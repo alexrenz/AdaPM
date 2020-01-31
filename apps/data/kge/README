@@ -1,0 +1,28 @@
+Small dataset for testing.
+Created from the top 399 entities with the most number of triples in the training set of FB15K-237.
+Cleaned up so no triples with unseen entities/relations appear in valid/test.
+
+# entities:       280
+# relations:      112
+# train triples:  4565
+# valid triples:  109
+# test triples:   152
+
+The following are results of models trained for 12 epochs on this dataset using negative sampling (6 negs per pos):
+
+Complex:
+  dim:      100
+  lr:       0.1
+  l2_reg:   0.1
+
+  MRR:      0.53
+  Hits@10:  78.9 
+
+TransE using L1 and normalizing entity vectors:
+  dim:      152
+  lr:       0.1
+  margin:   3
+
+  MRR:      0.60
+  Hits@10:  84.86 
+  
