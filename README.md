@@ -3,7 +3,9 @@
 [![Build Status](https://travis-ci.com/alexrenz/lapse.svg?token=qPF2yxPz6mVQ9DGSToqy&branch=master)](https://travis-ci.com/alexrenz/lapse)
 [![GitHub license](http://dmlc.github.io/img/apache2.svg)](./LICENSE)
 
-A parameter server with dynamic parameter allocation. I.e., it can relocate parameters among nodes during run time. This enables efficient distributed machine learning. Lapse provides the following primitives: 
+A parameter server with dynamic parameter allocation. I.e., it can relocate parameters among nodes during run time. This enables efficient distributed machine learning. More information can be found in our paper on Lapse: [http://arxiv.org/abs/2002.00655](http://arxiv.org/abs/2002.00655). 
+
+Lapse provides the following primitives: 
 - `Pull(keys)`: retrieve the values of a set of parameters (identified by keys) from the corresponding servers 
 - `Push(keys, updates)`: send updates for parameters to the corresponding servers
 - `Localize(keys)`: request local allocation of parameters
