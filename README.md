@@ -40,8 +40,8 @@ sudo apt-get update && sudo apt-get install -y build-essential git libboost-all-
 Then clone and build
 
 ```bash
-git clone https://github.com/alexrenz/lapse
-cd lapse && make
+git clone https://github.com/alexrenz/lapse-ps
+cd lapse-ps && make
 ```
 
 ### Getting started

@@ -59,8 +59,3 @@ apps: $(APPS)
 
 include mb/mb.mk
 mb: $(MB)
-
-run:
-	fab -H localhost makedsgd dsgdtoy --servers 2 --coloc
-
-include custom.mk
