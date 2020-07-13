@@ -14,6 +14,7 @@
 #include <thread>
 #include <mutex>
 #include <memory>
+#include <atomic>
 
 #include <iostream>
 #include <sstream>
@@ -25,16 +26,26 @@
   Default server handle for co-located parameter servers.
   Treats push's as increments.
 
-  We implemented multiple variants for the backend data structure.
+  There are multiple implementations of the backend data structure.
   Currently supported are:
-  (1) std::unordered_map with a lock array (PS_BACKEND_STD_UNORDERED_LOCKS)
+  (1) std::unordered_map with a lock array (PS_BACKEND_STD_UNORDERED_LOCKS=1)
        - For each key, there is one lock. But each lock is for multiple keys
        - For pushs/pulls, the appropriate lock is acquired
        - For parameter moves (when we need to add/remove parameters to the map),
          we acquire all locks. (LOCK_ALL)
-  (2) std::vector with a lock array (PS_BACKEND_VECTOR_LOCKS) [DEFAULT]
+  (2) std::vector with a lock array (PS_BACKEND_VECTOR_LOCKS=14) [DEFAULT]
        - As (1), but for a parameter move, we don't lock the entire data structure.
          We acquire only the lock for the moved parameter. (LOCK_SINGLE)
+  (3) std::vector without locks (PS_BACKEND_VECTOR=10)
+       - As (2), but without locks. This is useful when consistency is guaranteed
+         in another way. For example when shared memory access to parameters is disabled.
+         In this case, consistency is guaranteed because only the server thread accesses
+         local parameters.
+
+   The desired backend data structure can be specified with the compilation flag PS_BACKEND in
+   the external variable LAPSE_EXTERNAL_LDFLAGS. E.g, the following compiles the knowledge graph
+   embeddings app with an unordered map:
+   export LAPSE_EXTERNAL_LDFLAGS="-DPS_BACKEND=1"; make apps/knowledge_graph_embeddings
 
 */
 
@@ -74,6 +85,13 @@
 #define PS_LOCALITY_STATS 0
 #endif
 namespace ps {
+
+  // relocation statistics
+#ifdef PS_RELOC_STATS
+  extern std::atomic<long> STATS_num_localizes;
+  extern std::atomic<long> STATS_num_localizes_local;
+  extern std::atomic<long> STATS_num_localizes_queue;
+#endif
 
   /* A parameter in the local parameter server */
   template <typename Val>
@@ -123,7 +141,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     std::cout << "Handle data structure: TBB concurrent hash map" << std::endl;
 
 #elif PS_BACKEND == PS_BACKEND_VECTOR
-    std::cout << "Handle data structure: vector<unique_ptr<Parameter>>" << std::endl;
+    std::cout << "Handle data structure: vector<unique_ptr<Parameter>> (no locks)" << std::endl;
     store.resize(store_max);
 
 #elif PS_BACKEND == PS_BACKEND_VECTOR_LOCKS
@@ -157,7 +175,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     ADLOG("Capture locality statistics for " << store_max << " keys");
     myRank = Postoffice::Get()->my_rank();
     num_accesses.resize(store_max, 0);
-    num_local.resize(store_max, 0);
+    num_accesses_local.resize(store_max, 0);
     // clean stats directory
     if (myRank == 0 && system("exec rm -r stats/locality_stats.rank.*.tsv")==0)
       ADLOG("Cleaned locality statistics");
@@ -239,7 +257,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     // erase key from local store
 #if PS_BACKEND < 10 // map
     store.erase(key);
-#elif PS_BACKEND == PS_BACKEND_VECTOR_LOCKS
+#elif PS_BACKEND == PS_BACKEND_VECTOR_LOCKS || PS_BACKEND == PS_BACKEND_VECTOR
     store[key].reset();
 #endif
   }
@@ -282,7 +300,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
         search->second.updated = true;
       }
 #if PS_LOCALITY_STATS
-      num_local[key]++;
+      num_accesses_local[key]++;
 #endif
       return true;
     }
@@ -298,7 +316,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
         param.updated = true;
       }
 #if PS_LOCALITY_STATS
-      num_local[key]++;
+      num_accesses_local[key]++;
 #endif
       return true;
     }
@@ -339,7 +357,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
 
-    if (attemptLocalPullUnsafe(key, val)) {
+    if ((Postoffice::Get()->shared_memory_access() || !localRequest) && attemptLocalPullUnsafe(key, val)) {
       return ps::Status::LOCAL;
     } else if (transfers.isInTransferUnsafe(key)) {
       if (localRequest)
@@ -357,19 +375,24 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
   /**
      \brief Process a local or remote push request
   */
-  inline ps::Status processPush(const Key key, const Val* val, const int ts, Customer* customer, bool localRequest=true, std::shared_ptr<QueuedMessage<Val>> queued_msg = {}) {
+  inline ps::Status processPush(const Key key, Val* val, const int ts, Customer* customer, bool localRequest=true,
+                                std::shared_ptr<QueuedMessage<Val>> queued_msg = {},
+                                std::shared_ptr<KVPairs<Val>> data_ptr = {}) {
 #if PS_BACKEND_LOCKS
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
 
-    if (attemptLocalPushUnsafe(key, val)) {
+    if ((Postoffice::Get()->shared_memory_access() || !localRequest) && attemptLocalPushUnsafe(key, val)) {
       return ps::Status::LOCAL;
     } else if (transfers.isInTransferUnsafe(key)) {
-      if (localRequest)
+      if (localRequest) {
         transfers.queueLocalRequestUnsafe(key, ts, customer);
-      else
+        transfers.addPushToQueueUnsafe(key, val, vpk);
+      } else {
         transfers.queueRemoteRequestUnsafe(key, queued_msg);
-      mergeValue(transfers.getPushTarget(key), val); // pre-aggregate push
+        transfers.addRemotePushToQueueUnsafe(key, val, vpk, data_ptr);
+      }
+
       return ps::Status::IN_TRANSFER;
     } else {
       return ps::Status::REMOTE;
@@ -390,12 +413,22 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
 
+#if PS_RELOC_STATS
+      ++STATS_num_localizes;
+#endif
+
       if (isLocalUnsafe(key)) {
         // skip the localization: key is already local
+#if PS_RELOC_STATS
+        ++STATS_num_localizes_local;
+#endif
         return ps::Status::LOCAL;
       } else if (transfers.isInTransferUnsafe(key)) {
         // wait for a previously started localize
         transfers.queueLocalRequestUnsafe(key, ts, customer);
+#if PS_RELOC_STATS
+        ++STATS_num_localizes_queue;
+#endif
         return ps::Status::IN_TRANSFER;
       } else {
         // start a new localize
@@ -450,7 +483,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
       } else {
         std::copy_n(begin(search->second.val), vpk, val);
 #if PS_LOCALITY_STATS
-        num_local[key]++;
+        num_accesses_local[key]++;
 #endif
         return true;
       }
@@ -467,7 +500,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
       } else {
         std::copy_n(begin(param.val), vpk, val);
 #if PS_LOCALITY_STATS
-        num_local[key]++;
+        num_accesses_local[key]++;
 #endif
         return true;
       }
@@ -670,7 +703,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     ofstream statsfile ("stats/locality_stats.rank." + std::to_string(myRank) + ".tsv", ofstream::trunc);
     statsfile << "Param\tAccesses\tLocal\n";
     for (uint i=0; i!=num_accesses.size(); ++i) {
-      statsfile << i << "\t" << num_accesses[i] << "\t" << num_local[i] << "\n";
+      statsfile << i << "\t" << num_accesses[i] << "\t" << num_accesses_local[i] << "\n";
     }
     statsfile.close();
 #endif
@@ -695,7 +728,7 @@ private:
   tbb::concurrent_hash_map<Key, std::valarray<Val>> store;
 
 #elif PS_BACKEND == PS_BACKEND_VECTOR
-  std::vector<Val> store;
+  std::vector<std::unique_ptr<Parameter<Val>>> store;
 
 #elif PS_BACKEND == PS_BACKEND_VECTOR_LOCKS
   std::vector<std::unique_ptr<Parameter<Val>>> store;
@@ -719,7 +752,7 @@ private:
   std::vector<bool>* cached_parameters = nullptr;
 #if PS_LOCALITY_STATS
   std::vector<unsigned long> num_accesses;
-  std::vector<unsigned long> num_local;
+  std::vector<unsigned long> num_accesses_local;
   int myRank;
 #endif
 };

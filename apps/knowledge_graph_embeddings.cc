@@ -40,7 +40,7 @@ typedef ColoKVWorker<ValT, HandleT> WorkerT;
 enum class Alg { ComplEx, RESCAL };
 
 
-// Configuration
+// Model and algorithm parameters
 string  alg;
 Alg     algorithm;
 string  dataset;
@@ -57,18 +57,23 @@ uint    nr; // number of relations
 string  model_path;
 
 
-// Scale parameters
+// System parameters
 bool async_push;
 bool localize_relations;
 uint localize_entities_ahead;
 bool read_partitioned_dataset;
 bool location_caches;
+bool shared_memory;
+bool init_parameters;
+bool enforce_random_keys;
 
 uint num_workers = -1;
 uint num_keys = -1;
 uint entity_vector_length;
 uint relation_vector_length;
 
+// random assignment of keys (if enabled)
+std::vector<Key> key_assignment;
 
 static default_random_engine GLOBAL_GENERATOR;
 static uniform_real_distribution<double> UNIFORM(0, 1);
@@ -77,18 +82,20 @@ typedef tuple<int, int, int> triplet;
 
 
 // Parameter server functions
-inline const Key entity_key  (const int e) { return e; }
+inline const Key entity_key  (const int e) {
+  return enforce_random_keys ? key_assignment[e] : e;
+}
 
 
 vector<Key> relation_keys(const int r){
-    if(algorithm == Alg::ComplEx){
-        vector<Key> vec_r{ne+r};
-        return vec_r;
-    } else {
-        vector<Key> vec_r(embed_dim);
-        std::iota(vec_r.begin(),vec_r.end(), ne+r*embed_dim);
-        return vec_r;
-    }
+  if(algorithm == Alg::ComplEx){
+    vector<Key> vec_r{enforce_random_keys ? key_assignment[ne+r] : ne+r};
+    return vec_r;
+  } else {
+    vector<Key> vec_r(embed_dim);
+    std::iota(vec_r.begin(),vec_r.end(), enforce_random_keys ? key_assignment[ne+r] : ne+r*embed_dim);
+    return vec_r;
+  }
 }
 
 
@@ -732,7 +739,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
   ADLOG("Worker " << worker_id << " reads data points " << pi[0] << ".." << pi[pi.size()-1]);
 
   // Initialize model
-  if (worker_id == 0) {
+  if (init_parameters && worker_id == 0) {
     ADLOG("Init model ... ");
     vector<Key> keys (num_keys);
     std::iota(keys.begin(), keys.end(), 0);
@@ -740,6 +747,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     kv.Wait(kv.Push(keys, init_vals));
     ADLOG("Init model done");
   }
+  kv.ResetStats();
   kv.Barrier();
 
   // Localize parameters of local relations
@@ -773,6 +781,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
     // evaluation
     if (epoch % eval_freq == 0 && eval_freq != -1) {
+      assert(!enforce_random_keys); // range pulls below do not work with enforced random keys currently
       if (worker_id == 0) {
         sw["eval"].start();
         // pull full model once
@@ -917,6 +926,9 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("localize_relations", po::value<bool>(&localize_relations)->default_value(false), "whether relations are partitioned (true) or not (default)")
     ("read_partitioned_dataset", po::value<bool>(&read_partitioned_dataset)->default_value(true), "read partitioned dataset")
     ("location_caches", po::value<bool>(&location_caches)->default_value(false), "use location caches")
+    ("shared_memory", po::value<bool>(&shared_memory)->default_value(true), "use shared memory to access local parameters")
+    ("init_parameters", po::value<bool>(&init_parameters)->default_value(true), "initialize parameters")
+    ("enforce_random_keys", po::value<bool>(&enforce_random_keys)->default_value(false), "enforce that keys are assigned randomly")
     ;
 
   po::variables_map vm;
@@ -957,11 +969,35 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
+  // enforce random parameter allocation
+  if (enforce_random_keys) {
+    // manual mapping: parameter->key
+    key_assignment.resize(ne+nr);
+    iota(key_assignment.begin(), key_assignment.end(), 0);
+
+    srand(2); // enforce same seed among different ranks
+    random_shuffle(key_assignment.begin(), key_assignment.end());
+
+    // special treatment for RESCAL, because relation parameters can span multiple keys
+    // in detail, each relation maps to `embed_dim` keys
+    // so we add key space after each relation parameter
+    if (algorithm == Alg::RESCAL) {
+      vector<Key> relation_positions;
+      std::copy(key_assignment.begin()+ne, key_assignment.end(), std::back_inserter(relation_positions));
+      sort(relation_positions.begin(), relation_positions.end());
+      for (size_t i=0; i!=key_assignment.size(); ++i) {
+        // how many relations occur before this?
+        auto adjust = lower_bound(relation_positions.begin(), relation_positions.end(), key_assignment[i]) - relation_positions.begin();
+        key_assignment[i] = key_assignment[i] + adjust * (embed_dim-1);
+      }
+    }
+  }
 
   Postoffice::Get()->enable_dynamic_allocation(num_keys, num_threads, location_caches);
+  Postoffice::Get()->set_shared_memory_access(shared_memory);
 
   std::string role = std::string(getenv("DMLC_ROLE"));
-  std::cout << "kge. Starting " << role << ": running " << num_epochs << " epochs of " << alg << " on " << ne << " entities and " << nr << " relations (" << embed_dim << " depth) on " << dataset << "\n" << num_threads << " threads, " << neg_ratio << " neg_ratio, " << eval_freq << " eval_freq, " << eta << " eta, " << gamma_param << " gamma\nasync push " << async_push << ", localize relations " << localize_relations << ", read partitioned dataset " << read_partitioned_dataset << "\n";
+  std::cout << "kge. Starting " << role << ": running " << num_epochs << " epochs of " << alg << " on " << ne << " entities and " << nr << " relations (" << embed_dim << " depth) on " << dataset << "\n" << num_threads << " threads, " << neg_ratio << " neg_ratio, " << eval_freq << " eval_freq, " << eta << " eta, " << gamma_param << " gamma\nasync push " << async_push << ", localize relations " << localize_relations << ", read partitioned dataset " << read_partitioned_dataset << ", enforce random keys: " << enforce_random_keys << "\n";
 
   if (role.compare("scheduler") == 0) {
     Start(0);

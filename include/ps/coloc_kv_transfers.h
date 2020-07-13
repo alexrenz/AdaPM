@@ -60,13 +60,34 @@ namespace ps {
     }
 
     /**
+     * \brief Adds a push to the queue of a transfer. When the transfer is finished,
+     *        the push will be processed in order.
+     */
+    void addPushToQueueUnsafe(const Key key, Val* val, size_t vpk) {
+      transfers[key].ops.push_back(std::make_pair(true, val));
+    }
+
+    /**
+     * \brief Adds a remote push to the queue of a transfer. Makes sure that the
+     *        data that shall be pushed will still be around when the transfer finishes.
+     */
+    void addRemotePushToQueueUnsafe(const Key key, Val* val, size_t vpk,
+                                    std::shared_ptr<KVPairs<Val>>& data_ptr) {
+      // ensure that the data of the request is still available when the transfer is finished
+      transfers[key].push_data_ptrs.push_back(data_ptr);
+
+      // add to queue
+      addPushToQueueUnsafe(key, val, vpk);
+    }
+
+    /**
      * \brief Adds a memory location to a transfer. When the transfer is finished,
-     *        the latest value will be copied to this location.
+     *        the current value will be copied to this location.
      */
     void addPullToQueueUnsafe(const Key key, Val* val_loc) {
       // store the target location of pulls
       // we copy the latest value there when the transfer finishes
-      transfers[key].writeLocations.push_back(val_loc);
+      transfers[key].ops.push_back(std::make_pair(false, val_loc));
     }
 
     /**

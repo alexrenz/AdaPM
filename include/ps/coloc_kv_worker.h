@@ -54,10 +54,14 @@ namespace ps {
 
     // debug statistics
     ~ColoKVWorker() {
-      server.num_pulls += num_pulls;
-      server.num_pulls_local += num_pulls_local;
-      server.num_pushs += num_pushs;
-      server.num_pushs_local += num_pushs_local;
+      server.num_pull_ops += num_pull_ops;
+      server.num_pull_ops_local += num_pull_ops_local;
+      server.num_push_ops += num_push_ops;
+      server.num_push_ops_local += num_push_ops_local;
+      server.num_pull_params += num_pull_params;
+      server.num_pull_params_local += num_pull_params_local;
+      server.num_push_params += num_push_params;
+      server.num_push_params_local += num_push_params_local;
     }
 
     // reset re-used data structures
@@ -69,7 +73,7 @@ namespace ps {
     /**
      * \brief Push key--values into the PS (overrides KVWorker::Push())
      *
-     * If useShortCircuit is true, this method attempts to push all keys locally.
+     * If shared memory access is enabled, this method attempts to push all keys locally.
      * If this succeeds (i.e., if all keys are in the local PS),
      * method returns -1 (meaning "no need to wait for a request to finish").
      * Otherwise, it returns a timestamp to wait for.
@@ -79,14 +83,15 @@ namespace ps {
      * @return -1 if all the keys were answered locally, a timestamp otherwise
      */
     int Push(const std::vector<Key>& keys,
-             const std::vector<Val>& vals) {
+             std::vector<Val>& vals) {
       size_t vpk = server.request_handle_.get_vpk();
-      ++num_pushs;
+      ++num_push_ops;
+      num_push_params += keys.size();
 
       // STEP 1: fast special case (if all parameters are local)
       reset(keys.size());
       size_t numLocal = 0;
-      if (Postoffice::Get()->use_shortcircuit()) {
+      if (Postoffice::Get()->shared_memory_access()) {
         for (size_t i = 0; i < keys.size(); ++i) {
           // try to process the request locally
           Key key = keys[i];
@@ -94,8 +99,9 @@ namespace ps {
           numLocal += local[i];
         }
       }
+      num_push_params_local += numLocal;
       if (numLocal == keys.size()) {
-        ++num_pushs_local;
+        ++num_push_ops_local;
         return -1; // fast case done
       }
 
@@ -129,7 +135,7 @@ namespace ps {
     /**
      * \brief Pull key--values from the PS (overwrites KVWorker::Pull())
      *
-     * If useShortCircuit is true, this method attempts to pull all keys locally.
+     * If shared memory access is enabled, this method attempts to pull all keys locally.
      * If this succeeds (i.e., if all keys are in the local PS),
      * method returns -1 (meaning "no need to wait for a request to finish").
      * Otherwise, it returns a timestamp to wait for.
@@ -144,12 +150,13 @@ namespace ps {
              int cmd = 0,
              const Callback& cb = nullptr) {
       auto vpk = server.request_handle_.get_vpk();
-      ++num_pulls;
+      ++num_pull_ops;
+      num_pull_params += keys.size();
 
       // STEP 1: fast special case (if all parameters are local)
       size_t numLocal = 0;
       reset(keys.size());
-      if (Postoffice::Get()->use_shortcircuit()) {
+      if (Postoffice::Get()->shared_memory_access()) {
         for (size_t i = 0; i < keys.size(); ++i) {
           // try to process the request locally
           Key key = keys[i];
@@ -157,8 +164,9 @@ namespace ps {
           numLocal += local[i];
         }
       }
+      num_pull_params_local += numLocal;
       if (numLocal == keys.size()) {
-        ++num_pulls_local;
+        ++num_pull_ops_local;
         return -1;
       }
 
@@ -322,6 +330,20 @@ namespace ps {
     }
 
     /**
+     * \brief Reset locality statistics. Useful if one does not want to measure locality of parameter initialization
+     */
+    void ResetStats() {
+      num_pull_ops = 0;
+      num_pull_ops_local = 0;
+      num_push_ops = 0;
+      num_push_ops_local = 0;
+      num_pull_params = 0;
+      num_pull_params_local = 0;
+      num_push_params = 0;
+      num_push_params_local = 0;
+    }
+
+    /**
      * \brief Wait for a barrier among all servers
      */
     void Barrier() {
@@ -374,7 +396,7 @@ namespace ps {
       }
 
       // Debug output
-      if (msg.meta.recver == Postoffice::Get()->ServerRankToID(Postoffice::Get()->my_rank())) {
+      if (Postoffice::Get()->shared_memory_access() && msg.meta.recver == Postoffice::Get()->ServerRankToID(Postoffice::Get()->my_rank())) {
         Key key = kvs.keys[0];
         bool isloc = server.request_handle_.isLocal(key);
         bool ispip = server.request_handle_.isInTransfer(key);
@@ -406,7 +428,8 @@ namespace ps {
     // Note status (local/not local) of parameters of a request
     std::vector<bool> local {};
 
-    long num_pulls=0, num_pulls_local=0, num_pushs=0, num_pushs_local=0;
+    long num_pull_ops=0, num_pull_ops_local=0, num_push_ops=0, num_push_ops_local=0;
+    long num_pull_params=0, num_pull_params_local=0, num_push_params=0, num_push_params_local=0;
   };
 
 
@@ -431,28 +454,38 @@ namespace ps {
 
         CHECK(orig.first) << "FATAL: have no place to put reply to a pull requests at worker " << Postoffice::Get()->my_rank() << "::" << obj_->customer_id() << " for ts " << ts <<". Pointer is " << orig.first;
 
-        // go trough keys of this message, place vals at the correct positions of the array
+        // go trough requested keys and match with the keys of this message,
+        // place received vals at the correct positions of the array
         // note: we can do this without lock because (a) there is only one receive thread
         //    (b) if there were multiple, there is separated write areas in the val array
 
+        size_t pos = 0;
+        auto &requested_keys = *orig.first;
         auto vpk = server.request_handle_.get_vpk();
         auto senderRank = Postoffice::Get()->IDtoRank(msg.meta.sender);
-        for(uint i=0; i!=kvs.keys.size(); ++i) {
-          Key key = kvs.keys[i];
-          // find position of this key in the original array // TODO-performance: could make search more efficient
-          auto pos = std::lower_bound((*orig.first).begin(), (*orig.first).end(), key) - (*orig.first).begin();
+        for (size_t i = 0; i != requested_keys.size(); ++i) {
+          Key key = kvs.keys[pos];
+          if (requested_keys[i] == key) {
+            // write vals to correct position
+            std::copy_n(kvs.vals.begin()+pos*vpk, vpk, (*orig.second).begin()+i*vpk);
 
-          // write vals to correct position
-          std::copy_n(kvs.vals.begin()+i*vpk, vpk, (*orig.second).begin()+pos*vpk);
+            // update location caches
+            if (Postoffice::Get()->use_location_caches()) {
+              server.addressbook.updateCache(key, senderRank);
+            }
 
-          // update location caches
-          if (Postoffice::Get()->use_location_caches()) {
-            server.addressbook.updateCache(key, senderRank);
-          }
+            // update value caches
+            if (Postoffice::Get()->use_value_caches()) {
+              server.request_handle_.updateValueCache(key, kvs.vals.begin());
+            }
 
-          // update value caches
-          if (Postoffice::Get()->use_value_caches()) {
-            server.request_handle_.updateValueCache(key, kvs.vals.begin());
+            // move pointer forward
+            ++pos;
+
+            // early stop: stop when all keys of this response are processed
+            if (pos == kvs.keys.size()) {
+                break;
+            }
           }
         }
 

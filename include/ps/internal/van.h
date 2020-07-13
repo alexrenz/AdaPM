@@ -55,13 +55,6 @@ class Van {
      */
     int Send(const Message &msg);
 
-
-    /**
-     * \brief Public wrapper for ProcessLocalDataMsg to send local messages internally [sysChange]
-     */
-    void ProcessLocalDataMsg(Message* msg);
-
-
     /**
      * \brief return my node
      */

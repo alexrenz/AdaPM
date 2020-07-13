@@ -403,6 +403,8 @@ inline void preload_word(WorkerT &kv, long long &word) { //
 // Generates a fresh list of negative samples
 unsigned long long generate_negative_samples(vector <long long> &vec, vector <Key> &to_localize, unsigned long long next_random) {
   unsigned long long target = 0;
+  vec.resize(negative_list_size);
+  to_localize.resize(negative_list_size);
   for (unsigned int e = 0; e < vec.size(); e++) {
     next_random = next_random * (unsigned long long) 25214903917 + 11;
     target = table[(next_random >> 16) % table_size];
@@ -445,6 +447,7 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
   vector <long long> next_list    (negative_list_size);
   long long neg_checks = 0;
   long long neg_gone   = 0;
+  long long num_neg_lists = 0;
 
   // generate and localize a list of negative samples
   next_random = generate_negative_samples(current_list, to_localize, next_random);
@@ -526,7 +529,7 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
       auto fepoch = num_iterations - local_iter; //finished epochs
 
       sw_epoch.stop();
-      ADLOG("Worker " << worker_id << " finished epoch " << fepoch << " (" << sw_epoch << ")");
+      ADLOG("Worker " << worker_id << " finished epoch " << fepoch << " (" << sw_epoch << "). Negative lists: " << num_neg_lists << " (" << sw_epoch.elapsed_us() / num_neg_lists << " per list)" );
       kv.Barrier();
       sw_epoch_all.stop();
       if (worker_id == 0) {
@@ -621,9 +624,9 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
               syn1neg_key[0] = syn1KeyResolver(target);
 
               // try to retrieve the parameter for this negative sample
-              if(only_local_negatives){
+              if (only_local_negatives) {
                 have_neg_s = kv.PullIfLocal(syn1neg_key[0], &syn1neg_vec);
-              }else{ //normal pull
+              } else { //normal pull
                 have_neg_s = true;
                 kv.Wait(kv.Pull(syn1neg_key, &syn1neg_vec));
               }
@@ -639,6 +642,7 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
 
               // end of negative sample list: retrieve new negatives
               if (listpos == negative_list_size) {
+                ++num_neg_lists;
                 listpos = 0;
                 std::swap(current_list,next_list);
               }
@@ -869,6 +873,7 @@ void RunWorker(int customer_id, ServerT *server = nullptr) {
   }
 
   // halts every thread to ensure global-datastructure existence
+  kv.ResetStats();
   kv.Barrier();
 
   training_thread(kv, customer_id, worker_id);
@@ -908,16 +913,16 @@ int process_program_options(const int argc, const char *const argv[]) {
      "negative-sampling list size, # of negative sampled words to localize at once ")
     ("clustered_input", po::bool_switch(&clustered_input)->default_value(false),
      "flag to utilize separate files for each server in a distributed setting")
-     ("only_local_neg", po::value<bool>(&only_local_negatives)->default_value(false), "toggle to use neg samples which are localized on that node and skip those who are not. ")
+    ("only_local_neg", po::value<bool>(&only_local_negatives)->default_value(false), "toggle to use neg samples which are localized on that node and skip those who are not. ")
     ("write_results", po::value<bool>(&write_results)->default_value(false), "write out results")
-          ("localize_pos", po::value<bool>(&localize_positives)->default_value(true), "localize contextual data beforehand (default: yes)")
-          ("localize_neg", po::value<bool>(&localize_negatives)->default_value(true), "localize negative samples beforehand (default: yes)")
+    ("localize_pos", po::value<bool>(&localize_positives)->default_value(true), "localize contextual data beforehand (default: yes)")
+    ("localize_neg", po::value<bool>(&localize_negatives)->default_value(true), "localize negative samples beforehand (default: yes)")
     ("sync_push", po::value<bool>(&sync_push)->default_value(true), "use synchronous pushes? (default: yes)")
     ("data_words", po::value<long long int>(&data_words)->default_value(numeric_limits<long long int>::max()), "use synchronous pushes? (default: yes)")
     ("min_count", po::value<int>(&min_count)->default_value(5), "learn embeddings for all words with count larger than min_cout")
     ("neg_power", po::value<double>(&neg_power)->default_value(0.75), "power for negative sampling")
     ("subsample", po::value<ValT>(&sample)->default_value(1e-4), "subsample frequent words")
-          ("localize_next",po::value<int>(&localize_next)->default_value(0)," determines the start of localization for the next negative sampling list ")
+    ("localize_next",po::value<int>(&localize_next)->default_value(0)," determines the start of localization for the next negative sampling list ")
     ("binary", po::value<int>(&binary)->default_value(0), "output in binary human-readable format(default)");
 
 

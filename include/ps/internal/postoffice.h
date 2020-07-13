@@ -140,19 +140,19 @@ class Postoffice {
 
   // methods added for co-location and parameter movements. start [sysChange]
   void enable_dynamic_allocation(const Key key, const size_t nt, const bool use_location_caches=false) {
-    shortcircuit_ = true; coloc_ = true; set_max_key(key); set_num_worker_threads(nt); location_caches_ = use_location_caches; }
+    shared_memory_access_ = true; coloc_ = true; set_max_key(key); set_num_worker_threads(nt); location_caches_ = use_location_caches; }
   /** \brief Return whether to co-locate workers and servers in the same process */
   inline bool coloc() const { return coloc_; }
-  /** \brief Return whether to short-circuit local reads */
-  inline bool use_shortcircuit() const { return shortcircuit_; }
+  /** \brief Return whether to access local parameters via shared memory */
+  inline bool shared_memory_access() const { return shared_memory_access_; }
   /** \brief Returns whether location caches are used */
   inline bool use_location_caches() const { return location_caches_; }
   /** \brief Returns whether value caches are used */
   inline bool use_value_caches() const { return value_caches_; }
   /** \brief Enable value caches */
   void enable_value_caches() { value_caches_ = true; }
-  /** \brief Set whether to short-circuit local reads */
-  void set_shortcircuit(bool sc) { shortcircuit_ = sc; }
+  /** \brief Set whether to access local parameters via shared memory */
+  void set_shared_memory_access(bool sm) { shared_memory_access_ = sm; }
   /** \brief Set the maximum key */
   void set_max_key(Key key) { kMaxKey = key; }
   /** \brief Get the configured maximum key */
@@ -203,7 +203,7 @@ class Postoffice {
   bool is_worker_, is_server_, is_scheduler_;
   int num_servers_, num_workers_;
   bool coloc_; // [sysChange]
-  bool shortcircuit_ = false; // [sysChange]
+  bool shared_memory_access_ = false; // [sysChange]
   bool location_caches_ = false; // [sysChange]
   bool value_caches_ = false; // [sysChange]
   std::unordered_map<int, std::unordered_map<int, bool> > barrier_done_;

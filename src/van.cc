@@ -118,7 +118,7 @@ void Van::UpdateLocalID(Message* msg, std::unordered_set<int>* deadnodes_set,
   if (msg->meta.sender == Meta::kEmpty) {
     CHECK(is_scheduler_);
     CHECK_EQ(ctrl.node.size(), 1);
-    if (nodes->control.node.size() < num_nodes) {
+    if (nodes->control.node.size() < static_cast<size_t>(num_nodes)) {
       nodes->control.node.push_back(ctrl.node[0]);
     } else {
       // some node dies and restarts
@@ -183,7 +183,7 @@ void Van::ProcessBarrierCommand(Message* msg) {
     }
     int group = ctrl.barrier_group;
     ++barrier_count_[group];
-    PS_VLOG(1) << "Barrier count for " << group << " : " << barrier_count_[group];
+    PS_VLOG(1) << "Barrier count for " << group << " : " << barrier_count_[group] << " (from " << msg->meta.sender << "/" << msg->meta.customer_id << ")" ;
     if (barrier_count_[group] ==
         static_cast<int>(Postoffice::Get()->GetNodeIDs(group).size())) {
       barrier_count_[group] = 0;
@@ -206,11 +206,6 @@ void Van::ProcessBarrierCommand(Message* msg) {
   } else {
     Postoffice::Get()->Manage(*msg);
   }
-}
-
-// Wrapper for ProcessDataMsg [sysChange]
-void Van::ProcessLocalDataMsg(Message* msg) {
-  ProcessDataMsg(msg);
 }
 
 void Van::ProcessDataMsg(Message* msg) {

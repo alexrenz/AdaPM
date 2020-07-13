@@ -344,10 +344,6 @@ class KVServer : public SimpleApp {
    */
   void Response(const KVMeta& req, const KVPairs<Val>& res = KVPairs<Val>());
 
-  // count total and local number of kv responses [sysChange]
-  unsigned long resp_total = 0;
-  unsigned long resp_local = 0;
-
  private:
   /** \brief internal receive handle */
   bool Process(const Message& msg); // need to overwrite this [sysChange]
@@ -434,18 +430,7 @@ void KVServer<Val>::Response(const KVMeta& req, const KVPairs<Val>& res) {
     }
   }
 
-  // Do we have to send this KV response over the network? [sysChange]
-  auto thisProcess = Postoffice::Get()->ServerRankToID(Postoffice::Get()->my_rank());
-  if(Postoffice::Get()->coloc() && msg.meta.recver == thisProcess) {
-    // we can process it locally (note: no need to handle shortcircuits here, as Response() is not called for shortcircuit access)
-    msg.meta.sender = thisProcess; // info for the receiving thread
-    Postoffice::Get()->van()->ProcessLocalDataMsg(&msg);
-    ++resp_local;
-  } else {
-    // have to go over the network
-    Postoffice::Get()->van()->Send(msg);
-  }
-  ++resp_total;
+  Postoffice::Get()->van()->Send(msg);
 }
 
 template <typename Val>
@@ -546,22 +531,6 @@ void KVWorker<Val>::Send(int timestamp, bool push, int cmd, const KVPairs<Val>& 
     ss << "ts " << timestamp << ": send msg to " << msg.meta.recver << "\n";
     std::cout << ss.str();
 
-    // Do we have to send this KV request over the network? [sysChange]
-    auto thisProcess = Postoffice::Get()->ServerRankToID(Postoffice::Get()->my_rank());
-    if(Postoffice::Get()->coloc() && msg.meta.recver == thisProcess) {
-      // we can process it locally
-      if(Postoffice::Get()->use_shortcircuit()) {
-        // if we are using short circuits, we processed the local keys already. So there is nothing to do here.
-        // for now, we skip only the pushes (duplicate pushes lead to wrong values when the server applies deltas)
-      } else {
-        msg.meta.sender = thisProcess;
-        Postoffice::Get()->van()->ProcessLocalDataMsg(&msg);
-        ++reqs_local;
-      }
-    } else {
-      // we have to go over the network
-      Postoffice::Get()->van()->Send(msg);
-    }
     ++reqs_total;
   }
 }

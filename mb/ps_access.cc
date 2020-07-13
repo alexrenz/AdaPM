@@ -28,7 +28,7 @@ int num_accesses = 0;
 int num_threads = 0;
 int value_length;
 bool access_remote;
-bool sc;
+bool sm;
 
 
 template <typename Val>
@@ -87,7 +87,7 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("value_length", po::value<int>(&value_length)->default_value(4), "length of the value")
     ("num_accesses", po::value<int>(&num_accesses)->default_value(100000), "Number of parameter accesses")
     ("num_threads,t", po::value<int>(&num_threads)->default_value(1), "number of worker threads to run")
-    ("sc", po::value<bool>(&sc)->default_value(true), "use short circuit for local updates")
+    ("sm", po::value<bool>(&sm)->default_value(true), "wether to access local parameters via shared memory")
     ("access_remote", po::value<bool>(&access_remote)->default_value(false), "access remote PS")
     ;
 
@@ -109,7 +109,7 @@ int main(int argc, char *argv[]) {
   int po_error = process_program_options(argc, argv);
   if(po_error) return 1;
   Postoffice::Get()->enable_dynamic_allocation(num_keys+2, num_threads);
-  Postoffice::Get()->set_shortcircuit(sc);
+  Postoffice::Get()->set_shared_memory_access(sm);
 
   std::string role = std::string(getenv("DMLC_ROLE"));
   std::cout << "mb_ps_calls " << role << ": " << num_accesses << " accesses to " << num_keys << " keys (" << value_length << " value length, " << sizeof(ValT) * value_length << " bytes)\n";
@@ -135,9 +135,6 @@ int main(int argc, char *argv[]) {
     // wait for the workers to finish
     for (auto & w : workers)
       w.join();
-
-    // debug
-    ADLOG("[s" << ps::MyRank() << "]:   " << server->resp_local << "/" << server->resp_total << " local responses");
 
     // stop the server
     Finalize(server_customer_id, true);

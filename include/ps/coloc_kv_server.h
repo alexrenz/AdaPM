@@ -10,13 +10,25 @@
 #include <unordered_map>
 #include <boost/functional/hash.hpp>
 #include <algorithm>
+#include <atomic>
 #include "ps/kv_app.h"
 #include "ps/addressbook.h"
+#include <limits>
 
 #include <iostream>
 #include <sstream>
 
 namespace ps {
+
+#ifdef PS_RELOC_STATS
+  long STATS_total_transfer_time_sum = 0;
+  long STATS_total_transfers = 0;
+  long STATS_total_transfer_time_max = 0;
+  long STATS_total_transfer_time_min = std::numeric_limits<long>::max();
+  std::atomic<long> STATS_num_localizes (0);
+  std::atomic<long> STATS_num_localizes_local (0);
+  std::atomic<long> STATS_num_localizes_queue (0);
+#endif
 
   /**
    * \brief The information necessary to notify a waiting worker thread
@@ -48,23 +60,29 @@ namespace ps {
   template <typename Val>
     struct Transfer {
       bool _ongoing = false;
-      std::vector<Val*>  writeLocations;
-      std::valarray<Val> val;
+      std::vector<std::pair<bool,Val*>> ops; // queued pull and push operations: <true=push/false=pull, pointer_to_val_location>
+      std::vector<std::shared_ptr<KVPairs<Val>>> push_data_ptrs; // to ensure that push data is still around when transfer is finished
       std::vector<WaitingThread> threads; // waiting local worker threads
       std::vector<std::shared_ptr<QueuedMessage<Val>>> messages; // waiting messages for remote worker threads
       bool subsequentLocalize = false; // did we receive a subsequent localize? (if yes, we forward the key directly when we receive it)
       std::shared_ptr<QueuedMessage<Val>> subsequentLocalizeMsg; // did we receive a subsequent localize? (if yes, we forward the key directly when we receive it)
+#ifdef PS_RELOC_STATS
+      util::Stopwatch total_transfer_time;
+#endif
 
       Transfer() {}
 
       Transfer(Transfer&& q) { // move constructor
-        writeLocations.swap(q.writeLocations);
-        val.swap(q.val);
+        ops.swap(q.ops);
+        push_data_ptrs.swap(q.push_data_ptrs);
         threads.swap(q.threads);
         messages.swap(q.messages);
         std::swap(subsequentLocalize, q.subsequentLocalize);
         std::swap(subsequentLocalizeMsg, q.subsequentLocalizeMsg);
         std::swap(_ongoing, q._ongoing);
+#ifdef PS_RELOC_STATS
+        std::swap(total_transfer_time, q.total_transfer_time);
+#endif
       }
 
       // Copy constructor
@@ -81,19 +99,30 @@ namespace ps {
       // start a transfer
       void start(size_t vpk) {
         _ongoing = true;
-        val.resize(vpk);
+#ifdef PS_RELOC_STATS
+        total_transfer_time.start();
+#endif
       }
 
       // stop a transfer, i.e., reset the transfer object
       void reset() {
         CHECK(_ongoing) << "Resetting transfer that is not ongoing";
         _ongoing = false;
-        writeLocations.resize(0);
-        std::fill(std::begin(val), std::end(val), 0);
+        ops.resize(0);
+        push_data_ptrs.resize(0);
         threads.resize(0);
         messages.resize(0);
         subsequentLocalize = false;
         subsequentLocalizeMsg.reset();
+
+        // statistics
+#ifdef PS_RELOC_STATS
+        total_transfer_time.stop();
+        STATS_total_transfer_time_sum += total_transfer_time.elapsed_ns();
+        ++STATS_total_transfers;
+        STATS_total_transfer_time_max = max(total_transfer_time.elapsed_ns(), STATS_total_transfer_time_max);
+        STATS_total_transfer_time_min = min(total_transfer_time.elapsed_ns(), STATS_total_transfer_time_min);
+#endif
       }
 
     public:
@@ -118,9 +147,17 @@ namespace ps {
      * \brief destructor: output statistics about locality
      */
     ~ColoKVServer() {
-      ADLOG("Local at s" << my_rank << std::setprecision(2) << ": " <<
-            num_pulls_local << " / " << num_pulls << " pulls (" <<  100.0 * num_pulls_local / num_pulls << "%), " <<
-            num_pushs_local << " / " << num_pushs << " pushs (" <<  100.0 * num_pushs_local / num_pushs << "%)");
+      ADLOG("Local at s" << my_rank << std::setprecision(5) << " (ops):    " <<
+            num_pull_ops_local << " / " << num_pull_ops << " pulls (" <<  100.0 * num_pull_ops_local / num_pull_ops << "%), " <<
+            num_push_ops_local << " / " << num_push_ops << " pushs (" <<  100.0 * num_push_ops_local / num_push_ops << "%)\n" <<
+            "Local at s" << my_rank << " (params): " <<
+            num_pull_params_local << " / " << num_pull_params << " pulls (" <<  100.0 * num_pull_params_local / num_pull_params << "%), " <<
+            num_push_params_local << " / " << num_push_params << " pushs (" <<  100.0 * num_push_params_local / num_push_params << "%)");
+
+#ifdef PS_RELOC_STATS
+      if (STATS_total_transfers == 0) STATS_total_transfers = -1; // prevent division by 0
+      ADLOG("Relocations at s" << my_rank << ": " << STATS_total_transfers << " (" << STATS_num_localizes_local << " already local, " << STATS_num_localizes_queue <<  " already running, " << STATS_num_localizes << " localizes). Total transfer time: " << STATS_total_transfer_time_sum << " ns. " << STATS_total_transfer_time_sum/STATS_total_transfers << " ns per transfer (" << STATS_total_transfer_time_min << " min / " << STATS_total_transfer_time_max << " max)");
+#endif
     }
 
     /**
@@ -154,7 +191,7 @@ namespace ps {
 
     Handle& request_handle_; // hides the request_handle_ of KVServer
     bool Process(const Message& msg); // we re-define Process to use the correct request_handle_
-    void ProcessPushPullRequest(KVPairs<Val>& data, KVPairs<Val>& res,
+    void ProcessPushPullRequest(std::shared_ptr<KVPairs<Val>>& data, KVPairs<Val>& res,
                                 std::shared_ptr<QueuedMessage<Val>>& queued_msg);
     void ProcessLocalizeRequest(KVPairs<Val>& data, KVPairs<Val>& res,
                            std::shared_ptr<QueuedMessage<Val>>& queued_msg);
@@ -162,7 +199,8 @@ namespace ps {
     Addressbook addressbook {};
     int my_rank; // the rank of this server
 
-    long num_pulls = 0, num_pulls_local = 0, num_pushs = 0, num_pushs_local = 0 ; // statistics
+    long num_pull_ops=0, num_pull_ops_local=0, num_push_ops=0, num_push_ops_local=0;
+    long num_pull_params=0, num_pull_params_local=0, num_push_params=0, num_push_params_local=0;
   };
 
 
@@ -193,10 +231,11 @@ namespace ps {
       meta.customer_id = msg.meta.customer_id;
 
       // parse request key/value data
-      KVPairs<Val> data;
+      std::shared_ptr<KVPairs<Val>> data_ptr (new KVPairs<Val>());
       CHECK_GE(msg.data.size(), 2);
-      data.keys = msg.data[0];
-      data.vals = msg.data[1];
+      data_ptr->keys = msg.data[0];
+      data_ptr->vals = msg.data[1];
+      KVPairs<Val>& data = *data_ptr;
 
       // prepare response key/value data
       KVPairs<Val>& res = queued_msg.get()->kvs;
@@ -210,7 +249,7 @@ namespace ps {
       if (isLocalize(meta.cmd)) {
         ProcessLocalizeRequest(data, res, queued_msg);
       } else {
-        ProcessPushPullRequest(data, res, queued_msg);
+        ProcessPushPullRequest(data_ptr, res, queued_msg);
       }
     } else if(isLocalize(msg.meta.head)) { // process responses to localizes
       // note: push/pull responses are handled in the worker threads (i.e., not here)
@@ -225,7 +264,7 @@ namespace ps {
    * \brief Process a regular (i.e., push/pull) request to a parameter server
    */
   template <typename Val, typename Handle>
-    void ColoKVServer<Val, Handle>::ProcessPushPullRequest(KVPairs<Val>& data, KVPairs<Val>& res,
+    void ColoKVServer<Val, Handle>::ProcessPushPullRequest(std::shared_ptr<KVPairs<Val>>& data_ptr, KVPairs<Val>& res,
                                                            std::shared_ptr<QueuedMessage<Val>>& queued_msg) {
 
     // prepare a couple of forward messages to other servers
@@ -233,6 +272,8 @@ namespace ps {
 
     KVMeta& meta = queued_msg.get()->meta;
     auto vpk = request_handle_.get_vpk();
+
+    KVPairs<Val>& data = *data_ptr;
 
     uint numLocal = 0;
     uint numLocalSoon = 0;
@@ -243,7 +284,7 @@ namespace ps {
 
       ps::Status status;
       if (meta.push) // push request
-        status = request_handle_.processPush(key, data.vals.begin()+i*vpk, -1, 0, false, queued_msg);
+        status = request_handle_.processPush(key, data.vals.begin()+i*vpk, -1, 0, false, queued_msg, data_ptr);
       else // pull request
         status = request_handle_.processPull(key, res.vals.data()+res.keys.size()*vpk, -1, 0, false, queued_msg);
 
@@ -438,8 +479,16 @@ namespace ps {
       CHECK(request_handle_.transfers.isInTransferUnsafe(key)) << "FATAL! Did not find key " << key << " in pip map on rank " << my_rank;
       auto& queue = request_handle_.transfers.getTransferUnsafe(key);
 
-      // merge received value and queued value
-      request_handle_.mergeValue(val, queue.val);
+      // process queued pull and push operations
+      for (size_t r=0; r!=queue.ops.size(); ++r) {
+        bool push = queue.ops[r].first; // is this op a push or a pull?
+        Val* queued_val = queue.ops[r].second;
+        if (push) { // process the queued push: merge into received value
+          request_handle_.mergeValue(val, queued_val);
+        } else { // process the queued pull: copy current value to stored destination
+          std::copy_n(val, vpk, queued_val);
+        }
+      }
 
       if (queue.subsequentLocalize) {
         // the next (subsequent) localize for this parameter has already arrived. so we don't
@@ -464,12 +513,6 @@ namespace ps {
         request_handle_.insertKeyUnsafe(key, val);
       }
 
-      // answer queued pull requests
-      // TODO-performance: could do this outside the critical section
-      for (size_t r=0; r!=queue.writeLocations.size(); ++r) {
-        Val* ptr = queue.writeLocations[r];
-        std::copy_n(val, vpk, ptr);
-      }
 
       // note threads to notify (send notifications outside the critical section)
       std::swap(thread_lists[i], queue.threads);
