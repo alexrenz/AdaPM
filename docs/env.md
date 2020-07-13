@@ -1,4 +1,4 @@
-# environment variables
+# Environment variables
 
 The variables must be set for starting
 
