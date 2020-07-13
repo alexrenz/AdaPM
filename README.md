@@ -1,6 +1,6 @@
 ![lapse logo](docs/lapse.png?raw=true) 
 
-[![Build Status](https://travis-ci.com/alexrenz/lapse.svg?token=qPF2yxPz6mVQ9DGSToqy&branch=master)](https://travis-ci.com/alexrenz/lapse)
+[![Build Status](https://travis-ci.org/alexrenz/lapse-ps.svg?branch=master)](https://travis-ci.org/alexrenz/lapse-ps/)
 [![GitHub license](http://dmlc.github.io/img/apache2.svg)](./LICENSE)
 
 A parameter server with dynamic parameter allocation. I.e., it can relocate parameters among nodes during run time. This capability can be key for efficient distributed machine learning. More information can be found in our paper on Lapse: [http://arxiv.org/abs/2002.00655](http://arxiv.org/abs/2002.00655). Details on the experiment settings for this paper can be found in [docs/experiments-vldb20.md](docs/experiments-vldb20.md).
