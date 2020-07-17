@@ -6,7 +6,7 @@ This document gives details about the experiments that were run in the Lapse cod
 > *Dynamic Parameter Allocation in Parameter Servers*.  
 > PVLDB, 13(11): 1877-1890, 2020
 
-The paper can be downloaded from the [PVLDB Volume 13 page](http://www.vldb.org/pvldb/vol13.html) ([PDF (TODO)](TODO)). A slightly longer version of this paper can be obtained from [arXiv](https://arxiv.org/abs/2002.00655). 
+The paper can be downloaded from the [PVLDB Volume 13 page](http://www.vldb.org/pvldb/vol13.html) ([PDF](https://www.vldb.org/pvldb/vol13/p1877-renz-wieland.pdf)). A slightly longer version of this paper can be obtained from [arXiv](https://arxiv.org/abs/2002.00655). 
 
 If you run into any problems, have questions, find bugs, or want to obtain any of our datasets, please do not hesitate to contact us. I (Alexander Renz-Wieland) plan to keep durable contact information available at [alexrw.org](https://www.alexrw.org). 
 
