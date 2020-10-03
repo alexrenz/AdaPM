@@ -2,15 +2,15 @@
 # main script of travis
 
 if [ ${TASK} == "lint" ]; then
-    make lint || travis_terminate 1
+    make lint || exit 1
 fi
 
 if [ ${TASK} == "build" ]; then
-    make DEPS_PATH=${CACHE_PREFIX} CXX=${CXX} || travis_terminate 1
+    make DEPS_PATH=${CACHE_PREFIX} CXX=${CXX} || exit 1
 fi
 
 if [ ${TASK} == "test" ]; then
-    make tests DEPS_PATH=${CACHE_PREFIX} CXX=${CXX} || travis_terminate 1
+    make tests DEPS_PATH=${CACHE_PREFIX} CXX=${CXX} || exit 1
     cd tests
     # single-worker tests
     tests=( test_connection test_dynamic_allocation test_locality_api )
@@ -32,11 +32,11 @@ if [ ${TASK} == "test" ]; then
 
     cd ..
 
-    make apps DEPS_PATH=${CACHE_PREFIX} CXX=${CXX} || travis_terminate 1
+    make apps DEPS_PATH=${CACHE_PREFIX} CXX=${CXX} || exit 1
 
-    python tracker/dmlc_local.py -n 0 -s 2  build/apps/matrix_factorization --dataset apps/data/mf/ -r 2 --num_keys 12 --epochs 10  || travis_terminate 1
+    python tracker/dmlc_local.py -n 0 -s 2  build/apps/matrix_factorization --dataset apps/data/mf/ -r 2 --num_keys 12 --epochs 10  || exit 1
 
-    python tracker/dmlc_local.py -n 0 -s 2 build/apps/knowledge_graph_embeddings --dataset apps/data/kge/ --num_entities 280 --num_relations 112 --num_epochs 4 --embed_dim 100 --eval_freq 2 || travis_terminate 1
+    python tracker/dmlc_local.py -n 0 -s 2 build/apps/knowledge_graph_embeddings --dataset apps/data/kge/ --num_entities 280 --num_relations 112 --num_epochs 4 --embed_dim 100 --eval_freq 2 || exit 1
 
-    python tracker/dmlc_local.py -n 0 -s 2 build/apps/word2vec --num_threads 2 --negative 2 --binary 1 --num_keys 4970 --embed_dim 10  --input_file apps/data/lm/small.txt --num_iterations 4 --window 2 --localize_pos 1 --localize_neg 1 --data_words 10000 || travis_terminate 1
+    python tracker/dmlc_local.py -n 0 -s 2 build/apps/word2vec --num_threads 2 --negative 2 --binary 1 --num_keys 4970 --embed_dim 10  --input_file apps/data/lm/small.txt --num_iterations 4 --window 2 --localize_pos 1 --localize_neg 1 --data_words 10000 || exit 1
 fi
