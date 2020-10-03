@@ -56,6 +56,3 @@ tests: $(TESTS)
 
 include apps/apps.mk
 apps: $(APPS)
-
-include mb/mb.mk
-mb: $(MB)
