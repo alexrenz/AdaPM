@@ -143,7 +143,7 @@ struct Meta {
   /** \brief default constructor */
   Meta() : head(kEmpty), app_id(kEmpty), customer_id(kEmpty),
            timestamp(kEmpty), sender(kEmpty), recver(kEmpty),
-           request(false), push(false), simple_app(false) {}
+           request(false), push(false), set(false), simple_app(false) {}
   std::string DebugString() const {
     std::stringstream ss;
     if (sender == Node::kEmpty) {
@@ -160,7 +160,8 @@ struct Meta {
       ss << ", app_id=" << app_id
          << ", customer_id=" << customer_id
          << ", simple_app=" << simple_app
-         << ", push=" << push;
+         << ", push=" << push
+         << ", set=" << set;
     }
     if (head != kEmpty) ss << ", head=" << head;
     if (body.size()) ss << ", body=" << body;
@@ -187,6 +188,8 @@ struct Meta {
   bool request;
   /** \brief whether or not a push message */
   bool push;
+  /** \brief whether or not a set message */
+  bool set;
   /** \brief whether or not it's for SimpleApp */
   bool simple_app;
   /** \brief an string body */

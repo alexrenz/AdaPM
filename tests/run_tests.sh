@@ -1,7 +1,10 @@
 #!/bin/bash
 
+rm -rf logs
+mkdir logs
+
 if [ "$1" != "dont_compile" ]; then
-    make tests
+    make tests || echo "Test compilation FAILED" > logs/compliation.log
 fi
 
 workload="--quick"
@@ -9,29 +12,37 @@ if [ "$2" == "heavy" ]; then
     workload=""
 fi
 
-rm -rf logs
-mkdir logs
-
 ######################
 ## run tests
 
 # dynamic allocation
-python tracker/dmlc_local.py -s 3 tests/test_dynamic_allocation | tee -a "logs/dynamic_allocation.log"
-python tracker/dmlc_local.py -s 4 tests/test_dynamic_allocation replicate | tee -a "logs/dynamic_allocation_replicate.log"
+python tracker/dmlc_local.py -s 3 build/tests/test_dynamic_allocation | tee -a "logs/dynamic_allocation.log"
+python tracker/dmlc_local.py -s 4 build/tests/test_dynamic_allocation replicate | tee -a "logs/dynamic_allocation_replicate.log"
 
 # locality API
-python tracker/dmlc_local.py -s 3 tests/test_locality_api | tee -a "logs/locality_api.log"
+python tracker/dmlc_local.py -s 3 build/tests/test_locality_api | tee -a "logs/locality_api.log"
 
 # variable length values
-python tracker/dmlc_local.py -s 3 tests/test_variable_length_values | tee -a "logs/variable_length_values.log"
+python tracker/dmlc_local.py -s 3 build/tests/test_variable_length_values | tee -a "logs/variable_length_values.log"
 
 # many-key operations
-python tracker/dmlc_local.py -s 4 tests/test_many_key_operations $workload | tee -a "logs/many_keys.log"
+python tracker/dmlc_local.py -s 4 build/tests/test_many_key_operations $workload | tee -a "logs/many_keys.log"
 
 # many-key operations with replication
-python tracker/dmlc_local.py -s 4 tests/test_many_key_operations $workload --replicate --rep.sm bg_tree | tee -a "logs/many_keys_replication_tree.log"
-python tracker/dmlc_local.py -s 4 tests/test_many_key_operations $workload --replicate --rep.sm bg_butterfly | tee -a "logs/many_keys_replication_butterfly.log"
+python tracker/dmlc_local.py -s 4 build/tests/test_many_key_operations $workload --replicate --rep.sm bg_tree | tee -a "logs/many_keys_replication_tree.log"
+python tracker/dmlc_local.py -s 4 build/tests/test_many_key_operations $workload --replicate --rep.sm bg_butterfly | tee -a "logs/many_keys_replication_butterfly.log"
 
+# test set operation
+python tracker/dmlc_local.py -s 4 build/tests/test_set_operation | tee -a "logs/set_operation.log"
+
+# sampling support
+python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy naive
+python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy preloc
+python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy pool --sampling.reuse 3
+python tracker/dmlc_local.py -s 4 build/tests/test_sampling --sampling.strategy pool --sampling.reuse 3 --replicate 1
+python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy pool --sampling.reuse 3 --sampling.postpone 1
+python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy onlylocal --sampling.batch_size 1
+python tracker/dmlc_local.py -s 4 build/tests/test_sampling --sampling.strategy onlylocal --sampling.batch_size 1 --replicate 1
 
 ######################
 ## evaluate

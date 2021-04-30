@@ -1360,8 +1360,7 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    HandleT handle (num_keys+1, entity_vector_length); // the handle specifies how the server handles incoming Push() and Pull() calls
-    auto server = new ServerT(server_customer_id, handle, &hotspot_keys);
+    auto server = new ServerT(num_keys+1, entity_vector_length, &hotspot_keys);
     RegisterExitCallback([server](){ delete server; });
 
     num_workers = ps::NumServers() * num_threads;

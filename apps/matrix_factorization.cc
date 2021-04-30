@@ -703,8 +703,7 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    HandleT handle (num_keys, mf_rank);
-    auto server = new ServerT(server_customer_id, handle, &hotspot_keys);
+    auto server = new ServerT(num_keys, mf_rank, &hotspot_keys);
     RegisterExitCallback([server](){ delete server; });
 
     // make sure all servers are set up

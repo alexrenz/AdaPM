@@ -32,6 +32,7 @@
 #define MAX_SENTENCE_LENGTH 1000
 #define MAX_CODE_LENGTH 40
 
+using namespace std;
 
 const int vocab_hash_size = 30000000, table_size = 1e8;  // Maximum 30 * 0.7 = 21M words in the vocabulary
 
@@ -346,9 +347,6 @@ void SaveVocab() {
 void ReadVocab() {
   long long a, i = 0;
   char c, eof = 0;
-  int irrelevant_returnval = 0; // only here so the compiler does not warn anymore, as fscanf has a unused returnvalue
-  irrelevant_returnval++;
-  irrelevant_returnval--;
   char word[MAX_STRING];
   FILE *fin = fopen(vocab_retrieve.c_str(), "rb");
   if (fin == NULL) {
@@ -361,7 +359,9 @@ void ReadVocab() {
     ReadWord(word, fin, &eof);
     if (eof) break;
     a = AddWordToVocab(word);
-    irrelevant_returnval = fscanf(fin, "%lld%c", &vocab[a].cn, &c);
+    auto num_read = fscanf(fin, "%lld%c", &vocab[a].cn, &c);
+    CHECK ( num_read != EOF) << "Error: ReadVocab()-fscanf encountered input failure or runtime constraint violation";
+
     i++;
   }
   SortVocab();
@@ -900,18 +900,26 @@ void initialize_model(WorkerT &kv) {
       ALOG("Error opening checkpoint files (" << init_model << ")");
       abort();
     }
-    fscanf(fo_syn0, "%lld %lld\n", &read_vocab_size, &read_embed_dim);
+    auto num_read = fscanf(fo_syn0, "%lld %lld\n", &read_vocab_size, &read_embed_dim);
+    CHECK ( num_read != EOF) << "Error: initialize_model()-fscanf encountered input failure or runtime constraint violation";
+
     assert(read_vocab_size == vocab_size);
     assert(read_embed_dim == embed_dim);
 
     // read word by word
     for (long a = 0; a < vocab_size; a++) {
-      fscanf(fo_syn0, "%s", read_word);
+      auto num_read = fscanf(fo_syn0, "%s", read_word);
+      CHECK ( num_read != EOF) << "Error: initialize_model()-fscanf encountered input failure or runtime constraint violation";
       fgetc(fo_syn0); // read space
       assert(strcmp(read_word, vocab[a].word) == 0);
 
-      fread(&syn0[a*embed_dim], sizeof(ValT), embed_dim, fo_syn0);
-      fread(&syn1[a*embed_dim], sizeof(ValT), embed_dim, fo_syn1);
+      auto syn0_num_read = fread(&syn0[a*embed_dim], sizeof(ValT), embed_dim, fo_syn0);
+      auto syn1_num_read = fread(&syn1[a*embed_dim], sizeof(ValT), embed_dim, fo_syn1);
+
+      CHECK (embed_dim == static_cast<long long int>(syn0_num_read) && syn0_num_read == syn1_num_read) << "Error: Number of objects read successfully differs from number of objects "
+                                                                                   "intended to read. \n Intended to read " << embed_dim << " syn0-read: "
+                                                                                   << syn0_num_read << ", syn1-read: " << syn1_num_read ;
+
       fgetc(fo_syn0); // read line break
     }
     fclose(fo_syn0);
@@ -1028,7 +1036,7 @@ std::vector<Key> determine_hotspot_keys(size_t N_hotspots) {
   std::vector<Key> to_replicate {};
   if (N_hotspots == 0) return to_replicate;
 
-  if (N_hotspots > vocab_size*2) N_hotspots = vocab_size*2; // cannot replicate more than all keys
+  if (static_cast<long>(N_hotspots) > vocab_size*2) N_hotspots = vocab_size*2; // cannot replicate more than all keys
 
   to_replicate.reserve(N_hotspots);
 
@@ -1100,7 +1108,7 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("output_file,o", po::value<string>(&out_file)->default_value("vectors.bin"), "output file (to store word vectors)")
     ("vocab_save", po::value<string>(&vocab_save), "name of the resulting vocab-file")
     ("vocab_retrieve", po::value<string>(&vocab_retrieve), "name of the source vocab-file")
-    ("shuffle", po::bool_switch(&shuffle_b)->default_value(true), "boolean to scramble words on keys randomly")
+    ("shuffle", po::value<bool>(&shuffle_b)->default_value(true), "boolean to scramble words on keys randomly")
     ("debug_mode,d", po::value<int>(&debug_mode)->default_value(2), "disables debug mode")
     ("window,w", po::value<int>(&window)->default_value(5), "adjusts sizing of word-window, default is 5")
     ("embed_dim,v", po::value<long long int>(&embed_dim)->default_value(200),
@@ -1108,7 +1116,7 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("num_keys,k", po::value<Key>(&num_keys)->default_value(10), "number of parameters")
     ("negative", po::value<int>(&negative)->default_value(25),
      "number of negative samples per context word pair")
-    ("clustered_input", po::bool_switch(&clustered_input)->default_value(false),
+    ("clustered_input", po::value<bool>(&clustered_input)->default_value(false),
      "flag to utilize separate files for each server in a distributed setting")
     ("write_results", po::value<bool>(&write_results)->default_value(false), "write out results")
     ("localize_pos", po::value<bool>(&localize_positives)->default_value(true), "localize contextual data beforehand (default: yes)")
@@ -1184,8 +1192,7 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    HandleT handle(num_keys, embed_dim); // the handle specifies how the server handles incoming Push() and Pull() calls
-    auto server = new ServerT(server_customer_id, handle, &hotspot_keys);
+    auto server = new ServerT(num_keys, embed_dim, &hotspot_keys);
     RegisterExitCallback([server]() { delete server; });
     num_workers = ps::NumServers() * num_threads;
 

@@ -446,6 +446,7 @@ void Van::PackMeta(const Meta& meta, char** meta_buf, int* buf_size) {
   if (meta.sender != Meta::kEmpty) pb.set_sender(meta.sender);
   if (meta.body.size()) pb.set_body(meta.body);
   pb.set_push(meta.push);
+  pb.set_set(meta.set);
   pb.set_request(meta.request);
   pb.set_simple_app(meta.simple_app);
   pb.set_customer_id(meta.customer_id);
@@ -489,6 +490,7 @@ void Van::UnpackMeta(const char* meta_buf, int buf_size, Meta* meta) {
   meta->sender = pb.has_sender() ? pb.sender() : meta->sender;
   meta->request = pb.request();
   meta->push = pb.push();
+  meta->set = pb.set();
   meta->simple_app = pb.simple_app();
   meta->body = pb.body();
   meta->customer_id = pb.customer_id();

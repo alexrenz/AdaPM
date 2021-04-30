@@ -12,8 +12,6 @@
 
 #pragma once
 
-using namespace std;
-
 template<typename vT>
 std::string str(vT& v) {
   std::stringstream ss;
@@ -57,7 +55,7 @@ namespace util {
 
   class Stopwatch {
 
-    chrono::time_point<std::chrono::high_resolution_clock> begin;
+    std::chrono::time_point<std::chrono::high_resolution_clock> begin;
 
     std::chrono::high_resolution_clock::duration _elapsed {};
 
@@ -105,20 +103,20 @@ namespace util {
 
     void clear() {
       // clear the trace file
-      ofstream tracefile (fname, ofstream::trunc);
+      std::ofstream tracefile (fname, std::ofstream::trunc);
       tracefile.close();
     }
 
     void operator() (int epoch, double time_elapsed, double step_size, double loss, double accuracy=0) {
-      ofstream tracefile (fname, ofstream::app);
-      tracefile << epoch << "\t" << time_elapsed << "\t" << loss << "\t" << step_size << "\t" << accuracy << endl;
+      std::ofstream tracefile (fname, std::ofstream::app);
+      tracefile << epoch << "\t" << time_elapsed << "\t" << loss << "\t" << step_size << "\t" << accuracy << std::endl;
       tracefile.close();
     }
   };
 
 }
 
-ostream& operator<<(ostream& os, util::Stopwatch& sw) {
+std::ostream& operator<<(std::ostream& os, util::Stopwatch& sw) {
   std::stringstream ss;
   ss.setf(std::ios::fixed);
   ss.precision(3);

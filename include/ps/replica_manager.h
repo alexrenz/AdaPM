@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <ps/internal/postoffice.h>
 #include <zmq_van.h>
-#include "../apps/utils.h"
+#include "utils.h"
 #include "ps/kv_app.h"
 #include <math.h>
 #include <boost/program_options.hpp>
@@ -40,7 +40,6 @@ std::istream& operator>>(std::istream& in, ReplicaSyncMethod& rsm) {
 
 namespace ps {
   const Key SHUTDOWN = -1;
-
 
 
 
@@ -95,7 +94,7 @@ namespace ps {
     static int sync_pause; // period pause (in milliseconds)
     static double syncs_per_sec; // aim for specific number of syncs per seconds
     std::chrono::milliseconds sync_interval {}; // interval (calculated, for interval pauses)
-    chrono::time_point<std::chrono::high_resolution_clock> last_run; // last run (for interval pauses)
+    std::chrono::time_point<std::chrono::high_resolution_clock> last_run; // last run (for interval pauses)
 
     // stopwatches
     util::Stopwatch sw_runtime, sw_collect, sw_write, sw_exchange, time_since_last_report;
@@ -383,7 +382,7 @@ namespace ps {
       size_t i_pos = 0, j_pos = 0;
 
       // pre-allocate (for efficiency)
-      auto max_keys = min(replicas.keys.size(), a.keys.size()+b.keys.size());
+      auto max_keys = std::min(replicas.keys.size(), a.keys.size()+b.keys.size());
       target.keys.reserve(max_keys);
       target.vals.reserve(replicas.vals.size());
 
@@ -522,7 +521,7 @@ namespace ps {
     /**
      * \brief Construct replica manager object
      */
-    ReplicaManager(Handle& h, vector<Key>* replicated_parameters) : handle(h), replicas{} {
+    ReplicaManager(Handle& h, std::vector<Key>* replicated_parameters) : handle(h), replicas{} {
       my_rank = Postoffice::Get()->my_rank();
       world_size = Postoffice::Get()->num_servers();
 

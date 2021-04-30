@@ -1,4 +1,4 @@
-#include "../apps/utils.h"
+#include "utils.h"
 #include "ps/ps.h"
 #include <thread>
 #include <chrono>
@@ -345,7 +345,7 @@ int main(int argc, char *argv[]) {
     ALOG("Heavy mode: run full workload");
   }
 
-  vector<Key> hotspot_keys {};
+  std::vector<Key> hotspot_keys {};
   if (replicate) {
     for(Key k=0; k<num_keys; k+=5) {
       hotspot_keys.push_back(k);
@@ -368,8 +368,7 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    HandleT handle (num_keys, vpk);
-    auto server = new ServerT(server_customer_id, handle, &hotspot_keys);
+    auto server = new ServerT(num_keys, vpk, &hotspot_keys);
     RegisterExitCallback([server](){ delete server; });
 
     // make sure all servers are set up

@@ -40,17 +40,19 @@ message PBMeta {
   // false: the response task to the request task with the same *time*
   optional bool request = 4 [default = false];
   // the unique id of an application
-  optional int32 app_id = 7;
+  optional int32 app_id = 8;
   // the timestamp of this message
-  optional int32 timestamp = 8;
+  optional int32 timestamp = 9;
   // data type of message.data[i]
-  repeated int32 data_type = 9 [packed=true];
+  repeated int32 data_type = 10 [packed=true];
   // the locally unique id of an customer
-  optional int32 customer_id = 10;
+  optional int32 customer_id = 11;
   // whether or not a push message
   optional bool push = 5;
+  // whether or not a set message
+  optional bool set = 6 [default = false];
   // whether or not it's for SimpleApp
-  optional bool simple_app = 6 [default = false];
+  optional bool simple_app = 7 [default = false];
   // original sender of this message (only needed when forwarding messages)
-  optional int32 sender = 11 [default = -1];
+  optional int32 sender = 12 [default = -1];
 }

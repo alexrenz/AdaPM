@@ -56,6 +56,9 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     std::stringstream s;
     s << "Key " << x << " in worker " << worker_id << ": " << values_pull << "\n";
     std::cout << s.str();
+
+    // localize
+    kv.Wait(kv.Localize(keys));
   }
 
   kv.Finalize();
@@ -110,8 +113,7 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    HandleT handle (num_keys, num_values_per_key); // the handle specifies how the server handles incoming Push() and Pull() calls
-    auto server = new ServerT(server_customer_id, handle);
+    auto server = new ServerT(num_keys, num_values_per_key);
     RegisterExitCallback([server](){ delete server; });
 
     num_workers = ps::NumServers() * num_threads;

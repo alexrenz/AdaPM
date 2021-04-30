@@ -1,4 +1,4 @@
-#include "../apps/utils.h"
+#include "utils.h"
 #include "ps/ps.h"
 #include <thread>
 #include <chrono>
@@ -21,7 +21,7 @@ bool coloc = false;
 int num_keys = 150;
 std::vector<size_t> value_lengths;
 
-vector <int> sim_push_pull_members = {0,2}; //to assign roles of threads in simultaneous_pushpull
+std::vector <int> sim_push_pull_members = {0,2}; //to assign roles of threads in simultaneous_pushpull
 bool error = false;
 
 std::string prfx ("Variable-length values: ");
@@ -33,7 +33,7 @@ std::string prfx ("Variable-length values: ");
  * passing some values not by reference is intentional.
  * should only be entered by  exactly 2 threads, whose id is set in in sim_push_pull-vector
  */
-void simultaneous_pushpull(WorkerT &kv, vector<Key> &keys, vector<ValT> values,  int worker_id){
+void simultaneous_pushpull(WorkerT &kv, std::vector<Key> &keys, std::vector<ValT> values,  int worker_id){
   CHECK(worker_id == sim_push_pull_members[0] || worker_id == sim_push_pull_members[1]) << " wrong worker w["<< worker_id
     << "] has entered this func for it to work properly,\n Allowed workers:: " << sim_push_pull_members;
   int signflip = -1;
@@ -43,7 +43,7 @@ void simultaneous_pushpull(WorkerT &kv, vector<Key> &keys, vector<ValT> values, 
   // adds  magnitude to clearly distinguish between noise and the real pushes
   for(auto & elem : values) elem = elem * 10 * signflip;
 
-  vector<ValT> pulled_vals(values.size());
+  std::vector<ValT> pulled_vals(values.size());
   int loop_duration = 9999; // chosen number arbitrarily, hope its large enough to cover the whole duration of the LOCALIZE()-Transfer, and not too long.
   for(int e = 0; e < loop_duration; e++){
       kv.Push(keys, values);
@@ -56,7 +56,7 @@ void simultaneous_pushpull(WorkerT &kv, vector<Key> &keys, vector<ValT> values, 
 // Invoked to return to a clean slate in between individual tests.
 void reset_kv_localizes(WorkerT &kv){
   int share = num_keys / ps::NumServers();
-  vector<Key> keyshare(share);
+  std::vector<Key> keyshare(share);
   std::iota(keyshare.begin(), keyshare.end(), (ps::MyRank() * share));
   kv.Localize(keyshare);
 }
@@ -68,8 +68,8 @@ void reset_kv_store(WorkerT &kv){
   size_t lenssum = 0;
   //determining the total sum of lengths of all parameters
   for(size_t e = 0; e < value_lengths.size();e ++ ) lenssum += value_lengths[e];
-  vector<Key> keys (value_lengths.size());
-  vector<ValT> vals (lenssum);
+  std::vector<Key> keys (value_lengths.size());
+  std::vector<ValT> vals (lenssum);
   std::iota(keys.begin(), keys.end(), 0);
 
   // Pulling all parameters/ the complete state of the key-value store
@@ -330,7 +330,8 @@ void vvpk_localize_contention(WorkerT &kv, int customer_id){
         ALOG(prfx << "FAILED. Key " << keys << " has not migrated");
       }
     } else {
-      kv.Wait(kv.Pull(vector <Key> {key}, &values_pull));
+      auto keys = std::vector <Key> {key};
+      kv.Wait(kv.Pull(keys, &values_pull));
     }
   }
 
@@ -579,7 +580,8 @@ void vvpk_localize_nc(WorkerT &kv, int customer_id){
            << " has not migrated in between nodes");
          }
       } else {
-        kv.Wait(kv.Pull(vector <Key> {key}, &values_pull));
+        auto keys = std::vector <Key> {key};
+        kv.Wait(kv.Pull(keys, &values_pull));
       }
 
       for (size_t j = 0; j < values_pull.size(); j++)
@@ -588,7 +590,7 @@ void vvpk_localize_nc(WorkerT &kv, int customer_id){
           ALOG(prfx << " Pull of multiple localized parameters FAILED on node " << rank <<"; key " << key << " input "
                   << values << " differs from pulled " << values_pull << ". Affected pos: "
                   << values[lens_offset + j] << " differs from returned " << values_pull[j]
-                  << " with keys " << vector<Key> {key});
+                  << " with keys " << std::vector<Key> {key});
         }
       lens_offset += value_lengths[keys[e]];
     }
@@ -612,7 +614,8 @@ void vvpk_localize_nc(WorkerT &kv, int customer_id){
           << " has not migrated in between nodes");
         }
       } else {
-        kv.Wait(kv.Pull(vector < Key > {key}, &values_pull));
+        auto keys = std::vector <Key> {key};
+        kv.Wait(kv.Pull(keys, &values_pull));
       }
 
       for (size_t j = 0; j < values_pull.size(); j++)
@@ -651,7 +654,8 @@ void vvpk_localize_nc(WorkerT &kv, int customer_id){
           << " has not migrated in between nodes");
         }
       } else {
-        kv.Wait(kv.Pull(vector < Key > {key}, &values_pull));
+        auto keys = std::vector <Key> {key};
+        kv.Wait(kv.Pull(keys, &values_pull));
       }
 
       for (size_t j = 0; j < values_pull.size(); j++)
@@ -742,8 +746,7 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    HandleT handle (value_lengths.size(), value_lengths); // the handle specifies how the server handles incoming Push() and Pull() calls
-    auto server = new ServerT(server_customer_id, handle);
+    auto server = new ServerT(value_lengths.size(), value_lengths);
     RegisterExitCallback([server](){ delete server; });
 
     // run worker(s)

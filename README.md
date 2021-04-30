@@ -1,15 +1,17 @@
-![lapse logo](docs/lapse2.svg?raw=true) 
+![lapse logo](docs/lapse.svg?raw=true) 
 
 [![Build Status](https://travis-ci.org/alexrenz/lapse-ps.svg?branch=main)](https://travis-ci.org/alexrenz/lapse-ps/)
-![Build on Latest Ubuntu](https://github.com/alexrenz/lapse-ps/workflows/Latest%20Ubuntu/badge.svg)
+![Build on Latest Ubuntu](https://github.com/alexrenz/lapse-ps/actions/workflows/latest-ubuntu.yml/badge.svg)
+![Test bindings](https://github.com/alexrenz/lapse-ps/actions/workflows/bindings.yml/badge.svg)
 [![GitHub license](docs/apache2.svg?raw=true)](./LICENSE)
 
-Lapse2 is a parameter server that combines multiple techniques to manage parameters. It replicates a small set of hot spot parameters, and relocates all other parameters. Combining multiple management techniques is key for efficient distributed training of many ML tasks. More information can be found in our paper on multi-technique parameter servers and Lapse2 ([arXiv.org](https://arxiv.org/abs/2104.00501)).
-Details on the **experiment settings** for this paper can be found in [docs/experiments-arxiv21.md](docs/experiments-arxiv21.md).
+Lapse is a parameter server that implements two key contributions for improving the performance of parameter servers in distributed machine learning:
+1. Lapse implements **dynamic parameter allocation**. I.e., it can relocate parameters among nodes during run time. This capability can improve parameter server performance drastically. More information can be found in our paper on dynamic parameter allocation ([PVLDB](https://www.vldb.org/pvldb/vol13/p1877-renz-wieland.pdf), slightly longer version on [arXiv](https://arxiv.org/abs/2002.00655)). Details on the experiments for this paper can be found in [docs/experiments-vldb20.md](docs/experiments-vldb20.md), the source code used in the paper is tagged [v1.0](https://github.com/alexrenz/lapse-ps/releases/tag/v1.0). 
+2. Lapse supports **multiple management techniques** and leverages a well-suited management technique for each parameter. It replicates a small set of hot spot parameters, and relocates all other parameters. Additionally, it employs specialized management techniques for sampling access. Combining multiple management techniques is key for efficient distributed training of many ML tasks. More information can be found in our paper on multi-technique parameter servers ([arXiv](https://arxiv.org/abs/2104.00501)). Details on the experiments for this paper can be found in [docs/experiments-arxiv21.md](docs/experiments-arxiv21.md), the source code used in the paper is tagged [v2.0](https://github.com/alexrenz/lapse-ps/releases/tag/v2.0).
 
-The implementation of Lapse2 implementation is based on [Lapse1](https://github.com/alexrenz/lapse-ps/releases/tag/v1.0) and [PS-Lite](https://github.com/dmlc/ps-lite).
+The `main` branch contains the latest version of Lapse. Lapse provides bindings to PyTorch, see [bindings/](bindings/). The implementation of Lapse is based on [PS-Lite](https://github.com/dmlc/ps-lite).
 
-Lapse2 provides the following primitives: 
+Lapse provides the following primitives: 
 - `Pull(keys)`: retrieve the values of a set of parameters (identified by keys) from the corresponding servers 
 - `Push(keys, updates)`: send updates for parameters to the corresponding servers
 - `Localize(keys)`: request local allocation of parameters
@@ -39,7 +41,7 @@ A simple example:
 
 ### Build
 
-`lapse2` requires a C++11 compiler such as `g++ >= 4.8` and boost for some the application examples. On Ubuntu >= 13.10, you
+`lapse` requires a C++11 compiler such as `g++ >= 4.8` and boost for some the application examples. On Ubuntu >= 13.10, you
 can install it by
 ```
 sudo apt-get update && sudo apt-get install -y build-essential git libboost-all-dev
@@ -51,6 +53,8 @@ Then clone and build
 git clone https://github.com/alexrenz/lapse-ps
 cd lapse-ps && make
 ```
+
+See [bindings/README.md](bindings/README.md) for how to build the bindings.
 
 ### Getting started
 
@@ -78,7 +82,7 @@ To test dynamic parameter allocation (i.e., moving parameters between servers), 
 
 ```bash
 make -j 4 tests/test_dynamic_allocation
-python tracker/dmlc_local.py -s 4 tests/test_dynamic_allocation
+python tracker/dmlc_local.py -s 4 build/tests/test_dynamic_allocation
 ```
 
 
@@ -90,7 +94,7 @@ There are multiple start scripts. At the moment, we mostly use the following one
 - [tracker/dmlc_ssh.py](tracker/dmlc_ssh.py) to run on a cluster
 To see more information, run `python tracker/dmlc_local.py --help`, for example.
 
-The `-s` flag specifies how many processes (i.e., nodes to use, e.g. `-s 4` uses 4 nodes. In each process, Lapse2 starts one server thread and multiple worker threads. 
+The `-s` flag specifies how many processes/nodes to use. For example, `-s 4` uses 4 nodes. In each process, Lapse starts one server thread and multiple worker threads. 
 
 ### Example Applications
 
@@ -118,7 +122,29 @@ python tracker/dmlc_local.py -s 2  build/apps/matrix_factorization --dataset app
 
 ### Architecture
 
-Lapse2 starts one process per node. Within this process, worker threads access the parameter store directly. A parameter server thread handles requests by other nodes and parameter relocations.
+Lapse starts one process per node. Within this process, worker threads access the parameter store directly. A parameter server thread handles requests by other nodes and parameter relocations.
 
 ![architecture](docs/architecture.png?raw=true)
 
+
+### How to cite
+Please cite the original Lapse publication if you refer to Lapse:
+
+```bibtex
+@article{10.14778/3407790.3407796,
+author = {Renz-Wieland, Alexander and Gemulla, Rainer and Zeuch, Steffen and Markl, Volker},
+title = {Dynamic Parameter Allocation in Parameter Servers},
+year = {2020},
+issue_date = {August 2020},
+publisher = {VLDB Endowment},
+volume = {13},
+number = {12},
+issn = {2150-8097},
+url = {https://doi.org/10.14778/3407790.3407796},
+doi = {10.14778/3407790.3407796},
+journal = {Proc. VLDB Endow.},
+month = jul,
+pages = {1877–1890},
+numpages = {14}
+}
+```

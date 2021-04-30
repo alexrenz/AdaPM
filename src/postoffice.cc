@@ -17,8 +17,7 @@ Postoffice::Postoffice() {
 
 void Postoffice::InitEnvironment() {
   const char* val = NULL;
-  val = CHECK_NOTNULL(Environment::Get()->find("DMLC_NUM_WORKER"));
-  num_workers_ = atoi(val);
+  num_workers_ = 0;
   val =  CHECK_NOTNULL(Environment::Get()->find("DMLC_NUM_SERVER"));
   num_servers_ = atoi(val);
   val = CHECK_NOTNULL(Environment::Get()->find("DMLC_ROLE"));

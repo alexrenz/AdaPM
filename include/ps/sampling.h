@@ -142,6 +142,7 @@ namespace ps {
     static int group_size_;
     static int reuse_factor_;
     static bool postpone_nonlocal_;
+    static size_t sampling_batch_size_;
 
     /**
      * \brief Program options for sampling support
@@ -152,7 +153,8 @@ namespace ps {
         ("sampling.strategy", po::value<SamplingSupportType>(&sampling_strategy)->default_value(SamplingSupportType::Naive), "Sampling strategy (naive [default], preloc, pool, or onlylocal)")
         ("sampling.group_size", po::value<int>(&group_size_)->default_value(250), "(only for 'pool' strategy) Group size, i.e., how may keys should be in one localize")
         ("sampling.reuse", po::value<int>(&reuse_factor_)->default_value(1), "(only for 'pool' strategy) Reuse factor: how often should a sample be used")
-        ("sampling.postpone", po::value<bool>(&postpone_nonlocal_)->default_value(true), "(only for 'pool' strategy) Postpone non-local samples? (default: true)")
+        ("sampling.postpone", po::value<bool>(&postpone_nonlocal_)->default_value(false), "(only for 'pool' strategy) Postpone non-local samples? (default: false)")
+        ("sampling.batch_size", po::value<size_t>(&sampling_batch_size_)->default_value(10000), "In local sampling we batch draw samples in batches. This determines the batch size (default: 10000). Usually, you should not need to change this value.")
         ;
     }
   };
@@ -498,7 +500,8 @@ namespace ps {
       // stats
       fetched_total += group_size_; // stats. don't recount the postponed
 
-      return kv.Localize({to_localize.begin(), to_localize.end()});
+      std::vector<Key> localize {to_localize.begin(), to_localize.end()};
+      return kv.Localize(localize);
     }
 
     // thread for refreshing the pool in the background
@@ -588,6 +591,7 @@ namespace ps {
     using SamplingSupport<Val, Worker>::sample_key_;
     using SamplingSupport<Val, Worker>::id_counters;
     using SamplingSupport<Val, Worker>::workers;
+    using SamplingSupport<Val, Worker>::sampling_batch_size_;
 
   public:
     OnlyLocalSamplingSupport(Key (*const sample_key)()):
@@ -599,10 +603,9 @@ namespace ps {
 
     // OnlyLocal samples a lot of keys. To do this efficiently, we sample batches of Keys
     Key sample(const int customer_id) {
-      constexpr size_t batch_size = 10000;
       // sample a new batch if necessary
       if (sampled_keys[customer_id-1].size() == 0) {
-        for (size_t z=0; z!=batch_size; ++z) {
+        for (size_t z=0; z!=sampling_batch_size_; ++z) {
           sampled_keys[customer_id-1].push((*sample_key_)());
         }
       }
@@ -643,6 +646,7 @@ namespace ps {
   template <typename Val, typename Worker> int SamplingSupport<Val,Worker>::reuse_factor_;
   template <typename Val, typename Worker> int SamplingSupport<Val,Worker>::group_size_;
   template <typename Val, typename Worker> bool SamplingSupport<Val,Worker>::postpone_nonlocal_;
+  template <typename Val, typename Worker> size_t SamplingSupport<Val,Worker>::sampling_batch_size_;
 }
 
 #endif  // PS_SAMPLING_H_

@@ -1,6 +1,6 @@
-name: Latest Ubuntu
+name: Run on latest Ubuntu
 
-on: [push, pull_request]
+on: [push]
 
 jobs:
   build:
@@ -14,7 +14,7 @@ jobs:
       uses: actions/cache@v2
       with:
         path: deps
-        key: ${{ runner.os }}-deps-ubuntu
+        key: ${{ runner.os }}-deps-ubuntu-main
 
     - name: Compile
       run: make

@@ -301,6 +301,8 @@ struct KVMeta {
   int cmd;
   /** \brief whether or not this is a push request */
   bool push;
+  /** \brief whether or not this is a set operation */
+  bool set;
   /** \brief sender's node id */
   int sender;
   /** \brief the associated timestamp */

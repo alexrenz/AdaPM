@@ -64,6 +64,16 @@ inline void InitLogging(const char* argv0) {
 }
 
 // Always-on checking
+
+#undef CHECK
+#undef CHECK_LT
+#undef CHECK_GT
+#undef CHECK_LE
+#undef CHECK_GE
+#undef CHECK_EQ
+#undef CHECK_NE
+#undef CHECK_NOTNULL
+
 #define CHECK(x)                                           \
   if (!(x))                                                \
     dmlc::LogMessageFatal(__FILE__, __LINE__).stream() << "Check "  \
@@ -77,6 +87,14 @@ inline void InitLogging(const char* argv0) {
 #define CHECK_NOTNULL(x) \
   ((x) == NULL ? dmlc::LogMessageFatal(__FILE__, __LINE__).stream() << "Check  notnull: "  #x << ' ', (x) : (x)) // NOLINT(*)
 // Debug-only checking.
+
+#undef DCHECK
+#undef DCHECK_LT
+#undef DCHECK_GT
+#undef DCHECK_LE
+#undef DCHECK_GE
+#undef DCHECK_EQ
+#undef DCHECK_NE
 #ifdef NDEBUG
 #define DCHECK(x) \
   while (false) CHECK(x)
@@ -130,10 +148,13 @@ inline void InitLogging(const char* argv0) {
   { std::stringstream s; s << x << "\n"; std::cout << s.str() << std::flush;} // atomic log [sysChange]
 
 // Poor man version of VLOG
+#undef VLOG
 #define VLOG(x) LOG_INFO.stream()
 
+#undef LOG
 #define LOG(severity) LOG_##severity.stream()
 #define LG LOG_INFO.stream()
+#undef LOG_IF
 #define LOG_IF(severity, condition) \
   !(condition) ? (void)0 : dmlc::LogMessageVoidify() & LOG(severity)
 
