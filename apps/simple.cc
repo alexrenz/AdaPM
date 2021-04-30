@@ -16,8 +16,6 @@
 #include <iostream>
 #include <unistd.h>
 #include <bitset>
-#include <Eigen/Dense>
-#include <Eigen/SparseCore>
 
 using namespace ps;
 using namespace std;

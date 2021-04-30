@@ -16,8 +16,6 @@
 #include <iostream>
 #include <unistd.h>
 #include <bitset>
-#include <Eigen/Dense>
-#include <Eigen/SparseCore>
 #include <random>
 #include <iomanip>
 #include <algorithm>
