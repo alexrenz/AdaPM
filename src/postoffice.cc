@@ -77,7 +77,7 @@ void Postoffice::Start(int customer_id, const char* argv0, const bool do_barrier
   start_mu_.unlock();
 
   // start van
-  van_->Start(customer_id);
+  van_->Start(customer_id, num_network_threads_); // [sysChange]
 
   start_mu_.lock();
   if (init_stage_ == 1) {
@@ -118,7 +118,9 @@ void Postoffice::AddCustomer(Customer* customer) {
     << customer_id << " already exists\n";
   customers_[app_id].insert(std::make_pair(customer_id, customer));
   std::unique_lock<std::mutex> ulk(barrier_mu_);
-  barrier_done_[app_id].insert(std::make_pair(customer_id, false));
+  for(int node_group=0; node_group!=8; ++node_group) {
+    barrier_done_[node_group].insert(std::make_pair(customer_id, false));
+  }
 }
 
 
@@ -162,7 +164,7 @@ void Postoffice::Barrier(int customer_id, int node_group) {
   }
 
   std::unique_lock<std::mutex> ulk(barrier_mu_);
-  barrier_done_[0][customer_id] = false;
+  barrier_done_[node_group][customer_id] = false;
   Message req;
   req.meta.recver = kScheduler;
   req.meta.request = true;
@@ -172,8 +174,8 @@ void Postoffice::Barrier(int customer_id, int node_group) {
   req.meta.control.barrier_group = node_group;
   req.meta.timestamp = van_->GetTimestamp();
   CHECK_GT(van_->Send(req), 0);
-  barrier_cond_.wait(ulk, [this, customer_id] {
-      return barrier_done_[0][customer_id];
+  barrier_cond_.wait(ulk, [this, customer_id, node_group] {
+      return barrier_done_[node_group][customer_id];
     });
 }
 
@@ -195,9 +197,8 @@ void Postoffice::Manage(const Message& recv) {
   const auto& ctrl = recv.meta.control;
   if (ctrl.cmd == Control::BARRIER && !recv.meta.request) {
     barrier_mu_.lock();
-    for (uint customer_id = 0; customer_id < barrier_done_[recv.meta.app_id].size();
-         ++customer_id) {
-      barrier_done_[recv.meta.app_id][customer_id] = true;
+    for (uint customer_id = 0; customer_id < barrier_done_[ctrl.barrier_group].size(); ++customer_id) {
+      barrier_done_[ctrl.barrier_group][customer_id] = true;
     }
     barrier_mu_.unlock();
     barrier_cond_.notify_all();

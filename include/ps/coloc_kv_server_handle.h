@@ -97,9 +97,9 @@ namespace ps {
   template <typename Val>
     struct Parameter {
       // Constructor: normal feature, no inital value
-      Parameter(size_t vpk): val(vpk) {}
+      Parameter(size_t len): val(len) {}
       // Constructor: normal feature, initial value given
-      Parameter(Val* init_val, size_t vpk): val(init_val, vpk) {}
+      Parameter(Val* init_val, size_t len): val(init_val, len) {}
       Parameter() {}
 
       // the parameter value
@@ -111,24 +111,36 @@ namespace ps {
       // indicates whether this feature is cached
       bool cache = false;
 
-      // indicates whether there is a cached value for this feature right now
-      bool have_cached_value = false;
-
       // indicates whether this parameter was updated since the last cache sync
       bool updated = false;
+
+      // data for keeping around values of unused parameters
+      bool keptAround = false; // is the available value a kept around value?
+      chrono::time_point<std::chrono::steady_clock> removeTime; // time of removal
+      long numUses = 0; // number of times this parameter was accessed while at this node
     };
 
 template <typename Val>
 struct DefaultColoServerHandle {
 public:
 
-DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
-  long store_max = Postoffice::Get()->GetServerKeyRanges().back().end();
-  ADLOG("Creating handle for " << num_keys << " (max " << store_max << ") keys with vpk " << vpk);
+  // Uniform parameter lengths: each parameter value has the same length
+  DefaultColoServerHandle(size_t num_keys, size_t uniform_len): DefaultColoServerHandle(num_keys, std::vector<size_t> {uniform_len}) { }
+
+  // Non-uniform parameter lengths: each parameter can have its own value length
+  DefaultColoServerHandle(size_t num_keys, const std::vector<size_t>& value_lengths):
+    transfers {num_keys}, value_lengths {value_lengths},
+    keepAroundUnused{ColoKVServer<Val,DefaultColoServerHandle>::keepAroundUnused != 0},
+    maxKeepAround{std::chrono::microseconds(ColoKVServer<Val,DefaultColoServerHandle>::keepAroundUnused)} {
+
+    long store_max = Postoffice::Get()->GetServerKeyRanges().back().end();
+    ADLOG("Creating handle for " << num_keys << " (max " << store_max << ") keys with " <<
+          (value_lengths.size() == 1 ? "uniform" : "non-uniform") << " lengths " <<
+          " (keep around: " << std::chrono::duration_cast<std::chrono::microseconds>(maxKeepAround).count() << " us)");
 
 #if PS_BACKEND == PS_BACKEND_STD_UNORDERED_LOCKS
-  std::cout << "Handle data structure: std::unordered_map with " << mu_.size() << " locks" << std::endl;
-  store.reserve(store_max);
+    std::cout << "Handle data structure: std::unordered_map with " << mu_.size() << " locks" << std::endl;
+    store.reserve(store_max);
 
 #elif PS_BACKEND == PS_BACKEND_GOOGLE_DENSE
     std::cout << "Handle data structure: Google dense" << std::endl;
@@ -150,13 +162,15 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
 
 #elif PS_BACKEND == PS_BACKEND_ARRAY
     std::cout << "Handle data structure: Val[]" << std::endl;
-    store = new Val[store_max*vpk];
-    std::fill_n(store, store_max, 0);
+    CHECK(false) << "The chosen backend data structure is not implemented";
+    // store = new Val[length_of_all_keys];
+    // std::fill_n(store, store_max, 0);
 
 #elif PS_BACKEND == PS_BACKEND_ARRAY_ATOMIC
     std::cout << "Handle data structure: std::atomic<Val>[]" << std::endl;
-    store = new std::atomic<Val>[store_max];
-    std::fill_n(store, store_max, 0);
+    CHECK(false) << "The chosen backend data structure is not implemented";
+    // store = new std::atomic<Val>[store_max];
+    // std::fill_n(store, store_max, 0);
 
 #else
     std::cout << "Handle data structure: std::unordered" << std::endl;
@@ -176,8 +190,11 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     myRank = Postoffice::Get()->my_rank();
     num_accesses.resize(store_max, 0);
     num_accesses_local.resize(store_max, 0);
+    num_accesses_in_transfer.resize(store_max, 0);
+    num_kept_around.resize(store_max, 0);
+    num_kept_around_used.resize(store_max, 0);
     // clean stats directory
-    if (myRank == 0 && system("exec rm -r stats/locality_stats.rank.*.tsv")==0)
+    if (myRank == 0 && std::system("mkdir -p stats && rm -r stats/locality_stats*.rank.*.tsv")==0)
       ADLOG("Cleaned locality statistics");
 #endif
 
@@ -186,14 +203,21 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     lockAll(); // does nothing if we use LOCK-SINGLE
     for(Key i=myRange.begin(); i!=myRange.end(); ++i) {
       lockSingle(i); // does nothing if we use LOCK-ALL
-      insertKeyUnsafe(i);
+      if(i < num_keys) {
+        insertKeyUnsafe(i);
+#if PS_BACKEND < 10 // map
+        store[i].numUses = 1;
+# else
+        store[i]->numUses = 1; // disable keep around for initial allocation
+#endif
+      }
       unlockSingle(i);
     }
     unlockAll();
   }
 
   ~DefaultColoServerHandle(){
-#if  PS_BACKEND == PS_BACKEND_ARRAY_ATOMIC
+#if PS_BACKEND == PS_BACKEND_ARRAY_ATOMIC
     delete[] store;
 #endif
   }
@@ -224,15 +248,15 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     // add key to local store
 #if PS_BACKEND < 10 // map
     if (val == 0) { // default value
-      store[key] = Parameter<Val>(vpk); // use default value for Val (typically 0)
+      store[key] = Parameter<Val>(get_len(key)); // use default value for Val (typically 0)
     } else {
-      store[key] = Parameter<Val>(val, vpk);
+      store[key] = Parameter<Val>(val, get_len(key));
     }
 # else
     if (val == 0) { // default value
-      store[key] = make_unique<Parameter<Val>>(vpk);
+      store[key] = make_unique<Parameter<Val>>(get_len(key));
     } else {
-      store[key] = make_unique<Parameter<Val>>(val, vpk);
+      store[key] = make_unique<Parameter<Val>>(val, get_len(key));
     }
 #endif
   }
@@ -251,15 +275,40 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
   /**
    * \brief Removes a key from the local data structure (without synchronization)
    *
+   *        If the deleted key has not been used while at this node (and keep around is enabled),
+   *        we keep its value around for a short period of time (to serve pulls).
+   *
    *        Warning: this method is not thread safe.
    */
   inline void removeKeyUnsafe(Key key) {
-    // erase key from local store
+    // special case: keep a cached value around if the key was not used
 #if PS_BACKEND < 10 // map
-    store.erase(key);
-#elif PS_BACKEND == PS_BACKEND_VECTOR_LOCKS || PS_BACKEND == PS_BACKEND_VECTOR
-    store[key].reset();
+    if (keepAroundUnused && store[key].numUses == 1) {
+# else
+    if (keepAroundUnused && store[key]->numUses == 1) {
 #endif
+      // (`== 1` assumes that a relocation calls `attemptLocalPull` once before `removeKey`
+#if PS_BACKEND < 10 // map
+      auto search = store.find(key);
+      if (search != store.end()) {
+        search->second.keptAround = true;
+        search->second.removeTime = std::chrono::steady_clock::now();
+#if PS_LOCALITY_STATS
+        num_kept_around[key]++;
+#endif
+      }
+#else
+      if (store[key] != nullptr) {
+        store[key]->keptAround = true;
+        store[key]->removeTime = std::chrono::steady_clock::now();
+#if PS_LOCALITY_STATS
+        num_kept_around[key]++;
+#endif
+      }
+#endif
+    } else { // normal case: delete the key from the store
+      dropKeyUnsafe(key);
+    }
   }
 
   /**
@@ -282,42 +331,37 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
    *        Warning: this method is not thread safe.
    */
   inline bool attemptLocalPushUnsafe(const Key key, const Val* val) {
-#if PS_LOCALITY_STATS
-    num_accesses[key]++;
-#endif
     // attempt to push the value for this key into the local store
 #if PS_BACKEND < 10 // map
     auto search = store.find(key);
-    if (search == store.end()) {
+    if (search == store.end() || search->second.keptAround) {
       return false;
     } else {
-      mergeValue(search->second.val, val);
+      mergeValue(search->second.val, val, get_len(key));
 
-      // if this feature is cached, we additionally note the updates separately,
+      // if this parameter is replicated, we additionally note the updates separately,
       // so that we can send delta updates to the server later
       if (search->second.cache) {
-        mergeValue(search->second.cached_updates, val);
+        mergeValue(search->second.cached_updates, val, get_len(key));
         search->second.updated = true;
+        ++num_pushs_to_replicas;
       }
-#if PS_LOCALITY_STATS
-      num_accesses_local[key]++;
-#endif
+      search->second.numUses++;
       return true;
     }
 #else
-    if (store[key] == nullptr) {
+    if (store[key] == nullptr || store[key]->keptAround) {
       return false;
     } else {
       auto& param = *store[key];
-      mergeValue(param.val, val);
+      mergeValue(param.val, val, get_len(key));
 
       if (param.cache) {
-        mergeValue(param.cached_updates, val);
+        mergeValue(param.cached_updates, val, get_len(key));
         param.updated = true;
+        ++num_pushs_to_replicas;
       }
-#if PS_LOCALITY_STATS
-      num_accesses_local[key]++;
-#endif
+      ++param.numUses;
       return true;
     }
 #endif
@@ -327,8 +371,8 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
    * \brief Merge a value `merge` into an existing value `target`
    */
   template<typename V1, typename V2>
-    inline void mergeValue(V1& target, V2& merge) {
-    for(uint i=0; i!=vpk; ++i) {
+    inline void mergeValue(V1& target, V2& merge, const size_t len) {
+    for(uint i = 0; i != len; ++i) {
       target[i] += merge[i];
     }
   }
@@ -340,11 +384,11 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
    * @param vals the array to put the value into
    * @return true if the key is local (and therefore, the current value is in vals), false otherwise
    */
-  inline bool attemptLocalPull(const Key key, Val* val) {
+  inline bool attemptLocalPull(const Key key, Val* val, const bool stats=true, const bool regularWorkerCall=false) {
 #if PS_BACKEND_LOCKS
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
-    return attemptLocalPullUnsafe(key, val);
+    return attemptLocalPullUnsafe(key, val, stats, regularWorkerCall);
   }
 
 
@@ -357,7 +401,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
 
-    if ((Postoffice::Get()->shared_memory_access() || !localRequest) && attemptLocalPullUnsafe(key, val)) {
+    if ((Postoffice::Get()->shared_memory_access() || !localRequest) && attemptLocalPullUnsafe(key, val, false)) {
       return ps::Status::LOCAL;
     } else if (transfers.isInTransferUnsafe(key)) {
       if (localRequest)
@@ -365,6 +409,9 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
       else
         transfers.queueRemoteRequestUnsafe(key, queued_msg);
       transfers.addPullToQueueUnsafe(key, val);
+#if PS_LOCALITY_STATS
+    num_accesses_in_transfer[key]++;
+#endif
       return ps::Status::IN_TRANSFER;
     } else {
       return ps::Status::REMOTE;
@@ -387,10 +434,10 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
     } else if (transfers.isInTransferUnsafe(key)) {
       if (localRequest) {
         transfers.queueLocalRequestUnsafe(key, ts, customer);
-        transfers.addPushToQueueUnsafe(key, val, vpk);
+        transfers.addLocalPushToQueueUnsafe(key, val, get_len(key));
       } else {
         transfers.queueRemoteRequestUnsafe(key, queued_msg);
-        transfers.addRemotePushToQueueUnsafe(key, val, vpk, data_ptr);
+        transfers.addRemotePushToQueueUnsafe(key, val, data_ptr);
       }
 
       return ps::Status::IN_TRANSFER;
@@ -432,7 +479,7 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
         return ps::Status::IN_TRANSFER;
       } else {
         // start a new localize
-        transfers.startTransferUnsafe(key, vpk);
+        transfers.startTransferUnsafe(key);
         transfers.queueLocalRequestUnsafe(key, ts, customer);
         return ps::Status::REMOTE;
       }
@@ -466,148 +513,160 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
    *
    *        Warning: this method is not thread safe.
    */
-  inline bool attemptLocalPullUnsafe(const Key key, Val* val) {
+  inline bool attemptLocalPullUnsafe(const Key key, Val* val, const bool stats=true, const bool regularWorkerCall=false) {
 #if PS_LOCALITY_STATS
-    num_accesses[key]++;
+    if (stats) num_accesses[key]++;
 #endif
-    // attempt to pull the value of this key from the local store
+
 #if PS_BACKEND < 10 // map
     auto search = store.find(key);
     if (search == store.end()) {
       return false; // this key is not local
     } else {
-      if (search->second.cache && !search->second.have_cached_value) {
-        // when using value caches, we might have an entry in the backend data structure
-        // although we don't currently have a value for this entry. in this case, return false
-        return false;
-      } else {
-        std::copy_n(begin(search->second.val), vpk, val);
-#if PS_LOCALITY_STATS
-        num_accesses_local[key]++;
-#endif
-        return true;
-      }
-    }
+      auto& param = search->second;
 #else
     if (store[key] == nullptr) {
       return false; // this key is not local
     } else {
       auto& param = (*store[key]);
-      if (param.cache && !param.have_cached_value) {
-        // when using value caches, we might have an entry in the backend data structure
-        // although we don't currently have a value for this entry. in this case, return false
-        return false;
-      } else {
-        std::copy_n(begin(param.val), vpk, val);
-#if PS_LOCALITY_STATS
-        num_accesses_local[key]++;
 #endif
-        return true;
+
+      // key is local
+
+      // special case: if this is a "kept around" value, check whether it is current enough
+      if (param.keptAround) {
+        if (!regularWorkerCall) { // use kept values only for `Pull()` calls (and not for system functions or `PullIfLocal`)
+          return false;
+        }
+        if (std::chrono::steady_clock::now() - param.removeTime > maxKeepAround) {
+          // too old: delete the kept value
+          dropKeyUnsafe(key);
+          return false;
+        }
       }
-    }
+
+      // the actual pull:copy the stored value to the passed location
+      std::copy_n(begin(param.val), get_len(key), val);
+      ++param.numUses;
+
+      // stats
+      if (param.cache) {
+        ++num_pulls_to_replicas;
+      }
+
+      // stats
+#if PS_LOCALITY_STATS
+      if (stats) num_accesses_local[key]++;
 #endif
+
+      // delete the value if this was a "kept around value"
+      if (param.keptAround) {
+#if PS_LOCALITY_STATS
+        num_kept_around_used[key]++;
+#endif
+        dropKeyUnsafe(key);
+      }
+      return true;
+    }
   }
 
   /**
-   * \brief Initialize value caches
+   * \brief Initialize replication of specified parameters
    */
-  void initValueCaches(std::vector<bool>* parameters_to_cache) {
-    cached_parameters = parameters_to_cache;
+  void initializeReplication(SArray<Key>& replicated) {
     lockAll();
     // insert entries for cached parameters
-    for (unsigned long i=0; i!=cached_parameters->size(); ++i) {
-      if ((*cached_parameters)[i]) {
-        lockSingle(i);
+    // for (unsigned long i=0; i!=cached_parameters->size(); ++i) {
+    for (Key key : replicated) {
+      lockSingle(key);
 #if PS_BACKEND < 10 // map
-        auto search = store.find(i);
-        if (search == store.end()) {
+      auto search = store.find(key);
+      if (search == store.end())
 #else
-        if(store[i] == nullptr) {
+      if(store[key] == nullptr)
 #endif
-          insertKeyUnsafe(i);
-
-#if PS_BACKEND < 10 // map
-          auto& param = store[i];
-#else
-          auto& param = (*store[i]);
-#endif
-
-          param.cache = true;
-          param.cached_updates.resize(vpk);
-        }
-        unlockSingle(i);
+      {
+        insertKeyUnsafe(key);
       }
+
+#if PS_BACKEND < 10 // map
+      auto& param = store[key];
+#else
+      auto& param = (*store[key]);
+#endif
+
+      param.cache = true;
+      param.cached_updates.resize(get_len(key));
+      unlockSingle(key);
     }
     unlockAll();
   }
 
   /**
-   * \brief Update the value cache for one parameter (e.g., when a remote pull arrives)
+   * \brief Read locally accumulated updates of replicated parameters.
+   *
+   *        Synchronizes selectively, depending on `threshold`:
+   *        - threshold=-1: synchronize all parameters (including ones with no updates)
+   *        - threshold=0: synchronize parameters with non-zero updates
+   *        - threshold>0: synchronize parameters where norm(updates)>threshold
+   *
    */
-  inline void updateValueCache(const Key key, Val* val) {
-    // update the value cache if this is a cached parameter
-    if ((*cached_parameters)[key]) {
+  void readReplicas(const SArray<Key>& keys, KVPairs<Val>& updates, const double threshold=-1) {
+
+    assert(updates.keys.size() == 0);
+    assert(updates.vals.size() == 0);
+
+    for (unsigned long i=0; i!=keys.size(); ++i) {
+      Key key = keys[i];
 #if PS_BACKEND_LOCKS
       std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
 #if PS_BACKEND < 10 // map
-      auto search = store.find(key);
-      CHECK(search != store.end()) << "Cannot find entry for cached parameter " << key;
-      auto& param = search->second;
-# else
-      CHECK(store[key] != nullptr) << "Didn't find";
+      auto& param = store[key];
+#else
       auto& param = (*store[key]);
 #endif
+      assert(param.cache);
 
-      // update cache only if this parameter is really cached (and not if it is a local parameter)
-      if (param.cache) {
-        std::copy_n(begin(param.val), vpk, val);
+      // extract update
+      if ((threshold == -1) ||
+          (threshold == 0 && param.updated) ||
+          (threshold > 0 && param.updated && l2norm(param.cached_updates) >= threshold)) {
 
-        // apply any updates
-        if (param.updated) {
-          mergeValue(param.val, param.cached_updates);
-        }
-        param.have_cached_value = true;
+        updates.keys.push_back(key);
+
+        // extract accumulated updates
+        std::copy_n(std::begin(param.cached_updates), get_len(key), std::back_inserter(updates.vals));
+
+        // clear accumulated updates (set to 0)
+        std::fill_n(std::begin(param.cached_updates), get_len(key), 0);
+        param.updated = false;
       }
     }
   }
 
+
   /**
-   * \brief Clear all value caches and collect cached updates
+   * \brief Write new parameter value to a replicated parameter
+   *
+   *        Adds updates that were accumulated since the synchronization mechanism
+   *        last read the replica.
    */
-  unsigned long clearValueCachesAndCollectUpdates(std::vector<KVPairs<Val>>& kvs, ps::Addressbook& addressbook, bool collectUpdates = true) {
-    CHECK (cached_parameters != nullptr) << "Caching is not initialized. Thus, cannot clear caches.";
-    auto total_params = cached_parameters->size();
-    unsigned long num_keys = 0;
-    for (unsigned long key=0; key!=total_params; ++key) {
-      if ((*cached_parameters)[key]) {
+  void writeReplica(const Key key, const Val* state) {
 #if PS_BACKEND_LOCKS
-        std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
+    std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
 #if PS_BACKEND < 10 // map
-        auto& param = store[key];
+    auto& param = store[key];
 #else
-        auto& param = (*store[key]);
+    auto& param = (*store[key]);
 #endif
-        if (param.cache) {
-          param.have_cached_value = false;
+    assert(param.cache);
 
-          if (collectUpdates && param.updated) {
-            ++num_keys;
-
-            // copy out updates
-            auto destination = addressbook.getManager(key);
-            kvs[destination].keys.push_back(key);
-            std::copy_n(std::begin(param.cached_updates), vpk, std::back_inserter(kvs[destination].vals));
-
-            // clear updates
-            std::fill_n(std::begin(param.cached_updates), vpk, 0);
-            param.updated = false;
-          }
-        }
-      }
+    // update the replica (adds the local updates that occurred since the sync last read the value)
+    for (size_t j=0; j!=get_len(key); ++j) {
+      param.val[j] = state[j] + param.cached_updates[j];
     }
-    return num_keys;
   }
 
 
@@ -687,33 +746,89 @@ DefaultColoServerHandle(long num_keys, size_t v): transfers{num_keys}, vpk{v} {
    */
   inline bool isLocalUnsafe(const Key key) {
 #if PS_BACKEND < 10
-    return store.find(key) != store.end();
+    auto search = store.find(key);
+    return search != store.end() && !search->second.keptAround;
 #else
-    return store[key] != nullptr;
+    return store[key] != nullptr && !store[key]->keptAround;
 #endif
   }
 
-  const size_t get_vpk() {
-    return vpk;
+  /**
+   * \brief If it is possible to say that a key is non-local
+   *        without acquiring the lock, this method does so.
+   *        Returns true if the parameter is non-local for sure
+   *        Returns false if the parameter (1) is local or (2) it is not
+   *        possible to check the status without acquiring a lock
+   */
+  inline bool nolockNonLocalCheck(const Key key) {
+#if PS_BACKEND < 10
+    return false;
+#else
+    return store[key] == nullptr;
+#endif
   }
 
   /** Write locality statistics to files */
   void writeStats() {
 #if PS_LOCALITY_STATS
-    ofstream statsfile ("stats/locality_stats.rank." + std::to_string(myRank) + ".tsv", ofstream::trunc);
-    statsfile << "Param\tAccesses\tLocal\n";
+    std::string outfile ("stats/locality_stats.rank." + std::to_string(myRank) + ".tsv");
+    ofstream statsfile (outfile, ofstream::trunc);
+    long total_accesses = 0, total_accesses_local = 0, total_accesses_in_transfer = 0, total_kept_around = 0, total_kept_around_used = 0;
+    statsfile << "Param\tAccesses\tLocal\tInTransfer\tKeptAround\tKeptAroundUsed\n";
     for (uint i=0; i!=num_accesses.size(); ++i) {
-      statsfile << i << "\t" << num_accesses[i] << "\t" << num_accesses_local[i] << "\n";
+      statsfile << i << "\t" << num_accesses[i] << "\t" << num_accesses_local[i] << "\t" << num_accesses_in_transfer[i] << "\t" << num_kept_around[i] << "\t" << num_kept_around_used[i] << "\n";
+      total_accesses += num_accesses[i];
+      total_accesses_local += num_accesses_local[i];
+      total_accesses_in_transfer += num_accesses_in_transfer[i];
+      total_kept_around += num_kept_around[i];
+      total_kept_around_used += num_kept_around_used[i];
     }
     statsfile.close();
+    ADLOG("Wrote locality stats for rank " << myRank << " to " << outfile << ". Total: " << total_accesses << " accesses, " << total_accesses_local << " local, " << total_accesses_in_transfer << " in transfer. \n" << 100.0 * total_kept_around_used / total_kept_around << "% of " << total_kept_around << " kept around used" );
 #endif
   }
 
+  /** Returns the length of the value of a specific key */
+  inline const size_t get_len(Key key) {
+    if (value_lengths.size() == 1) return value_lengths[0];
+    else                           return value_lengths[key];
+  }
+
+  /** Returns the sum of the lengths of a list of keys */
+  inline size_t get_total_len(SArray<Key>& keys) {
+    size_t total_len = 0;
+    for(Key key : keys)
+      total_len += get_len(key);
+    return total_len;
+  }
+
+  // allow the server to retrieve stats
+  unsigned long get_num_pulls_to_replicas() const { return num_pulls_to_replicas; }
+  unsigned long get_num_pushs_to_replicas() const { return num_pushs_to_replicas; }
+  void reset_replica_stats() { num_pulls_to_replicas=0; num_pushs_to_replicas=0; }
 
   ColoServerTransfers<Val> transfers; // TODO: make private
-
 private:
-  size_t vpk;
+
+  /** Actually delete a key from the local store */
+  inline void dropKeyUnsafe(Key key) {
+#if PS_BACKEND < 10 // map
+    store.erase(key);
+#else
+    store[key].reset();
+#endif
+  }
+
+  /** Calculate L2-norm of a parameter vector */
+  double l2norm(const std::valarray<Val>& vals) const {
+    double accum = 0;
+    for (Val val : vals) {
+      accum += val*val;
+    }
+    return sqrt(accum);
+  }
+
+  const std::vector<size_t> value_lengths;
 
 #if PS_BACKEND == PS_BACKEND_STD_UNORDERED_LOCKS
   std::unordered_map<Key, Parameter<Val>> store;
@@ -745,14 +860,26 @@ private:
 #endif
 
 #if PS_BACKEND_LOCKS
+  // locks
   std::array<std::mutex, PS_BACKEND_NUM_LOCKS> mu_;
 #endif
+
+  // settings for keeping around unused parameters
+  const bool keepAroundUnused;
+  const std::chrono::steady_clock::duration maxKeepAround;
+
+  // replica stats (approximate, as we don't synchronize these counters)
+  unsigned long num_pulls_to_replicas = 0;
+  unsigned long num_pushs_to_replicas = 0;
 
   // Contains true for the parameters whose value should be cached
   std::vector<bool>* cached_parameters = nullptr;
 #if PS_LOCALITY_STATS
   std::vector<unsigned long> num_accesses;
   std::vector<unsigned long> num_accesses_local;
+  std::vector<unsigned long> num_accesses_in_transfer;
+  std::vector<unsigned long> num_kept_around;
+  std::vector<unsigned long> num_kept_around_used;
   int myRank;
 #endif
 };

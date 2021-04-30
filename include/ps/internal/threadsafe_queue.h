@@ -39,11 +39,12 @@ template<typename T> class ThreadsafeQueue {
    * \brief wait until pop an element from the beginning, threadsafe
    * \param value the poped value
    */
-  void WaitAndPop(T* value) {
+  size_t WaitAndPop(T* value) {
     std::unique_lock<std::mutex> lk(mu_);
     cond_.wait(lk, [this]{return !queue_.empty();});
     *value = std::move(queue_.front());
     queue_.pop_front();
+    return queue_.size();
   }
 
  private:

@@ -148,10 +148,6 @@ class Postoffice {
   /** \brief Returns whether location caches are used */
   inline bool use_location_caches() const { return location_caches_; }
   /** \brief Returns whether value caches are used */
-  inline bool use_value_caches() const { return value_caches_; }
-  /** \brief Enable value caches */
-  void enable_value_caches() { value_caches_ = true; }
-  /** \brief Set whether to access local parameters via shared memory */
   void set_shared_memory_access(bool sm) { shared_memory_access_ = sm; }
   /** \brief Set the maximum key */
   void set_max_key(Key key) { kMaxKey = key; }
@@ -162,6 +158,10 @@ class Postoffice {
   /** \brief Get the number of worker threads per server process */
   inline uint num_worker_threads() { return num_worker_threads_; }
   // end [sysChange]
+
+  // number of network threads [sysChange]
+  int  get_num_network_threads() { return num_network_threads_; }
+  int num_network_threads_ = 1;
 
   /**
    * \brief barrier
@@ -205,7 +205,7 @@ class Postoffice {
   bool coloc_; // [sysChange]
   bool shared_memory_access_ = false; // [sysChange]
   bool location_caches_ = false; // [sysChange]
-  bool value_caches_ = false; // [sysChange]
+  bool replication_ = false; // [sysChange]
   std::unordered_map<int, std::unordered_map<int, bool> > barrier_done_;
   int verbose_;
   std::mutex barrier_mu_;

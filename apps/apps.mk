@@ -1,12 +1,18 @@
 APPS_SRC = $(wildcard apps/*.cc)
-APPS = $(patsubst apps/%.cc, apps/%, $(APPS_SRC))
+APPS = $(patsubst apps/%.cc, build/apps/%, $(APPS_SRC))
 
 # -ltcmalloc_and_profiler
-APPS_LDFLAGS = -Wl,-rpath,$(DEPS_PATH)/lib $(PS_LDFLAGS_SO) -pthread -l boost_system -l boost_program_options -I third_party/eigen3/ ${LAPSE_EXTERNAL_LDFLAGS}
+APPS_LDFLAGS = -Wl,-rpath,$(DEPS_PATH)/lib $(PS_LDFLAGS_SO) -pthread -l boost_system -l boost_program_options -I third_party/eigen3/ ${LAPSE_EXTERNAL_LDFLAGS} -fopenmp
 
-apps/% : apps/%.cc build/libps.a
+build/apps/% : apps/%.cc build/libps.a
 	mkdir -p build/apps
-	$(CXX) -std=c++0x $(CFLAGS) -MM -MT apps/$* $< >apps/$*.d
-	$(CXX) -std=c++0x $(CFLAGS) -o build/$@ $(filter %.cc %.a, $^) $(APPS_LDFLAGS)
+	$(CXX) -std=c++0x $(CFLAGS) -MM -MT build/apps/$* $< >build/apps/$*.d
+	$(CXX) -std=c++0x $(CFLAGS) -o $@ $(filter %.cc %.a, $^) $(APPS_LDFLAGS)
 
--include apps/*.d
+
+-include build/apps/*.d
+
+
+# enable "make apps/[app]"
+apps/% : apps/%.cc
+	make build/apps/$*

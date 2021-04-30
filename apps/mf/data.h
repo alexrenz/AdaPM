@@ -52,15 +52,17 @@ namespace mf {
   /** Part of the training data. Each worker thread holds one such part. */
   class DataPart {
   public:
-  DataPart(SizeT num_rows, SizeT num_cols, SizeT start_row, uint num_workers, const uint num_rows_per_block):
-    _num_rows{num_rows}, _num_cols{num_cols}, _start_row{start_row}, _num_blocks{num_workers}, _num_rows_per_block{num_rows_per_block} {
+    DataPart(SizeT num_rows, SizeT num_cols, const long nnz, SizeT start_row, uint num_workers,
+             const uint num_rows_per_block, const bool use_dsgd):
+      _num_rows{num_rows}, _num_cols{num_cols}, _total_nnz{nnz}, _start_row{start_row},
+      _num_rows_per_block{num_rows_per_block}, _use_dsgd{use_dsgd} {
       _col_nnz = vector<SizeT> (num_cols, 0);
       _row_nnz = vector<SizeT> (num_rows, 0);
-      _block_starts = vector<SizeT> (num_workers+1, 0);
+      _block_starts = vector<SizeT> ((use_dsgd ? num_workers+1 : num_cols+1), 0);
       _num_cols_per_block = round(ceil(1.0*num_cols/num_workers));
     }
 
-    DataPart() {}
+    DataPart(): _total_nnz{0}, _use_dsgd{false} {}
 
     // add a data point to the data structure
     void addDataPoint(SizeT i, SizeT j, ValT x) {
@@ -77,6 +79,7 @@ namespace mf {
     inline const SizeT num_nnz() { return _data.size(); }
     inline const SizeT num_cols() { return _num_cols; }
     inline const SizeT num_rows() { return _num_rows; }
+    inline const long total_nnz() { return _total_nnz; }
 
     inline const SizeT num_cols_per_block() { return _num_cols_per_block; }
     inline const SizeT num_rows_per_block() { return _num_rows_per_block; }
@@ -87,6 +90,7 @@ namespace mf {
 
     inline const SizeT block_start(uint block) { return _block_starts[block]; }
     inline const SizeT block_end(uint block) { return _block_starts[block+1]; }
+    inline const SizeT block_size(uint block) { return block_end(block) - block_start(block); }
     inline const SizeT block_has_nnz(uint block) { return block_start(block) != block_end(block); }
 
     bool empty() { return _num_rows == 0 || _num_cols == 0; }
@@ -94,7 +98,7 @@ namespace mf {
     // prepare data structure for training
     void freeze() {
       if (num_nnz() == 0) {
-        LL << "Warning: a worker has 0 data points";
+        ALOG("Warning: a worker has 0 data points");
         return;
       };
 
@@ -102,20 +106,37 @@ namespace mf {
       std::sort(_data.begin(), _data.end(), columnMajor);
 
       // Identify column starting points and store them in block_starts
-      _block_starts[0] = 0;
-      uint next_block = 1;
-      uint z = 0;
-      while (z!=num_nnz()) {
-        if (_data[z].j >= next_block * _num_cols_per_block) {
+      if (_use_dsgd) {
+        _block_starts[0] = 0;
+        uint next_block = 1;
+        uint z = 0;
+        while (z!=num_nnz()) {
+          if (_data[z].j >= next_block * _num_cols_per_block) {
+            _block_starts[next_block] = z;
+            ++next_block;
+          } else {
+            ++z;
+          }
+        }
+        while (next_block != _block_starts.size()) {
           _block_starts[next_block] = z;
           ++next_block;
-        } else {
-          ++z;
         }
-      }
-      while (next_block != _num_blocks+1) {
-        _block_starts[next_block] = z;
-        ++next_block;
+      } else {// if we use columnwise SGD, one block corresponds to the data points of one column
+        size_t current_j = 0;
+        uint z = 0;
+        while (z!=num_nnz()) {
+          if (_data[z].j >= current_j) {
+            _block_starts[current_j] = z;
+            ++current_j;
+          } else {
+            ++z;
+          }
+        }
+        while (current_j != _block_starts.size()) {
+          _block_starts[current_j] = z;
+          ++current_j;
+        }
       }
 
       // fill permute vector
@@ -124,14 +145,21 @@ namespace mf {
 
       // (temporary)
       // sort blocks by row
-      for (uint b=0; b!=_num_blocks; ++b) {
-        if (block_has_nnz(b)) std::sort(_data.begin()+block_start(b), _data.begin()+block_end(b), rowMajor);
+      if (_use_dsgd) {
+        for (uint b=0; b!=_block_starts.size()-1; ++b) {
+          if (block_has_nnz(b)) std::sort(_data.begin()+block_start(b), _data.begin()+block_end(b), rowMajor);
+        }
       }
     }
 
     // permute one block of the data structure
     void permuteBlock(uint block) {
       if (block_has_nnz(block)) std::random_shuffle(_permutation.begin() + block_start(block), _permutation.begin() + block_end(block));
+    }
+
+    // permute all data points
+    void permuteData() {
+      std::random_shuffle(_permutation.begin(), _permutation.end());
     }
 
   private:
@@ -142,10 +170,11 @@ namespace mf {
     std::vector<SizeT> _block_starts;
     SizeT _num_rows=0;
     SizeT _num_cols=0;
+    const long _total_nnz;
     SizeT _start_row;
-    SizeT _num_blocks;
     SizeT _num_cols_per_block;
     SizeT _num_rows_per_block;
+    const bool _use_dsgd;
   };
 
   /** Initializes a matrix with a sequential block schedule **/

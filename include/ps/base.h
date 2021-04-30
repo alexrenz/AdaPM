@@ -35,5 +35,8 @@ static const int kWorkerThreadGroup = 0;
 /* Status of a parameter: it resides in a local PS, is in transfer to the local PS, or resides on a remote PS */
  enum Status {LOCAL, IN_TRANSFER, REMOTE}; // [sysChange]: status enum
 
+/* ID/handle for a sample */
+using SampleID = size_t;
+
 }  // namespace ps
 #endif  // PS_BASE_H_

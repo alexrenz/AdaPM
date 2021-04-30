@@ -1,15 +1,15 @@
-# disable sudo to use container based build
-sudo: false
+os: linux
+dist: bionic
+language: cpp
 
 # Use Build Matrix to do lint and build seperately
 env:
-  matrix:
-#     - TASK=lint
-#     - TASK=test CXX=g++-4.8
+  jobs:
+     - TASK=test CXX=g++-8
+     - TASK=test CXX=g++-8 LAPSE_EXTERNAL_LDFLAGS="-DPS_BACKEND=1"
      - TASK=test CXX=g++-7
      - TASK=test CXX=g++-7 LAPSE_EXTERNAL_LDFLAGS="-DPS_BACKEND=1"
-#    - TASK=build CXX=g++-4.8
-#    - TASK=build CXX=g++-5
+     - TASK=test CXX=g++-5
 
 # dependent apt packages
 addons:
@@ -17,14 +17,13 @@ addons:
     sources:
       - ubuntu-toolchain-r-test
     packages:
-      - g++-4.8
-#      - g++-5
+      - g++-8
       - g++-7
+      - g++-5
       - wget
       - git
       - libboost-all-dev
       - build-essential
-#      - unzip
 
 before_install:
   - export TRAVIS=tests/travis

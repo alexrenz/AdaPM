@@ -22,6 +22,7 @@ class Resender {
     max_num_retry_ = max_num_retry;
     van_ = van;
     monitor_ = new std::thread(&Resender::Monitoring, this);
+    SET_THREAD_NAME(monitor_, "monitor");
   }
   ~Resender() {
     exit_ = true;

@@ -21,9 +21,11 @@ size_t vpk = 2;
 
 bool error = false;
 
+bool replicate; // set by command line arg
+
 
 template <typename Val>
-void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) { // TODO: it is ugly to pass the server.
+void RunWorker(int customer_id, ServerT* server=nullptr) {
   Start(customer_id);
   WorkerT kv(0, customer_id, *server); // app_id, customer_id
 
@@ -77,6 +79,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) { // TODO
   for(auto timestamp : ts_localize) kv.Wait(timestamp);
 
   std::cout << "Worker " << rank << ":" << customer_id << " is finished " << std::endl;
+  kv.WaitReplicaSync();
   kv.Barrier();
   duration.stop();
 
@@ -90,17 +93,16 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) { // TODO
     std::cout << "Time:  " << duration << "\n";
     if (static_cast<uint>(vals1[0]) == correct[0] &&
         vals1[1] == 2*vals1[0]) {
-      std::cout << "Test: PASSED" << std::endl;
+      std::cout << "Dynamic Allocation" << (replicate ? " (with replication)" : "") << ": PASSED" << std::endl;
     } else {
-      std::cout << "Test: FAILED" << std::endl;
+      std::cout << "Dynamic Allocation" << (replicate ? " (with replication)" : "") << ": FAILED" << std::endl;
       error = true;
     }
     std::cout << "--------------------------" << std::endl;
   }
 
-  kv.Barrier();
-
-  Finalize(customer_id, barrier);
+  kv.Finalize();
+  Finalize(customer_id, false);
 }
 
 int main(int argc, char *argv[]) {
@@ -117,17 +119,31 @@ int main(int argc, char *argv[]) {
     Finalize(0, true);
   } else if (role.compare("server") == 0) { // worker+server
 
+    // replication
+    vector<Key> replicated_keys {};
+    if(argc > 1 && strcmp("replicate", argv[1]) == 0) {
+      ALOG("Replication: on");
+      replicated_keys = {9, 12, 15};
+      replicate = true;
+    } else {
+      ALOG("Replication: off");
+      replicate = false;
+    }
+
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
     HandleT handle (num_keys, vpk);
-    auto server = new ServerT(server_customer_id, handle);
+    auto server = new ServerT(server_customer_id, handle, &replicated_keys);
     RegisterExitCallback([server](){ delete server; });
+
+    // make sure all servers are set up
+    server->Barrier();
 
     // run worker(s)
     std::vector<std::thread> workers {};
     for (int i=0; i!=num_local_workers; ++i)
-      workers.push_back(std::thread(RunWorker<ValT>, i+1, false, server));
+      workers.push_back(std::thread(RunWorker<ValT>, i+1, server));
 
     // wait for the workers to finish
     for (size_t w=0; w!=workers.size(); ++w) {
@@ -136,14 +152,12 @@ int main(int argc, char *argv[]) {
     }
 
     // stop the server
+    server->shutdown();
     Finalize(server_customer_id, true);
 
   } else {
     LL << "Process started with unkown role '" << role << "'.";
   }
-
-
-  CHECK(!error) << "Test failed";
 
   return error;
 }

@@ -349,7 +349,15 @@ class PSTracker:
         env['DMLC_PS_ROOT_PORT'] = str(self.port)
         for k, v in envs.items():
             env[k] = str(v)
-        self.thread = Thread(target = (lambda : subprocess.check_call(self.cmd, env=env, shell=True)), args = ())
+
+        def launch_scheduler(cmd, env):
+            try:
+                subprocess.check_call(cmd, env=env, shell=True)
+            except subprocess.CalledProcessError as e:
+                print("Failed to launch the scheduler: \n" + str(e))
+                os._exit(e.returncode)
+
+        self.thread = Thread(target = launch_scheduler, args = (self.cmd, env))
         self.thread.setDaemon(True)
         self.thread.start()
 

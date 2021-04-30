@@ -102,8 +102,12 @@ inline void InitLogging(const char* argv0) {
 #define DCHECK_EQ(x, y) CHECK((x) == (y))
 #define DCHECK_NE(x, y) CHECK((x) != (y))
 #define ADLOG(x) \
-  { std::stringstream s; s << x << "\n"; std::cout << s.str() << std::flush;} // atomic debug log [sysChange]
+  { std::stringstream ___s; ___s << x << "\n"; std::cout << ___s.str() << std::flush;} // atomic debug log [sysChange]
 #endif  // NDEBUG
+
+// ATOMIC LOG
+#define ALOG(x)                                                        \
+  { std::stringstream ___s; ___s << x << "\n"; std::cout << ___s.str() << std::flush;} // atomic log [sysChange]
 
 // LOG FOR PARAMETER TRANSFERS
 #define TRANSFER_LOG false
@@ -244,6 +248,14 @@ class LogMessageVoidify {
   // higher than "?:". See its usage.
   void operator&(std::ostream&) {}
 };
+
+// name threads (for gdb and top)
+#ifdef __unix__
+#define SET_THREAD_NAME(__thread, __name)                     \
+  { pthread_setname_np(__thread->native_handle(), __name); }
+#else
+#define SET_THREAD_NAME(__thread, __name)
+#endif
 
 }  // namespace dmlc
 

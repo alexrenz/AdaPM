@@ -259,6 +259,10 @@ class KVWorker : public SimpleApp {
    */
   void RunCallback(int timestamp);
   /**
+   * \brief Wait until no further callbacks are stored
+   */
+  void WaitCallbacks();
+  /**
    * \brief send the kv list to all servers
    * @param timestamp the timestamp of the request
    * @param push whether or not it is a push request
@@ -577,6 +581,16 @@ void KVWorker<Val>::RunCallback(int timestamp) {
     callback();
   } else {
     mu_.unlock();
+  }
+}
+
+template <typename Val>
+void KVWorker<Val>::WaitCallbacks() {
+  while (true) {
+    mu_.lock();
+    if (callbacks_.size() == 0) break;
+    mu_.unlock();
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 }
 

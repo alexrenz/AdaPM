@@ -126,9 +126,9 @@ struct Control {
   /** \brief node infos */
   std::vector<Node> node;
   /** \brief the node group for a barrier, such as kWorkerGroup */
-  int barrier_group;
+  int barrier_group=0;
   /** message signature */
-  uint64_t msg_sig;
+  uint64_t msg_sig=0;
 };
 
 /** \brief returns true if the given cmd indicates that the message belongs to a parameter transfer */

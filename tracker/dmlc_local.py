@@ -22,6 +22,7 @@ do
     rc=$?;
     nrep=$((nrep+1));
 done
+exit $rc
 """
 
 class LocalLauncher(object):

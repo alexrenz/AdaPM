@@ -31,15 +31,17 @@ class ZMQVan : public Van {
  public:
   ZMQVan() { }
   virtual ~ZMQVan() { }
+  void* getContext() { return context_; } // [sysChange] to reuse context for, e.g., replica management
 
  protected:
-  void Start(int customer_id) override {
+  void Start(int customer_id, int threads=1) override { // [sysChange]
     // start zmq
     start_mu_.lock();
     if (context_ == nullptr) {
       context_ = zmq_ctx_new();
       CHECK(context_ != NULL) << "create 0mq context failed";
       zmq_ctx_set(context_, ZMQ_MAX_SOCKETS, 65536);
+      zmq_ctx_set(context_, ZMQ_IO_THREADS, threads);
     }
     start_mu_.unlock();
     // zmq_ctx_set(context_, ZMQ_IO_THREADS, 4);

@@ -27,12 +27,12 @@ using namespace std;
 double l2(std::vector<double> &w, std::vector<double> &h, uint h_start_index, uint h_block_num_scalars) {
   double regularization = 0.;
   // w: worker adds reg for local block of w
-  for (uint z=0; z!=w.size(); z++) {
+  for (uint z=0; z!=w.size() && z<num_rows*mf_rank; z++) {
     regularization += w[z] * w[z];
   }
 
   // h: worker i adds reg for i'th block of h
-  for (uint z=h_start_index; z!=h_start_index+h_block_num_scalars; z++) {
+  for (uint z=h_start_index; z!=h_start_index+h_block_num_scalars && z<num_cols*mf_rank; z++) {
     regularization += h[z] * h[z];
   }
 
@@ -71,3 +71,64 @@ double loss_Nzsl_L2(mf::DataPart &data, std::vector<double> &w, std::vector<doub
 
   return loss;
 }
+
+
+/** Calculate non-zero squared loss with L2 regularization for local part of data,
+    without a full copy of the model. Instead, pull factors from the PS on demand.
+    This is slow in the distributed setting, but saves memory (e.g., when running on
+    a single node).
+ */
+double loss_Nzsl_L2_pull(mf::DataPart &data, WorkerT& kv, std::vector<Key>& local_w_keys,
+                         const double lambda, const uint mf_rank, int pos) {
+  double loss = 0;
+
+  std::vector<Key> w_key (1);
+  std::vector<Key> h_key (1);
+  std::vector<ValT> w_i (mf_rank);
+  std::vector<ValT> h_j (mf_rank);
+
+  // iterate over local part of the data
+  for (unsigned long z=0; z!=data.num_nnz(); ++z) {
+    double ip = 0;
+    const mf::DataPoint& dp = data.data()[z];
+    w_key[0] = row_key(dp.i);
+    h_key[0] = col_key(dp.j);
+    kv.Wait(kv.Pull(w_key, &w_i), kv.Pull(h_key, &h_j));
+
+    for (uint r=0; r!=mf_rank; ++r) {
+      ip += w_i[r] * h_j[r];
+    }
+
+    double diff = dp.x - ip;
+    loss += diff * diff;
+  }
+
+  // add L2 regularization
+  if (lambda > 0.) {
+    double regularization = 0.;
+
+    // w: worker adds reg for local block of w
+    for (Key key : local_w_keys) {
+      w_key[0] = key;
+      kv.Wait(kv.Pull(w_key, &w_i));
+      for (uint r=0; r!=mf_rank; r++) {
+        regularization += w_i[r] * w_i[r];
+      }
+    }
+
+    // h: worker i adds reg for i'th block of h
+    auto cols_per_block = data.num_cols_per_block();
+    for (uint j=pos*cols_per_block; j!=(pos+1)*cols_per_block && j<static_cast<size_t>(num_cols); ++j) {
+      h_key[0] = col_key(j);
+      kv.Wait(kv.Pull(h_key, &h_j));
+      for (uint r=0; r!=mf_rank; r++) {
+        regularization += h_j[r] * h_j[r];
+      }
+    }
+
+    loss += lambda * regularization;
+  }
+
+  return loss;
+}
+

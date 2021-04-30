@@ -1,0 +1,26 @@
+name: Latest Ubuntu
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Install package dependencies
+      run: sudo apt-get update && sudo apt-get install -y build-essential git libboost-all-dev
+    - name: Cache dependencies
+      uses: actions/cache@v2
+      with:
+        path: deps
+        key: ${{ runner.os }}-deps-ubuntu
+
+    - name: Compile
+      run: make
+
+    - name: Tests (quick)
+      run: tests/run_tests.sh dont_compile
+
+    - name: Apps
+      run: tests/run_apps.sh

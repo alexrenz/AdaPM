@@ -23,6 +23,7 @@ typedef boost::numeric::ublas::coordinate_matrix<double, boost::numeric::ublas::
 
 using namespace std;
 
+const double TRUNC = 10000;
 
 class UpdateNsqlL2 {
   uint mf_rank;
@@ -63,11 +64,11 @@ class UpdateNsqlL2 {
       w_update[z] = -(f1 * h[z] + f2 * w[z] * f3);
       h_update[z] = -(f1 * w[z] + f2 * h[z] * f4);
 
-      // Truncate gradients
-      // if(w[i*mf_rank+z] > 100) w[i*mf_rank+z] = 100;
-      // if(w[i*mf_rank+z] < -100) w[i*mf_rank+z] = -100;
-      // if(h_update[z] > 100) h_update[z] = 100;
-      // if(h_update[z] < -100) h_update[z] = -100;
+      // Truncate updates
+      if(w_update[z] >  TRUNC) w_update[z] =  TRUNC;
+      if(w_update[z] < -TRUNC) w_update[z] = -TRUNC;
+      if(h_update[z] >  TRUNC) h_update[z] =  TRUNC;
+      if(h_update[z] < -TRUNC) h_update[z] = -TRUNC;
     }
   }
 

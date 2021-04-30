@@ -25,8 +25,10 @@ all: ps tests apps
 include make/deps.mk
 
 clean:
-	rm -rf build $(TESTS) tests/*.d
-	rm -rf build $(APPS) apps/*.d
+	rm -rf build tests/*.d apps/*.d $(TESTS)
+
+clean-all:
+	rm -rf build tests/*.d apps/*.d $(TESTS)
 	find src -name "*.pb.[ch]*" -delete
 	rm -rf deps/
 	rm -rf protobuf-*

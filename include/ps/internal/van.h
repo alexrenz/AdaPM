@@ -47,7 +47,7 @@ class Van {
      * control message, give it to postoffice::manager, otherwise, give it to the
      * accoding app.
      */
-    virtual void Start(int customer_id);
+    virtual void Start(int customer_id, int threads=1); // [sysChange]
 
     /**
      * \brief send a message, It is thread-safe
@@ -78,6 +78,11 @@ class Van {
      * \brief whether it is ready for sending. thread safe
      */
     inline bool IsReady() { return ready_; }
+
+    /**
+    * \brief retrieve list of connected nodes [sysChange]
+    */
+    const std::unordered_map<std::string, int> GetConnectedNodes() { assert(IsReady()); return connected_nodes_; }
 
  protected:
     /**

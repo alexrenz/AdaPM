@@ -27,7 +27,7 @@ namespace ps {
   template <typename Val>
     class ColoServerTransfers {
   public:
-  ColoServerTransfers(long num_keys): transfers(num_keys) {}
+  ColoServerTransfers(size_t num_keys): transfers(num_keys) {}
 
     /**
      * \brief Queues a local push or pull request for a parameter that is in transfer.
@@ -52,18 +52,10 @@ namespace ps {
     }
 
     /**
-     * \brief Get the location for pre-aggregating a push call to a "in transfer" parameter
-     */
-    std::valarray<Val>& getPushTarget(const Key key) {
-      CHECK(transfers[key].ongoing()) << "FATAL! Getting push target for key " << key << ", which is not in transfer";
-      return transfers[key].val;
-    }
-
-    /**
      * \brief Adds a push to the queue of a transfer. When the transfer is finished,
      *        the push will be processed in order.
      */
-    void addPushToQueueUnsafe(const Key key, Val* val, size_t vpk) {
+    void registerPushOp(const Key key, Val* val) {
       transfers[key].ops.push_back(std::make_pair(true, val));
     }
 
@@ -71,13 +63,28 @@ namespace ps {
      * \brief Adds a remote push to the queue of a transfer. Makes sure that the
      *        data that shall be pushed will still be around when the transfer finishes.
      */
-    void addRemotePushToQueueUnsafe(const Key key, Val* val, size_t vpk,
-                                    std::shared_ptr<KVPairs<Val>>& data_ptr) {
+    void addRemotePushToQueueUnsafe(const Key key, Val* val, std::shared_ptr<KVPairs<Val>>& data_ptr) {
       // ensure that the data of the request is still available when the transfer is finished
       transfers[key].push_data_ptrs.push_back(data_ptr);
 
       // add to queue
-      addPushToQueueUnsafe(key, val, vpk);
+      registerPushOp(key, val);
+    }
+
+    /**
+     * \brief Adds a remote push to the queue of a transfer. Makes sure that the
+     *        data will still be around once the transfer finishes.
+     */
+    void addLocalPushToQueueUnsafe(const Key key, Val* val, const size_t len) {
+      // make a copy of the value that is being pushed and keep the copy around
+      //  (This is necessary because we don't require the application to keep
+      //   the value vector around after the Push()-call has returned)
+      std::vector<Val> push_copy (val, val+len);
+      Val* store_val = push_copy.data();
+      transfers[key].pushs.push_back(std::move(push_copy));
+
+      // add to queue
+      registerPushOp(key, store_val);
     }
 
     /**
@@ -128,10 +135,9 @@ namespace ps {
      *        Note: this method is run by the worker thread that requests the localize!
      *        Note: this method is not thread safe
      */
-    void startTransferUnsafe(Key key, size_t vpk) {
+    void startTransferUnsafe(Key key) {
       CHECK(!transfers[key].ongoing()) << "FATAL! Starting a localize for key " << key << ", but already have an ongoing localize";
-      // transfers[key] = Transfer<Val> queue {vpk, customer, ts};
-      transfers[key].start(vpk);
+      transfers[key].start();
     }
 
     ps::Transfer<Val>& getTransferUnsafe(Key key) {

@@ -3,6 +3,7 @@
  */
 #include "ps/internal/customer.h"
 #include "ps/internal/postoffice.h"
+#include <iomanip>
 namespace ps {
 
 const int Node::kEmpty = std::numeric_limits<int>::max();
@@ -12,6 +13,9 @@ Customer::Customer(int app_id, int customer_id, const Customer::RecvHandle& recv
     : app_id_(app_id), customer_id_(customer_id), recv_handle_(recv_handle) {
   Postoffice::Get()->AddCustomer(this);
   recv_thread_ = std::unique_ptr<std::thread>(new std::thread(&Customer::Receiving, this));
+  std::string name = std::to_string(Postoffice::Get()->my_rank()) + "-customer-" + std::to_string(customer_id);
+  if (customer_id == 0) name = std::to_string(Postoffice::Get()->my_rank()) + "-ps";
+  SET_THREAD_NAME(recv_thread_, name.c_str());
 }
 
 Customer::~Customer() {
@@ -57,14 +61,24 @@ bool Customer::AddResponse(int timestamp, int num) {
 }
 
 void Customer::Receiving() {
+  // stats
+  long long q_size = 0;
+  long long iterations = 0;
+  auto r = Postoffice::Get()->my_rank();
+
+  // receive loop
   while (true) {
     Message recv;
-    recv_queue_.WaitAndPop(&recv);
+    ++iterations;
+    q_size += recv_queue_.WaitAndPop(&recv);
     if (!recv.meta.control.empty() &&
         recv.meta.control.cmd == Control::TERMINATE) {
+      if (customer_id_ == 0) {
+        ADLOG("Mean length of recv queue in ps-" << r << ": " << std::setprecision(5) << 1.0*q_size/iterations);
+      }
       break;
     }
-    bool count_msg = recv_handle_(recv); // TODO: need to test this with traditional way to send messages
+    bool count_msg = recv_handle_(recv);
     if (!recv.meta.request) {
       std::lock_guard<std::mutex> lk(tracker_mu_);
       if(count_msg) tracker_[recv.meta.timestamp].second++;

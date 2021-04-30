@@ -192,6 +192,7 @@ void Van::ProcessBarrierCommand(Message* msg) {
       res.meta.app_id = msg->meta.app_id;
       res.meta.customer_id = msg->meta.customer_id;
       res.meta.control.cmd = Control::BARRIER;
+      res.meta.control.barrier_group = group;
       auto group_notify = group;
       if (group == kWorkerThreadGroup) group_notify = kServerGroup; // [sysChange]: in worker thread barriers, send only one reply per node
       for (int r : Postoffice::Get()->GetNodeIDs(group_notify)) {
@@ -252,7 +253,7 @@ void Van::ProcessAddNodeCommand(Message* msg, Meta* nodes, Meta* recovery_nodes)
   }
 }
 
-void Van::Start(int customer_id) {
+void Van::Start(int customer_id, int threads) { // [sysChange]
   // get scheduler info
   start_mu_.lock();
 
@@ -312,6 +313,7 @@ void Van::Start(int customer_id) {
     // start receiver
     receiver_thread_ = std::unique_ptr<std::thread>(
             new std::thread(&Van::Receiving, this));
+    SET_THREAD_NAME(receiver_thread_, "van-receiver");
     init_stage++;
   }
   start_mu_.unlock();

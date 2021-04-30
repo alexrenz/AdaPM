@@ -60,12 +60,8 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     std::cout << s.str();
   }
 
-  // make sure all workers finished
-  kv.Barrier();
-
-  if (customer_id != 0) {
-    Finalize(customer_id, false); // if this is not the main thread, we shut down the system for this thread here
-  }
+  kv.Finalize();
+  Finalize(customer_id, false);
 }
 
 
@@ -106,7 +102,7 @@ int main(int argc, char *argv[]) {
   Postoffice::Get()->enable_dynamic_allocation(num_keys, num_threads);
 
   std::string role = std::string(getenv("DMLC_ROLE"));
-  std::cout << "simple. Starting " << role << ": running " << num_iterations << " iterations on " << num_keys << " keys (" << num_values_per_key << " vpk) in " << num_threads << " threads\n";
+  std::cout << "simple. Starting " << role << ": running " << num_iterations << " iterations on " << num_keys << " keys (" << num_values_per_key << " length) in " << num_threads << " threads\n";
 
   if (role.compare("scheduler") == 0) {
     Start(0);
