@@ -313,7 +313,7 @@ see more info: https://github.com/dmlc/rabit/blob/master/doc/guide.md
         self.thread.start()
 
     def join(self):
-        while self.thread.isAlive():
+        while self.thread.is_alive():
             self.thread.join(100)
 
 class PSTracker:
@@ -363,7 +363,7 @@ class PSTracker:
 
     def join(self):
         if self.cmd is not None:
-            while self.thread.isAlive():
+            while self.thread.is_alive():
                 self.thread.join(100)
 
     def slave_envs(self):
