@@ -32,17 +32,14 @@ python tracker/dmlc_local.py -s 4 build/tests/test_many_key_operations $workload
 python tracker/dmlc_local.py -s 4 build/tests/test_many_key_operations $workload --replicate --rep.sm bg_tree | tee -a "logs/many_keys_replication_tree.log"
 python tracker/dmlc_local.py -s 4 build/tests/test_many_key_operations $workload --replicate --rep.sm bg_butterfly | tee -a "logs/many_keys_replication_butterfly.log"
 
-# test set operation
-python tracker/dmlc_local.py -s 4 build/tests/test_set_operation | tee -a "logs/set_operation.log"
-
 # sampling support
 python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy naive
 python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy preloc
 python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy pool --sampling.reuse 3
 python tracker/dmlc_local.py -s 4 build/tests/test_sampling --sampling.strategy pool --sampling.reuse 3 --replicate 1
 python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy pool --sampling.reuse 3 --sampling.postpone 1
-python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy onlylocal --sampling.batch_size 1
-python tracker/dmlc_local.py -s 4 build/tests/test_sampling --sampling.strategy onlylocal --sampling.batch_size 1 --replicate 1
+python tracker/dmlc_local.py -s 3 build/tests/test_sampling --sampling.strategy onlylocal
+python tracker/dmlc_local.py -s 4 build/tests/test_sampling --sampling.strategy onlylocal --replicate 1
 
 ######################
 ## evaluate

@@ -16,6 +16,8 @@
 #include <iostream>
 #include <unistd.h>
 #include <bitset>
+#include <Eigen/Dense>
+#include <Eigen/SparseCore>
 
 using namespace ps;
 using namespace std;
@@ -56,9 +58,6 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     std::stringstream s;
     s << "Key " << x << " in worker " << worker_id << ": " << values_pull << "\n";
     std::cout << s.str();
-
-    // localize
-    kv.Wait(kv.Localize(keys));
   }
 
   kv.Finalize();
@@ -76,6 +75,9 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("num_iterations,i", po::value<size_t>(&num_iterations)->default_value(4), "number of iterations to run")
     ("num_values_per_key,v", po::value<size_t>(&num_values_per_key)->default_value(3), "number of values per key")
     ;
+
+  // add system options
+  ServerT::AddSystemOptions(desc);
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -113,7 +115,8 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    auto server = new ServerT(num_keys, num_values_per_key);
+    HandleT handle (num_keys, num_values_per_key); // the handle specifies how the server handles incoming Push() and Pull() calls
+    auto server = new ServerT(server_customer_id, handle);
     RegisterExitCallback([server](){ delete server; });
 
     num_workers = ps::NumServers() * num_threads;

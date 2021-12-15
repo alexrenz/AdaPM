@@ -97,13 +97,6 @@ class Customer {
   }
 
   /**
-   * \brief notify waiting threads
-   */
-  void NotifyThreads() {
-    tracker_cond_.notify_all();
-  }
-
-  /**
    * \brief return the number of requests tracked by this customer [sysChange: added]
    */
   inline int num_requests() { return tracker_.size(); }

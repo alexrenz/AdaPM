@@ -29,10 +29,6 @@ namespace ps {
   public:
   ColoServerTransfers(size_t num_keys): transfers(num_keys) {}
 
-    size_t getNumKeys() const {
-        return transfers.size();
-    }
-
     /**
      * \brief Queues a local push or pull request for a parameter that is in transfer.
      *        The request will be answered locally when the transfer is finished.
@@ -59,28 +55,27 @@ namespace ps {
      * \brief Adds a push to the queue of a transfer. When the transfer is finished,
      *        the push will be processed in order.
      */
-    void registerPushOp(const Key key, Val* val, const bool set) {
-      transfers[key].ops.push_back(std::make_pair(set ? OpType::SET : OpType::PUSH, val));
+    void registerPushOp(const Key key, Val* val) {
+      transfers[key].ops.push_back(std::make_pair(true, val));
     }
 
     /**
      * \brief Adds a remote push to the queue of a transfer. Makes sure that the
      *        data that shall be pushed will still be around when the transfer finishes.
      */
-    void addRemotePushToQueueUnsafe(const Key key, Val* val, const bool set,
-                                    std::shared_ptr<KVPairs<Val>>& data_ptr) {
+    void addRemotePushToQueueUnsafe(const Key key, Val* val, std::shared_ptr<KVPairs<Val>>& data_ptr) {
       // ensure that the data of the request is still available when the transfer is finished
       transfers[key].push_data_ptrs.push_back(data_ptr);
 
       // add to queue
-      registerPushOp(key, val, set);
+      registerPushOp(key, val);
     }
 
     /**
      * \brief Adds a remote push to the queue of a transfer. Makes sure that the
      *        data will still be around once the transfer finishes.
      */
-    void addLocalPushToQueueUnsafe(const Key key, Val* val, const size_t len, const bool set) {
+    void addLocalPushToQueueUnsafe(const Key key, Val* val, const size_t len) {
       // make a copy of the value that is being pushed and keep the copy around
       //  (This is necessary because we don't require the application to keep
       //   the value vector around after the Push()-call has returned)
@@ -89,7 +84,7 @@ namespace ps {
       transfers[key].pushs.push_back(std::move(push_copy));
 
       // add to queue
-      registerPushOp(key, store_val, set);
+      registerPushOp(key, store_val);
     }
 
     /**
@@ -99,7 +94,7 @@ namespace ps {
     void addPullToQueueUnsafe(const Key key, Val* val_loc) {
       // store the target location of pulls
       // we copy the latest value there when the transfer finishes
-      transfers[key].ops.push_back(std::make_pair(OpType::PULL, val_loc));
+      transfers[key].ops.push_back(std::make_pair(false, val_loc));
     }
 
     /**

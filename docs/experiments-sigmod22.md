@@ -3,7 +3,7 @@
 This document provides details on the experiments of the following paper:
 
 > A. Renz-Wieland, R. Gemulla, Z. Kaoudi, V. Markl.  
-> *Replicate or Relocate? Non-Uniform Access in Parameter Servers*.  
+> *NuPS: A Parameter Server for Machine Learning with Non-Uniform Parameter Access*.  
 
 The paper is available on [arXiv.org](https://arxiv.org/abs/2104.00501).
 
@@ -62,6 +62,8 @@ The host file is a text file that contains one host name per line. The hosts hav
 
 We ran all experiments with 8 worker threads (`num_threads: 8`). For cluster runs, we used 8 nodes (`-s 8`), for the shared memory single node baseline, we used 1 node (`-s 1`).
 
+To launch on the InfiniBand network, we added the option `-i ibs2` to the launcher.
+
 We ran 3 independent runs of all experiments. To start each experiment with a distinct random starting point, we set `model_seed` to the values `23`, `343239821`, and `78974` in the three runs, respectively.
 
 In the following, we provide all task-specific program options. Program options that are not mentioned explicitly were left at the default values defined in the source code (visible in the `process_program_options` of the corresponding source code file).
@@ -81,14 +83,14 @@ num_relations: 828
 
 neg_ratio: 100
 num_epochs: 100
-max_runtime: 8*60*60    # 8h
+max_runtime: 6*60*60    # 6h
 
 gamma_entity: 2.8265676000215333e-10 
 gamma_relation: 6.626811716399634e-06 
 eta: 0.1868603431873307
 
 async_push: 1
-read_partitioned_dataset: 1
+read_partitioned_dataset: 0
 rep.clip_updates: 0
 
 init_parameters: 1
@@ -100,20 +102,18 @@ eval_freq: -1
 
 ### System variants
 
-For **Lapse2 (default)** (and **Reuse 16x**) we set
+For **NuPS (untuned)** (and **Reuse 16x**) we set
 ```
 localize_parameters_ahead: 1 
-localize_relations_initial: 1
 replicate: 900
 sampling.strategy: pool
 sampling.reuse: 16
 ```
 For **Reuse 64x** we used the same setting but set `sampling.reuse: 64`. For **Reuse with postponing (16x)** and **Reuse with postponing (64x)** we used the corresponding *Reuse* settings and additionally set `sampling.postpone: 1`.
 
-For **Lapse2 (optimal)** we set
+For **NuPS** we set
 ```
 localize_parameters_ahead: 1 
-localize_relations_initial: 1
 replicate: 900
 sampling.strategy: onlylocal 
 ```
@@ -121,7 +121,6 @@ sampling.strategy: onlylocal
 For **Lapse**, we set
 ```
 localize_parameters_ahead: 1 
-localize_relations_initial: 1
 replicate: 0
 sampling.strategy: preloc
 ```
@@ -129,7 +128,6 @@ sampling.strategy: preloc
 For **Classic**, we set
 ```
 localize_parameters_ahead: 0
-localize_relations_initial: 0
 replicate: 0
 sampling.strategy: naive
 ```
@@ -137,7 +135,6 @@ sampling.strategy: naive
 In the Ablation, for **Relocation + Replication**, we set
 ```
 localize_parameters_ahead: 1 
-localize_relations_initial: 1
 replicate: 900
 sampling.strategy: preloc
 ```
@@ -145,7 +142,6 @@ sampling.strategy: preloc
 For **Relocation + Sampling access management**, we set
 ```
 localize_parameters_ahead: 1 
-localize_relations_initial: 1
 replicate: 0
 sampling.strategy: pool
 sampling.reuse: 16
@@ -170,7 +166,7 @@ subsample: 1e-2
 embed_dim: 1000
 
 num_iterations: 20
-max_runtime: 8 * 60*60     #8h
+max_runtime: 6 * 60*60     #6h
 starting_alpha: 0.00625
 negative: 3
 
@@ -189,7 +185,7 @@ write_results:  1
 
 ### System variants
 
-For **Lapse2 (default)** (and **Reuse 16x**) we set
+For **NuPS (untuned)** (and **Reuse 16x**) we set
 ```
 replicate: 3272
 localize_pos: 1 
@@ -198,7 +194,7 @@ sampling.reuse: 16
 ```
 For **Reuse 64x** we used the same setting but set `sampling.reuse: 64`. For **Reuse with postponing (16x)** and **Reuse with postponing (64x)** we used these *Reuse* settings and additionally set `sampling.postpone: 1`.
 
-For **Lapse2 (optimal)** we set
+For **NuPS** we set
 ```
 replicate: 209408
 localize_pos: 1 
@@ -269,7 +265,7 @@ max_runtime: 3*60*60         # 3h
 
 
 ### System variants
-For **Lapse2 (default)**, we set
+For **NuPS (untuned)**, we set
 ```
 replicate: 4889
 prelocate_steps: 1
@@ -288,6 +284,6 @@ prelocate_steps: 0
 ```
 
 ## Other experiments
-For the **Choice of Management Technique** experiments, we used the *Lapse2 (default)* settings, and varied `replicate` as explained in the paper.
+For the **Choice of Management Technique** experiments, we used the *NuPS (untuned)* settings, and varied `replicate` as explained in the paper.
 
-For the **Effect of Replica Staleness** experiments, we used the *Lapse2 (default)* settings, and set `rep.syncs_per_sec` to the corresponding values (`0`, `0.2`, `1`, `5`, and `25`).
+For the **Effect of Replica Staleness** experiments, we used the *NuPS (untuned)* settings, and set `rep.syncs_per_sec` to the corresponding values (`0`, `0.2`, `1`, `5`, `25`, and `125`).

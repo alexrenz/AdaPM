@@ -142,7 +142,6 @@ namespace ps {
     static int group_size_;
     static int reuse_factor_;
     static bool postpone_nonlocal_;
-    static size_t sampling_batch_size_;
 
     /**
      * \brief Program options for sampling support
@@ -153,8 +152,7 @@ namespace ps {
         ("sampling.strategy", po::value<SamplingSupportType>(&sampling_strategy)->default_value(SamplingSupportType::Naive), "Sampling strategy (naive [default], preloc, pool, or onlylocal)")
         ("sampling.group_size", po::value<int>(&group_size_)->default_value(250), "(only for 'pool' strategy) Group size, i.e., how may keys should be in one localize")
         ("sampling.reuse", po::value<int>(&reuse_factor_)->default_value(1), "(only for 'pool' strategy) Reuse factor: how often should a sample be used")
-        ("sampling.postpone", po::value<bool>(&postpone_nonlocal_)->default_value(false), "(only for 'pool' strategy) Postpone non-local samples? (default: false)")
-        ("sampling.batch_size", po::value<size_t>(&sampling_batch_size_)->default_value(10000), "In local sampling we batch draw samples in batches. This determines the batch size (default: 10000). Usually, you should not need to change this value.")
+        ("sampling.postpone", po::value<bool>(&postpone_nonlocal_)->default_value(true), "(only for 'pool' strategy) Postpone non-local samples? (default: true)")
         ;
     }
   };
@@ -500,8 +498,7 @@ namespace ps {
       // stats
       fetched_total += group_size_; // stats. don't recount the postponed
 
-      std::vector<Key> localize {to_localize.begin(), to_localize.end()};
-      return kv.Localize(localize);
+      return kv.Localize({to_localize.begin(), to_localize.end()});
     }
 
     // thread for refreshing the pool in the background
@@ -591,21 +588,23 @@ namespace ps {
     using SamplingSupport<Val, Worker>::sample_key_;
     using SamplingSupport<Val, Worker>::id_counters;
     using SamplingSupport<Val, Worker>::workers;
-    using SamplingSupport<Val, Worker>::sampling_batch_size_;
 
   public:
-    OnlyLocalSamplingSupport(Key (*const sample_key)()):
-      NaiveSamplingSupport<Val, Worker>(sample_key), sampled_keys(Postoffice::Get()->num_worker_threads()) {
-      ALOG("OnlyLocal sampling support");
+    OnlyLocalSamplingSupport(Key (*const sample_key)(), const Key min_key, const Key max_key):
+      NaiveSamplingSupport<Val, Worker>(sample_key),
+      sampled_keys(Postoffice::Get()->num_worker_threads()),
+      _min_key(min_key), _max_key(max_key) {
+      ALOG("OnlyLocal sampling support, " << (_min_key == _max_key ? "general" : "memory friendly") << " implementation");
     }
 
     // prepare_sample is identical to the naive one
 
     // OnlyLocal samples a lot of keys. To do this efficiently, we sample batches of Keys
     Key sample(const int customer_id) {
+      constexpr size_t batch_size = 1000;
       // sample a new batch if necessary
       if (sampled_keys[customer_id-1].size() == 0) {
-        for (size_t z=0; z!=sampling_batch_size_; ++z) {
+        for (size_t z=0; z!=batch_size; ++z) {
           sampled_keys[customer_id-1].push((*sample_key_)());
         }
       }
@@ -619,12 +618,19 @@ namespace ps {
     int pull_sample(SampleID sample_id, std::vector<Key>& keys, std::vector<Val>& vals, const int customer_id) override {
       assert(keys.size() == 1);
       ++num_pulls;
-      bool found_neg = false;
-      while (!found_neg) {
-        keys[0] = sample(customer_id);
-        found_neg = workers[customer_id-1]->PullIfLocal(keys[0], &vals);
-        ++num_checks;
+
+      if (_min_key == _max_key) { // sampling range is not guaranteed to be continuous, so we use the safe implementation
+        bool found_neg = false;
+        while (!found_neg) {
+          keys[0] = sample(customer_id);
+          found_neg = workers[customer_id-1]->PullIfLocal(keys[0], &vals);
+          ++num_checks;
+        }
+      } else { // sampling range is guaranteed to be continuous, so we use the more memory friendly implementation
+        Key start_key = sample(customer_id);
+        keys[0] = workers[customer_id-1]->PullNextLocal(start_key, &vals, _min_key, _max_key, num_checks);
       }
+
       SamplingSupport<Val, Worker>::count_accesses(keys);
       return -1;
     }
@@ -638,6 +644,8 @@ namespace ps {
     unsigned long long num_checks = 0;
     unsigned long long num_pulls = 0;
     std::vector<std::queue<Key>> sampled_keys;
+    const Key _min_key;
+    const Key _max_key;
   };
 
 
@@ -646,7 +654,6 @@ namespace ps {
   template <typename Val, typename Worker> int SamplingSupport<Val,Worker>::reuse_factor_;
   template <typename Val, typename Worker> int SamplingSupport<Val,Worker>::group_size_;
   template <typename Val, typename Worker> bool SamplingSupport<Val,Worker>::postpone_nonlocal_;
-  template <typename Val, typename Worker> size_t SamplingSupport<Val,Worker>::sampling_batch_size_;
 }
 
 #endif  // PS_SAMPLING_H_

@@ -301,8 +301,6 @@ struct KVMeta {
   int cmd;
   /** \brief whether or not this is a push request */
   bool push;
-  /** \brief whether or not this is a set operation */
-  bool set;
   /** \brief sender's node id */
   int sender;
   /** \brief the associated timestamp */
@@ -436,7 +434,7 @@ void KVServer<Val>::Response(const KVMeta& req, const KVPairs<Val>& res) {
     }
   }
 
-  Postoffice::Get()->van()->Send(msg);
+  Postoffice::Get()->van()->Send(msg, SERVER_MSG);
 }
 
 template <typename Val>

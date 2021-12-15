@@ -21,6 +21,10 @@ static const char* DataTypeName[] = {
   "UINT8", "UINT16", "UINT32", "UINT64",
   "FLOAT", "DOUBLE", "OTHER"
 };
+/** \brief Message origins (used by the van sender thread) */
+const int NO_QUEUING = 0;
+const int SERVER_MSG = 1;
+const int WORKER_MSG = 2;
 /**
  * \brief compare if V and W are the same type
  */
@@ -126,9 +130,9 @@ struct Control {
   /** \brief node infos */
   std::vector<Node> node;
   /** \brief the node group for a barrier, such as kWorkerGroup */
-  int barrier_group=0;
+  int barrier_group;
   /** message signature */
-  uint64_t msg_sig=0;
+  uint64_t msg_sig;
 };
 
 /** \brief returns true if the given cmd indicates that the message belongs to a parameter transfer */
@@ -143,7 +147,7 @@ struct Meta {
   /** \brief default constructor */
   Meta() : head(kEmpty), app_id(kEmpty), customer_id(kEmpty),
            timestamp(kEmpty), sender(kEmpty), recver(kEmpty),
-           request(false), push(false), set(false), simple_app(false) {}
+           request(false), push(false), simple_app(false) {}
   std::string DebugString() const {
     std::stringstream ss;
     if (sender == Node::kEmpty) {
@@ -160,8 +164,7 @@ struct Meta {
       ss << ", app_id=" << app_id
          << ", customer_id=" << customer_id
          << ", simple_app=" << simple_app
-         << ", push=" << push
-         << ", set=" << set;
+         << ", push=" << push;
     }
     if (head != kEmpty) ss << ", head=" << head;
     if (body.size()) ss << ", body=" << body;
@@ -188,8 +191,6 @@ struct Meta {
   bool request;
   /** \brief whether or not a push message */
   bool push;
-  /** \brief whether or not a set message */
-  bool set;
   /** \brief whether or not it's for SimpleApp */
   bool simple_app;
   /** \brief an string body */

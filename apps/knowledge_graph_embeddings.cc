@@ -16,6 +16,8 @@
 #include <iostream>
 #include <unistd.h>
 #include <bitset>
+#include <Eigen/Dense>
+#include <Eigen/SparseCore>
 #include <random>
 #include <iomanip>
 #include <algorithm>
@@ -1360,7 +1362,8 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    auto server = new ServerT(num_keys+1, entity_vector_length, &hotspot_keys);
+    HandleT handle (num_keys+1, entity_vector_length); // the handle specifies how the server handles incoming Push() and Pull() calls
+    auto server = new ServerT(server_customer_id, handle, &hotspot_keys);
     RegisterExitCallback([server](){ delete server; });
 
     num_workers = ps::NumServers() * num_threads;
@@ -1371,7 +1374,7 @@ int main(int argc, char *argv[]) {
     // set up negative sampling
     negs_gen = std::mt19937(model_seed^Postoffice::Get()->my_rank());
     negs_dist = std::uniform_int_distribution<int>{0, static_cast<int>(ne-1)};
-    server->enable_sampling_support(&DrawEntity);
+    server->enable_sampling_support(&DrawEntity, 0, (enforce_random_keys ? 0 : ne)); // if we don't enforce random keys, the sampling range is continuous
 
 
     // run worker(s)

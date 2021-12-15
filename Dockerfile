@@ -20,8 +20,8 @@ RUN echo "export VISIBLE=now" >> /etc/profile
 # 22 for ssh server. 7777 for gdb server.
 EXPOSE 22 7777
 
-RUN useradd -ms /bin/bash lapse
-RUN echo 'lapse:pwd' | chpasswd
+RUN useradd -ms /bin/bash ps
+RUN echo 'ps:pwd' | chpasswd
 
 ########################################################
 # Add custom packages and development environment here

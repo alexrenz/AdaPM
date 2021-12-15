@@ -24,11 +24,13 @@ using namespace std;
 
 
 /** Calculate l2 regularization for the local part of W and one part of H */
-double l2(std::vector<double> &w, std::vector<double> &h, uint h_start_index, uint h_block_num_scalars) {
+double l2(std::vector<double> &w, std::vector<double> &h, uint h_start_index, uint h_block_num_scalars, const bool add_w_l2=true) {
   double regularization = 0.;
-  // w: worker adds reg for local block of w
-  for (uint z=0; z!=w.size() && z<num_rows*mf_rank; z++) {
-    regularization += w[z] * w[z];
+  if (add_w_l2) {
+    // w: worker adds reg for local block of w
+    for (uint z=0; z!=w.size() && z<num_rows*mf_rank; z++) {
+      regularization += w[z] * w[z];
+    }
   }
 
   // h: worker i adds reg for i'th block of h
@@ -41,7 +43,8 @@ double l2(std::vector<double> &w, std::vector<double> &h, uint h_start_index, ui
 
 
 /** Calculate non-zero squared loss with L2 regularization for local part of data */
-double loss_Nzsl_L2(mf::DataPart &data, std::vector<double> &w, std::vector<double> &h, const double lambda, const uint mf_rank, int pos) {
+double loss_Nzsl_L2(mf::DataPart &data, std::vector<double> &w, std::vector<double> &h,
+                    const double lambda, const uint mf_rank, const int pos, const bool add_w_l2) {
   double loss = 0;
   auto vals_per_block = data.num_cols_per_block() * mf_rank;
 
@@ -64,7 +67,7 @@ double loss_Nzsl_L2(mf::DataPart &data, std::vector<double> &w, std::vector<doub
 
   // add L2 regularization
   if (lambda > 0.) {
-    double l2l = l2(w,h,pos*vals_per_block,vals_per_block);
+    double l2l = l2(w, h, pos*vals_per_block, vals_per_block, add_w_l2);
     loss += lambda * l2l;
     /* LLOG("L2 loss: " << lambda * l2l); */
   }
@@ -79,7 +82,7 @@ double loss_Nzsl_L2(mf::DataPart &data, std::vector<double> &w, std::vector<doub
     a single node).
  */
 double loss_Nzsl_L2_pull(mf::DataPart &data, WorkerT& kv, std::vector<Key>& local_w_keys,
-                         const double lambda, const uint mf_rank, int pos) {
+                         const double lambda, const uint mf_rank, const int pos, const bool add_w_l2) {
   double loss = 0;
 
   std::vector<Key> w_key (1);
@@ -108,11 +111,13 @@ double loss_Nzsl_L2_pull(mf::DataPart &data, WorkerT& kv, std::vector<Key>& loca
     double regularization = 0.;
 
     // w: worker adds reg for local block of w
-    for (Key key : local_w_keys) {
-      w_key[0] = key;
-      kv.Wait(kv.Pull(w_key, &w_i));
-      for (uint r=0; r!=mf_rank; r++) {
-        regularization += w_i[r] * w_i[r];
+    if (add_w_l2) {
+      for (Key key : local_w_keys) {
+        w_key[0] = key;
+        kv.Wait(kv.Pull(w_key, &w_i));
+        for (uint r=0; r!=mf_rank; r++) {
+          regularization += w_i[r] * w_i[r];
+        }
       }
     }
 

@@ -4,7 +4,6 @@
 #ifndef PS_RANGE_H_
 #define PS_RANGE_H_
 #include "ps/internal/utils.h"
-#include "ps/base.h"
 namespace ps {
 
 /**
@@ -13,14 +12,14 @@ namespace ps {
 class Range {
  public:
   Range() : Range(0, 0) {}
-  Range(Key begin, Key end) : begin_(begin), end_(end) { }
+  Range(uint64_t begin, uint64_t end) : begin_(begin), end_(end) { }
 
-  Key begin() const { return begin_; }
-  Key end() const { return end_; }
-  Key size() const { return end_ - begin_; }
+  uint64_t begin() const { return begin_; }
+  uint64_t end() const { return end_; }
+  uint64_t size() const { return end_ - begin_; }
  private:
-  Key begin_;
-  Key end_;
+  uint64_t begin_;
+  uint64_t end_;
 };
 
 }  // namespace ps

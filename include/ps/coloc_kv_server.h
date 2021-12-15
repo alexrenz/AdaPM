@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <atomic>
 #include "ps/kv_app.h"
-#include "ps/coloc_kv_worker.h"
 #include "ps/addressbook.h"
 #include <limits>
 #include "ps/replica_manager.h"
@@ -63,7 +62,7 @@ namespace ps {
   template <typename Val>
     struct Transfer {
       bool _ongoing = false;
-      std::vector<std::pair<OpType,Val*>> ops; // queued pull and push operations: <0=pull/1=push/2=set, pointer_to_val_location>
+      std::vector<std::pair<bool,Val*>> ops; // queued pull and push operations: <true=push/false=pull, pointer_to_val_location>
       std::vector<std::shared_ptr<KVPairs<Val>>> push_data_ptrs; // to ensure that push data is still around when transfer is finished
     std::vector<std::vector<Val>> pushs; // holds copies of to-push values (when they are necessary)
       std::vector<WaitingThread> threads; // waiting local worker threads
@@ -143,23 +142,15 @@ namespace ps {
     class ColoKVServer : public KVServer<Val> {
     friend ColoKVWorker<Val, Handle>;
   public:
-
     /**
-     * Construct a Lapse server with uniform value lengths
-     */
-
-    explicit ColoKVServer(size_t num_keys, size_t uniform_len, std::vector<Key>* keys_to_replicate=nullptr) :
-      ColoKVServer(num_keys, std::vector<size_t> {uniform_len}, keys_to_replicate) {}
-
-    /**
-     * \brief Construct a Lapse server
+     * \brief constructor
      *        The system will replicate all keys that are contained in `keys_to_replicate`.
      *        Replication will be disabled entirely (i.e., no replica mgr thread) if
      *        `keys_to_replicate` is a nullptr or contains 0 keys.
      */
-    explicit ColoKVServer(size_t num_keys, std::vector<size_t> value_lengths, std::vector<Key>* keys_to_replicate=nullptr) :
-      KVServer<Val>(0), request_handle_(num_keys, value_lengths), my_rank{Postoffice::Get()->my_rank()},
-      replica_manager_{request_handle_, keys_to_replicate} {
+    explicit ColoKVServer(int app_id, Handle& h, vector<Key>* keys_to_replicate=nullptr) :
+      KVServer<Val>(app_id), request_handle_(h), my_rank{Postoffice::Get()->my_rank()},
+      replica_manager_{h, keys_to_replicate} {
 
       // start the replica manager thread
       if (keys_to_replicate != nullptr && keys_to_replicate->size() != 0) {
@@ -171,16 +162,6 @@ namespace ps {
 
     ~ColoKVServer() {
       delete sampling_;
-    }
-    /**
-    * \brief Retrieve the number of values per parameter key
-    */
-    size_t GetLen(const Key key) const {
-      return request_handle_.get_len(key);
-    }
-
-    size_t GetNumKeys() const {
-      return request_handle_.get_num_keys();
     }
 
     /**
@@ -205,7 +186,7 @@ namespace ps {
       }
 
       // output per-server locality statistics
-      ALOG(//pulls
+      ADLOG(//pulls
             "server " << my_rank << ": " << num_pull_params << " parameters pulled, " <<
             100.0 * num_pull_params_local / num_pull_params << "% local (~" <<
             100.0 * request_handle_.get_num_pulls_to_replicas() / num_pull_params << "% to replicas), " <<
@@ -237,8 +218,14 @@ namespace ps {
 
     /**
      * \brief Enable support for sampling
+     *
+     *        If the sampling function of your application (`sample_key`) draws
+     *        from a _continuous range_ of keys, you can pass the boundaries of
+     *        this range with `min_key` (incl.) and `max_key` (excl.). This
+     *        enables a more memory friendly implementation of local sampling.
+     *
      */
-    void enable_sampling_support(Key (*const sample_key)()) {
+    void enable_sampling_support(Key (*const sample_key)(), const Key min_key=0, const Key max_key=0) {
       auto& sst = SamplingSupport<Val, ColoKVWorker<Val,Handle>>::sampling_strategy;
       switch (sst) {
       case SamplingSupportType::Naive:
@@ -251,7 +238,7 @@ namespace ps {
         sampling_ = new PoolSamplingSupport<Val, ColoKVWorker<Val, Handle>, ColoKVServer<Val, Handle>>(sample_key, this);
         break;
       case SamplingSupportType::OnlyLocal:
-        sampling_ = new OnlyLocalSamplingSupport<Val, ColoKVWorker<Val, Handle>>(sample_key);
+        sampling_ = new OnlyLocalSamplingSupport<Val, ColoKVWorker<Val, Handle>>(sample_key, min_key, max_key);
         break;
       default:
         ALOG("Unkown sampling support type '" << sst << "'. Aborting.");
@@ -274,6 +261,7 @@ namespace ps {
       options.add_options()
         ("sys.keep_unused", po::value<unsigned int>(&keepAroundUnused)->default_value(0), "system option: keep around unused parameters (0: disabled, >0: max time to keep around (in microseconds)")
         ("sys.nw_threads", po::value<int>(&Postoffice::Get()->num_network_threads_)->default_value(3), "number of network threads")
+        ("sys.sender_thread", po::value<int>(&Postoffice::Get()->use_sender_thread_)->default_value(1), "whether and for which messages to use a separate thread in the van to send messages. 0: don't use a separate thread, 1: use the sender thread for server messages, 2: use the sender thread for server and worker messages")
         ;
 
       // replication options
@@ -300,7 +288,7 @@ namespace ps {
       }
     }
 
-    Handle request_handle_; // hides the request_handle_ of KVServer
+    Handle& request_handle_; // hides the request_handle_ of KVServer
     bool Process(const Message& msg); // we re-define Process to use the correct request_handle_
     void ProcessPushPullRequest(std::shared_ptr<KVPairs<Val>>& data, KVPairs<Val>& res,
                                 std::shared_ptr<QueuedMessage<Val>>& queued_msg);
@@ -350,7 +338,6 @@ namespace ps {
       KVMeta& meta = queued_msg.get()->meta;
       meta.cmd       = msg.meta.head;
       meta.push      = msg.meta.push;
-      meta.set       = msg.meta.set;
       meta.sender    = msg.meta.sender;
       meta.timestamp = msg.meta.timestamp;
       meta.customer_id = msg.meta.customer_id;
@@ -408,7 +395,7 @@ namespace ps {
       len = request_handle_.get_len(key);
       ps::Status status;
       if (meta.push) // push request
-        status = request_handle_.processPush(key, data.vals.begin()+data_pos, -1, 0, meta.set, false, queued_msg, data_ptr);
+        status = request_handle_.processPush(key, data.vals.begin() + data_pos, -1, 0, false, queued_msg, data_ptr);
       else // pull request
         status = request_handle_.processPull(key, res.vals.data() + res_pos, -1, 0, false, queued_msg);
 
@@ -612,11 +599,10 @@ namespace ps {
 
       // process queued pull and push operations
       for (size_t r=0; r!=queue.ops.size(); ++r) {
-        OpType optype = queue.ops[r].first; // is this op a push or a pull?
+        bool push = queue.ops[r].first; // is this op a push or a pull?
         Val* queued_val = queue.ops[r].second;
-        if (optype == OpType::PUSH || optype == OpType::SET) { // process the queued push: merge into received value
-          bool set = optype == OpType::SET;
-          request_handle_.mergeValue(val, queued_val, set, len);
+        if (push) { // process the queued push: merge into received value
+          request_handle_.mergeValue(val, queued_val, len);
         } else { // process the queued pull: copy current value to stored destination
           std::copy_n(val, len, queued_val);
         }
@@ -699,7 +685,6 @@ namespace ps {
     msg.meta.customer_id = req.customer_id;
     msg.meta.request     = true;
     msg.meta.push        = req.push;
-    msg.meta.set         = req.set;
     msg.meta.head        = req.cmd;
     msg.meta.timestamp   = req.timestamp;
     msg.meta.recver      = Postoffice::Get()->ServerRankToID(destination);
@@ -714,7 +699,7 @@ namespace ps {
       }
     }
 
-    Postoffice::Get()->van()->Send(msg);
+    Postoffice::Get()->van()->Send(msg, SERVER_MSG);
   }
 
 }  // namespace ps

@@ -12,6 +12,7 @@
 #include "./meta.pb.h"
 #include "./zmq_van.h"
 #include "./resender.h"
+#include <iomanip>
 namespace ps {
 
 // interval in second between to heartbeast signals. 0 means no heartbeat.
@@ -310,6 +311,12 @@ void Van::Start(int customer_id, int threads) { // [sysChange]
     if (Environment::Get()->find("PS_DROP_MSG")) {
       drop_rate_ = atoi(Environment::Get()->find("PS_DROP_MSG"));
     }
+    // start van-sender
+    if (Postoffice::Get()->use_sender_thread()) {
+      sender_thread_ = std::unique_ptr<std::thread>(
+              new std::thread(&Van::Sending, this));
+      SET_THREAD_NAME(sender_thread_, "van-sender");
+    }
     // start receiver
     receiver_thread_ = std::unique_ptr<std::thread>(
             new std::thread(&Van::Receiving, this));
@@ -365,9 +372,15 @@ void Van::Stop() {
   exit.meta.recver = my_node_.id;
   // only customer 0 would call this method
   exit.meta.customer_id = 0;
+  Message exit_sender = exit;
   int ret = SendMsg(exit);
   CHECK_NE(ret, -1);
+  if (Postoffice::Get()->use_sender_thread()) {
+    send_queue_.Push(exit_sender);
+    sender_thread_->join();
+  }
   receiver_thread_->join();
+  ProcessTerminateCommand();
   init_stage = 0;
   if (!is_scheduler_) heartbeat_thread_->join();
   if (resender_) delete resender_;
@@ -380,15 +393,45 @@ void Van::Stop() {
   barrier_count_.clear();
 }
 
-int Van::Send(const Message& msg) {
-  int send_bytes = SendMsg(msg);
-  CHECK_NE(send_bytes, -1);
-  send_bytes_ += send_bytes;
-  if (resender_) resender_->AddOutgoing(msg);
-  if (Postoffice::Get()->verbose() >= 2) {
-    PS_VLOG(2) << "Send: " << msg.DebugString();
+int Van::Send(const Message& msg, const int origin) {
+  if (Postoffice::Get()->use_sender_thread()
+      && origin != NO_QUEUING
+      && origin <= Postoffice::Get()->use_sender_thread()) {
+    // offload sending to the sender thread
+    send_queue_.Push(msg);
+    return 0;
+  } else {
+    // send out the message right away, in this thread
+    int send_bytes = SendMsg(msg);
+    CHECK_NE(send_bytes, -1);
+    send_bytes_ += send_bytes;
+    if (resender_) resender_->AddOutgoing(msg);
+    if (Postoffice::Get()->verbose() >= 2) {
+      PS_VLOG(2) << "Send: " << msg.DebugString();
+    }
+    return send_bytes;
   }
-  return send_bytes;
+}
+
+void Van::Sending() {
+  long long q_size = 0;
+  long long iterations = 0;
+
+  while (true) {
+    Message msg;
+    ++iterations;
+
+    q_size += send_queue_.WaitAndPop(&msg);
+
+    if (!msg.meta.control.empty() &&
+        msg.meta.control.cmd == Control::TERMINATE) {
+      ADLOG("Mean length of send queue in ps-" << Postoffice::Get()->my_rank() <<
+            ": " << std::setprecision(5) << 1.0*q_size/iterations );
+      break;
+    }
+
+    Send(msg, NO_QUEUING);
+  }
 }
 
 void Van::Receiving() {
@@ -420,7 +463,6 @@ void Van::Receiving() {
       // control msg
       auto& ctrl = msg.meta.control;
       if (ctrl.cmd == Control::TERMINATE) {
-        ProcessTerminateCommand();
         break;
       } else if (ctrl.cmd == Control::ADD_NODE) {
         ProcessAddNodeCommand(&msg, &nodes, &recovery_nodes);
@@ -446,7 +488,6 @@ void Van::PackMeta(const Meta& meta, char** meta_buf, int* buf_size) {
   if (meta.sender != Meta::kEmpty) pb.set_sender(meta.sender);
   if (meta.body.size()) pb.set_body(meta.body);
   pb.set_push(meta.push);
-  pb.set_set(meta.set);
   pb.set_request(meta.request);
   pb.set_simple_app(meta.simple_app);
   pb.set_customer_id(meta.customer_id);
@@ -490,7 +531,6 @@ void Van::UnpackMeta(const char* meta_buf, int buf_size, Meta* meta) {
   meta->sender = pb.has_sender() ? pb.sender() : meta->sender;
   meta->request = pb.request();
   meta->push = pb.push();
-  meta->set = pb.set();
   meta->simple_app = pb.simple_app();
   meta->body = pb.body();
   meta->customer_id = pb.customer_id();

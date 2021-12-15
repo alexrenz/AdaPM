@@ -13,7 +13,7 @@ ${PROTOBUF}:
 	$(eval DIR=protobuf-3.5.1)
 	rm -rf $(FILE) $(DIR)
 	$(WGET) $(URL2)/$(FILE) && tar --no-same-owner -zxf $(FILE)
-	cd $(DIR) && export CFLAGS=-fPIC && export CXXFLAGS="-fPIC $(ABI)" && ./configure -prefix=$(DEPS_PATH) && $(MAKE) && $(MAKE) install
+	cd $(DIR) && export CFLAGS=-fPIC && export CXXFLAGS=-fPIC && ./configure -prefix=$(DEPS_PATH) && $(MAKE) && $(MAKE) install
 	rm -rf $(FILE) $(DIR)
 
 # zmq
@@ -24,7 +24,7 @@ ${ZMQ}:
 	$(eval DIR=zeromq-4.1.4)
 	rm -rf $(FILE) $(DIR)
 	$(WGET) $(URL1)/$(FILE) && tar --no-same-owner -zxf $(FILE)
-	cd $(DIR) && export CFLAGS=-fPIC && export CXXFLAGS="-fPIC $(ABI)" && ./configure -prefix=$(DEPS_PATH) --with-libsodium=no --with-libgssapi_krb5=no && $(MAKE) && $(MAKE) install
+	cd $(DIR) && export CFLAGS=-fPIC && export CXXFLAGS=-fPIC && ./configure -prefix=$(DEPS_PATH) --with-libsodium=no --with-libgssapi_krb5=no && $(MAKE) && $(MAKE) install
 	rm -rf $(FILE) $(DIR)
 
 # lz4

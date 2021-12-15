@@ -6,11 +6,11 @@
 #include "ps/internal/utils.h"
 namespace ps {
 
-#ifdef KEY_TYPE
-/*! \brief Use the specified key type */
-using Key = KEY_TYPE;
+#if USE_KEY32
+/*! \brief Use unsigned 32-bit int as the key type */
+using Key = uint32_t;
 #else
-/*! \brief Default: use unsigned 64-bit int as the key type */
+/*! \brief Use unsigned 64-bit int as the key type */
 using Key = uint64_t;
 #endif
 /** \brief node ID for the scheduler */
@@ -34,9 +34,6 @@ static const int kWorkerThreadGroup = 0;
 
 /* Status of a parameter: it resides in a local PS, is in transfer to the local PS, or resides on a remote PS */
  enum Status {LOCAL, IN_TRANSFER, REMOTE}; // [sysChange]: status enum
-
-/* Type of an operation */
-enum class OpType {PULL=0, PUSH=1, SET=2};
 
 /* ID/handle for a sample */
 using SampleID = size_t;

@@ -9,6 +9,7 @@
 #include "ps/coloc_kv_worker.h"
 #include "ps/coloc_kv_server.h"
 #include "ps/coloc_kv_transfers.h"
+#include "../apps/utils.h"
 #include <valarray>
 #include <thread>
 #include <mutex>
@@ -42,9 +43,9 @@
          local parameters.
 
    The desired backend data structure can be specified with the compilation flag PS_BACKEND in
-   the external variable LAPSE_EXTERNAL_LDFLAGS. E.g, the following compiles the knowledge graph
+   the external variable PS_EXTERNAL_LDFLAGS. E.g, the following compiles the knowledge graph
    embeddings app with an unordered map:
-   export LAPSE_EXTERNAL_LDFLAGS="-DPS_BACKEND=1"; make apps/knowledge_graph_embeddings
+   export PS_EXTERNAL_LDFLAGS="-DPS_BACKEND=1"; make apps/knowledge_graph_embeddings
 
 */
 
@@ -104,18 +105,15 @@ namespace ps {
       // the parameter value
       std::valarray<Val> val;
 
-      // for value caches: cached parameter updates
-      std::valarray<Val> cached_updates;
+      // indicates whether this parameter is a replica
+      bool replica = false;
 
-      // indicates whether this feature is cached
-      bool cache = false;
-
-      // indicates whether this parameter was updated since the last cache sync
+      // indicates whether this parameter was updated since the last replica sync
       bool updated = false;
 
       // data for keeping around values of unused parameters
       bool keptAround = false; // is the available value a kept around value?
-      std::chrono::time_point<std::chrono::steady_clock> removeTime; // time of removal
+      chrono::time_point<std::chrono::steady_clock> removeTime; // time of removal
       long numUses = 0; // number of times this parameter was accessed while at this node
     };
 
@@ -202,7 +200,7 @@ public:
     lockAll(); // does nothing if we use LOCK-SINGLE
     for(Key i=myRange.begin(); i!=myRange.end(); ++i) {
       lockSingle(i); // does nothing if we use LOCK-ALL
-      if(i < static_cast<Key>(num_keys)) {
+      if(i < num_keys) {
         insertKeyUnsafe(i);
 #if PS_BACKEND < 10 // map
         store[i].numUses = 1;
@@ -253,9 +251,9 @@ public:
     }
 # else
     if (val == 0) { // default value
-      store[key] = std::make_unique<Parameter<Val>>(get_len(key));
+      store[key] = make_unique<Parameter<Val>>(get_len(key));
     } else {
-      store[key] = std::make_unique<Parameter<Val>>(val, get_len(key));
+      store[key] = make_unique<Parameter<Val>>(val, get_len(key));
     }
 #endif
   }
@@ -317,11 +315,13 @@ public:
    * @param val a pointer to the corresponding values
    * @return true if the key is local (and therefore, was pushed), false otherwise
    */
-  inline bool attemptLocalPush(const Key key, const Val* val, const bool set) {
+  inline bool attemptLocalPush(const Key key, const Val* val) {
+    if (isNonLocal_noLock(key)) { return false; } // try to return early
+
 #if PS_BACKEND_LOCKS
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
-    return attemptLocalPushUnsafe(key, val, set);
+    return attemptLocalPushUnsafe(key, val);
   }
 
   /**
@@ -329,19 +329,18 @@ public:
    *
    *        Warning: this method is not thread safe.
    */
-  inline bool attemptLocalPushUnsafe(const Key key, const Val* val, const bool set) {
+  inline bool attemptLocalPushUnsafe(const Key key, const Val* val) {
     // attempt to push the value for this key into the local store
 #if PS_BACKEND < 10 // map
     auto search = store.find(key);
     if (search == store.end() || search->second.keptAround) {
       return false;
     } else {
-      mergeValue(search->second.val, val, set, get_len(key));
+      mergeValue(search->second.val, val, get_len(key));
 
       // if this parameter is replicated, we additionally note the updates separately,
       // so that we can send delta updates to the server later
-      if (search->second.cache) {
-        mergeValue(search->second.cached_updates, val, set, get_len(key));
+      if (search->second.replica) {
         search->second.updated = true;
         ++num_pushs_to_replicas;
       }
@@ -353,10 +352,9 @@ public:
       return false;
     } else {
       auto& param = *store[key];
-      mergeValue(param.val, val, set, get_len(key));
+      mergeValue(param.val, val, get_len(key));
 
-      if (param.cache) {
-        mergeValue(param.cached_updates, val, set, get_len(key));
+      if (param.replica) {
         param.updated = true;
         ++num_pushs_to_replicas;
       }
@@ -370,15 +368,9 @@ public:
    * \brief Merge a value `merge` into an existing value `target`
    */
   template<typename V1, typename V2>
-    inline void mergeValue(V1& target, V2& merge, const bool set, const size_t len) {
-    if (set) { // set value
-      for(uint i=0; i!=len; ++i) {
-        target[i] = merge[i]; // TODO: use memcpy
-      }
-    } else { // push (i.e., add) value
-      for(uint i=0; i!=len; ++i) {
-        target[i] += merge[i];
-      }
+    inline void mergeValue(V1& target, V2& merge, const size_t len) {
+    for(uint i = 0; i != len; ++i) {
+      target[i] += merge[i];
     }
   }
 
@@ -390,6 +382,8 @@ public:
    * @return true if the key is local (and therefore, the current value is in vals), false otherwise
    */
   inline bool attemptLocalPull(const Key key, Val* val, const bool stats=true, const bool regularWorkerCall=false) {
+    if (isNonLocal_noLock(key)) { return false; } // try to return early
+
 #if PS_BACKEND_LOCKS
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
@@ -427,22 +421,22 @@ public:
   /**
      \brief Process a local or remote push request
   */
-  inline ps::Status processPush(const Key key, Val* val, const int ts, Customer* customer, const bool set, bool localRequest=true,
+  inline ps::Status processPush(const Key key, Val* val, const int ts, Customer* customer, bool localRequest=true,
                                 std::shared_ptr<QueuedMessage<Val>> queued_msg = {},
                                 std::shared_ptr<KVPairs<Val>> data_ptr = {}) {
 #if PS_BACKEND_LOCKS
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
 
-    if ((Postoffice::Get()->shared_memory_access() || !localRequest) && attemptLocalPushUnsafe(key, val, set)) {
+    if ((Postoffice::Get()->shared_memory_access() || !localRequest) && attemptLocalPushUnsafe(key, val)) {
       return ps::Status::LOCAL;
     } else if (transfers.isInTransferUnsafe(key)) {
       if (localRequest) {
         transfers.queueLocalRequestUnsafe(key, ts, customer);
-        transfers.addLocalPushToQueueUnsafe(key, val, get_len(key), set);
+        transfers.addLocalPushToQueueUnsafe(key, val, get_len(key));
       } else {
         transfers.queueRemoteRequestUnsafe(key, queued_msg);
-        transfers.addRemotePushToQueueUnsafe(key, val, set, data_ptr);
+        transfers.addRemotePushToQueueUnsafe(key, val, data_ptr);
       }
 
       return ps::Status::IN_TRANSFER;
@@ -555,7 +549,7 @@ public:
       ++param.numUses;
 
       // stats
-      if (param.cache) {
+      if (param.replica) {
         ++num_pulls_to_replicas;
       }
 
@@ -600,8 +594,7 @@ public:
       auto& param = (*store[key]);
 #endif
 
-      param.cache = true;
-      param.cached_updates.resize(get_len(key));
+      param.replica = true;
       unlockSingle(key);
     }
     unlockAll();
@@ -616,13 +609,15 @@ public:
    *        - threshold>0: synchronize parameters where norm(updates)>threshold
    *
    */
-  void readReplicas(const SArray<Key>& keys, KVPairs<Val>& updates, const double threshold=-1) {
+  void readReplicas(const KVPairs<Val>& state, KVPairs<Val>& updates, const double threshold=-1) {
 
     assert(updates.keys.size() == 0);
     assert(updates.vals.size() == 0);
 
-    for (unsigned long i=0; i!=keys.size(); ++i) {
-      Key key = keys[i];
+    size_t state_pos = 0;
+    for (unsigned long i=0; i!=state.keys.size(); ++i) {
+      Key key = state.keys[i];
+      auto len = get_len(key);
 #if PS_BACKEND_LOCKS
       std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
@@ -631,33 +626,31 @@ public:
 #else
       auto& param = (*store[key]);
 #endif
-      assert(param.cache);
+      assert(param.replica);
 
       // extract update
       if ((threshold == -1) ||
           (threshold == 0 && param.updated) ||
-          (threshold > 0 && param.updated && l2norm(param.cached_updates) >= threshold)) {
-
-        updates.keys.push_back(key);
+          (threshold > 0 && param.updated && diffl2norm(param.val, &state.vals.data()[state_pos]) >= threshold)) {
 
         // extract accumulated updates
-        std::copy_n(std::begin(param.cached_updates), get_len(key), std::back_inserter(updates.vals));
+        updates.keys.push_back(key);
+        for (size_t k=0; k!=len; ++k) {
+          updates.vals.push_back(param.val[k] - state.vals[state_pos+k]);
+        }
 
-        // clear accumulated updates (set to 0)
-        std::fill_n(std::begin(param.cached_updates), get_len(key), 0);
+        // mark that we have extracted these updates
         param.updated = false;
       }
+      state_pos += len;
     }
   }
 
 
   /**
-   * \brief Write new parameter value to a replicated parameter
-   *
-   *        Adds updates that were accumulated since the synchronization mechanism
-   *        last read the replica.
+   * \brief Write a global update to a replicated parameter
    */
-  void writeReplica(const Key key, const Val* state) {
+  void writeReplica(const Key key, const Val* global_update, const Val* my_update) {
 #if PS_BACKEND_LOCKS
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
@@ -666,11 +659,17 @@ public:
 #else
     auto& param = (*store[key]);
 #endif
-    assert(param.cache);
+    assert(param.replica);
 
-    // update the replica (adds the local updates that occurred since the sync last read the value)
-    for (size_t j=0; j!=get_len(key); ++j) {
-      param.val[j] = state[j] + param.cached_updates[j];
+    // update the replica (the global update contains the node's update, so account for that)
+    if (my_update == nullptr) { // this node did not send an update
+      for (size_t j=0; j!=get_len(key); ++j) {
+        param.val[j] += global_update[j];
+      }
+    } else { // this node did send an update
+      for (size_t j=0; j!=get_len(key); ++j) {
+        param.val[j] += global_update[j] - my_update[j];
+      }
     }
   }
 
@@ -765,7 +764,7 @@ public:
    *        Returns false if the parameter (1) is local or (2) it is not
    *        possible to check the status without acquiring a lock
    */
-  inline bool nolockNonLocalCheck(const Key key) {
+  inline bool isNonLocal_noLock(const Key key) {
 #if PS_BACKEND < 10
     return false;
 #else
@@ -773,15 +772,11 @@ public:
 #endif
   }
 
-  const size_t get_num_keys() const {
-      return transfers.getNumKeys();
-  }
-
   /** Write locality statistics to files */
   void writeStats() {
 #if PS_LOCALITY_STATS
     std::string outfile ("stats/locality_stats.rank." + std::to_string(myRank) + ".tsv");
-    std::ofstream statsfile (outfile, ofstream::trunc);
+    ofstream statsfile (outfile, ofstream::trunc);
     long total_accesses = 0, total_accesses_local = 0, total_accesses_in_transfer = 0, total_kept_around = 0, total_kept_around_used = 0;
     statsfile << "Param\tAccesses\tLocal\tInTransfer\tKeptAround\tKeptAroundUsed\n";
     for (uint i=0; i!=num_accesses.size(); ++i) {
@@ -829,10 +824,11 @@ private:
   }
 
   /** Calculate L2-norm of a parameter vector */
-  double l2norm(const std::valarray<Val>& vals) const {
+  double diffl2norm(const std::valarray<Val>& updated, const Val* old) const {
     double accum = 0;
-    for (Val val : vals) {
-      accum += val*val;
+    for (size_t z=0; z!=updated.size(); ++z) {
+      auto diff = updated[z]-old[z];
+      accum += (diff)*(diff);
     }
     return sqrt(accum);
   }

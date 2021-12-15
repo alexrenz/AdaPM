@@ -18,6 +18,25 @@
 using namespace std;
 using namespace util;
 
+enum class Alg {dsgd, columnwise, plain_sgd};
+std::ostream& operator<<(std::ostream &o, const Alg& rsm) {
+  switch(rsm) {
+  case Alg::dsgd: return o << "dsgd";
+  case Alg::columnwise: return o << "columnwise";
+  case Alg::plain_sgd: return o << "plain_sgd";
+  default: return o << "unkown";
+  }
+}
+std::istream& operator>>(std::istream& in, Alg& rsm) {
+  std::string token; in >> token;
+  if (token == "dsgd") rsm = Alg::dsgd;
+  else if (token == "columnwise") rsm = Alg::columnwise;
+  else if (token == "plain_sgd") rsm = Alg::plain_sgd;
+  else { CHECK(false) << "Fatal! Unknown MF algorithm " << token; }
+  return in;
+}
+
+
 // create a binary file from a mmc matrix
 // format: [int size1] [int size 2] [long nnz]  [int dp1.i] [int dp1.j] [double dp1.x]  [int dp2.i] ...
 bool create_binary_from_mmc (std::string fname, std::string fname_binary) {
@@ -91,12 +110,24 @@ bool create_binary_from_mmc (std::string fname, std::string fname_binary) {
   return true;
 }
 
+// data point that is read in from a binary file
+struct ReadDp {
+  int i;
+  int j;
+  double x;
+};
+
+bool compareByColThenRow(const ReadDp &a, const ReadDp &b) {
+  return (a.j == b.j ? a.i < b.i : a.j < b.j);
+}
+
 
 // read matrix for matrix factorization. creates a binary version of the passed mmc file if it doesn't exist yet
 template<typename WorkerT>
 mf::DataPart read_sparse_matrix_part(std::string fname, bool read_partial, int num_workers,
-                                     int worker_id, const size_t num_rows, const size_t num_cols,
-                                     int customer_id, const bool use_dsgd, WorkerT& kv) {
+                                     int worker_id, int num_servers, int my_rank,
+                                     const size_t num_rows, const size_t num_cols,
+                                     const int customer_id, const Alg algorithm, WorkerT& kv) {
   long nnz;
 
   std::string fname_binary = fname + ".bin";
@@ -131,38 +162,74 @@ mf::DataPart read_sparse_matrix_part(std::string fname, bool read_partial, int n
   }
 
   // Each worker reads only one block of rows
-  int read_min = 0;
-  int read_max = std::numeric_limits<int>::max();
-  int part_size =  round(ceil(1.0*size1/num_workers));
+  int min_row = 0;
+  int max_row = std::numeric_limits<int>::max();
+  int rows_per_worker = round(ceil(1.0*size1/num_workers));
   if(read_partial) {
-    read_min = part_size * worker_id;
-    read_max = part_size * (worker_id+1);
+    if (algorithm != Alg::columnwise) { // usually, each workers holds one partition of rows
+      min_row = rows_per_worker * worker_id;
+      max_row = rows_per_worker * (worker_id+1);
+    } else { // in columnwise, data points are not partitioned by row exclusively (see below)
+      rows_per_worker = round(ceil(1.0*size1/num_servers));
+      min_row = rows_per_worker * my_rank;
+      max_row = rows_per_worker * (my_rank+1);
+    }
   }
 
   // init matrices (one for each h-block)
-  mf::DataPart data (read_max-read_min, size2, nnz, read_min, num_workers, part_size, use_dsgd);
+  mf::DataPart data (max_row-min_row, size2, nnz, min_row, num_workers, rows_per_worker, algorithm == Alg::dsgd);
 
   // read matrix
-  struct ReadDp {
-    int i;
-    int j;
-    double x;
-  };
   ReadDp dp;
 
-  for(int p=0; p<nnz; p++) {
-    // if(p % 1000 == 0) cout << "Line " << p << "/" << nnz << endl;
+  // For the columnwise algorithm, we partition data points to nodes _by row_,
+  // and then we partition data points to workers roughly _by column_. "Roughly"
+  // because we assign data points to workers evenly. To achieve this, we first
+  // collect all data points for this node, sort the data points by column, and
+  // then assign the data points to workers evenly. That is not the most
+  // efficient way, but this works for now (and is not timed).
+  std::vector<ReadDp> datapoints_node {};
+  if (algorithm == Alg::columnwise) {
+    datapoints_node.reserve(nnz / num_servers);
+  }
 
+  for(int p=0; p<nnz; p++) {
     // read one data point from the binary file
     in.read((char *) &dp, sizeof(dp));
 
     // read only the rows for this worker
-    if(read_partial && dp.i > read_min && dp.i <= read_max) { // read w_min <= i < read_max (but with index starting at 1 in file)
-      // append to the matrix for the corresponding block
-      data.addDataPoint(dp.i-1, dp.j-1, dp.x);
+    if(read_partial && dp.i > min_row && dp.i <= max_row) { // read w_min <= i < max_row (but with index starting at 1 in file)
+      if (algorithm == Alg::columnwise) {
+        // collect data points first (so we can sort them by column)
+        datapoints_node.push_back(dp);
+      } else {
+        // append to the matrix for the corresponding block
+        data.addDataPoint(dp.i-1, dp.j-1, dp.x);
+      }
     } else {
       // otherwise, still increase nnz count of column j
       data.addColNnz(dp.j-1);
+    }
+  }
+
+  // columnwise: assign data points to workers evenly, by column
+  if (algorithm == Alg::columnwise) {
+    std::sort(datapoints_node.begin(),
+              datapoints_node.end(), compareByColThenRow);
+
+    int num_local_workers = num_workers/num_servers;
+    long dps_per_worker = round(ceil(1.0*datapoints_node.size()/num_local_workers));
+    size_t min_dp = dps_per_worker * (customer_id-1);
+    size_t max_dp = dps_per_worker * (customer_id-1+1);
+
+    for (size_t z=0; z!=datapoints_node.size(); ++z) {
+      auto& dp = datapoints_node[z];
+      if (z >= min_dp && z < max_dp) {
+        data.addDataPoint(dp.i-1, dp.j-1, dp.x);
+      } else {
+        data.addRowNnz(dp.i-1);
+        data.addColNnz(dp.j-1);
+      }
     }
   }
 
@@ -176,7 +243,9 @@ mf::DataPart read_sparse_matrix_part(std::string fname, bool read_partial, int n
 
   in.close();
   data.freeze();
-  LLOG("Data: " << size1 << "x" << size2 << ". Blocks: " << data.num_rows_per_block() << "x" << data.num_cols_per_block() << ". Worker " << worker_id << " has rows [" << read_min << "," << read_max << ") (" << data.num_nnz() << " nnz)" );
+  std::stringstream sc;
+  sc << data.num_nnz() << " of " << datapoints_node.size() << " data points of";
+  LLOG("Data (" << fname.substr(fname.find_last_of("/\\") + 1) << "): " << size1 << "x" << size2 << ". Blocks: " << data.num_rows_per_block() << "x" << data.num_cols_per_block() << ". Worker " << worker_id << " has " << (algorithm == Alg::columnwise ? sc.str() : "") << " rows [" << min_row << "," << max_row << ") (" << data.num_nnz() << " nnz)" );
   return data;
 }
 

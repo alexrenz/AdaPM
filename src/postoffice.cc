@@ -17,7 +17,8 @@ Postoffice::Postoffice() {
 
 void Postoffice::InitEnvironment() {
   const char* val = NULL;
-  num_workers_ = 0;
+  val = CHECK_NOTNULL(Environment::Get()->find("DMLC_NUM_WORKER"));
+  num_workers_ = atoi(val);
   val =  CHECK_NOTNULL(Environment::Get()->find("DMLC_NUM_SERVER"));
   num_servers_ = atoi(val);
   val = CHECK_NOTNULL(Environment::Get()->find("DMLC_ROLE"));
@@ -36,7 +37,7 @@ void Postoffice::Start(int customer_id, const char* argv0, const bool do_barrier
     if (argv0) {
       dmlc::InitLogging(argv0);
     } else {
-      dmlc::InitLogging("lapse\0");
+      dmlc::InitLogging("ps\0");
     }
 
     // init node info. // note: when co-locating, num_workers_=0

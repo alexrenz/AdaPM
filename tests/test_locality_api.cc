@@ -1,4 +1,4 @@
-#include "utils.h"
+#include "../apps/utils.h"
 #include "ps/ps.h"
 #include <thread>
 #include <chrono>
@@ -41,8 +41,8 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
   // wait for all workers to boot up
   kv.Barrier();
 
-  std::vector<Val> vals (2);
-  std::vector<Key> keys (1);
+  vector<Val> vals (2);
+  vector<Key> keys (1);
 
   // check initial locality
   if (worker_id == 0) {
@@ -126,7 +126,8 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    auto server = new ServerT(num_keys, vpk);
+    HandleT handle (num_keys, vpk);
+    auto server = new ServerT(server_customer_id, handle);
     RegisterExitCallback([server](){ delete server; });
 
     // make sure all servers are set up

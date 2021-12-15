@@ -43,23 +43,6 @@ typedef Eigen::SparseMatrix<ValT,Eigen::ColMajor> SpMatrixCM;
 typedef Eigen::Matrix<ValT, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> DeMatrixRM;
 typedef Eigen::Matrix<ValT, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor> DeMatrixCM;
 
-enum class Alg {dsgd, columnwise, plain_sgd};
-std::ostream& operator<<(std::ostream &o, const Alg& rsm) {
-  switch(rsm) {
-  case Alg::dsgd: return o << "dsgd";
-  case Alg::columnwise: return o << "columnwise";
-  case Alg::plain_sgd: return o << "plain_sgd";
-  default: return o << "unkown";
-  }
-}
-std::istream& operator>>(std::istream& in, Alg& rsm) {
-  std::string token; in >> token;
-  if (token == "dsgd") rsm = Alg::dsgd;
-  else if (token == "columnwise") rsm = Alg::columnwise;
-  else if (token == "plain_sgd") rsm = Alg::plain_sgd;
-  else { CHECK(false) << "Fatal! Unknown MF algorithm " << token; }
-  return in;
-}
 
 // Matrix factorization config
 string dataset;
@@ -92,6 +75,7 @@ bool sync_push;
 size_t replicate;
 long max_runtime;
 bool prevent_full_model_pull;
+std::string write_generated_factors;
 
 // set by system
 Key first_col_key;
@@ -136,6 +120,10 @@ double calculate_loss(const int epoch, std::vector<Key>& local_w_keys,
   // wait for sync
   kv.WaitReplicaSync();
 
+  // in columnwise SGD, multiple threads hold the same part of w
+  // we calculate l2 for this block only in the first of these threads
+  bool add_w_l2 = (algorithm == Alg::columnwise && customer_id != 1 ? false : true);
+
   // calculate local loss
   double local_train_loss = 0;
   double local_test_loss = 0;
@@ -152,13 +140,13 @@ double calculate_loss(const int epoch, std::vector<Key>& local_w_keys,
     kv.Barrier();
 
     // calculate loss (with a copy of the model)
-    local_train_loss = loss_Nzsl_L2(train_data, local_w, full_h, lambda, mf_rank, worker_id);
-    local_test_loss =  loss_Nzsl_L2(test_data,  local_w, full_h, 0.0,    mf_rank, worker_id);
+    local_train_loss = loss_Nzsl_L2(train_data, local_w, full_h, lambda, mf_rank, worker_id, add_w_l2);
+    local_test_loss =  loss_Nzsl_L2(test_data,  local_w, full_h, 0.0,    mf_rank, worker_id, add_w_l2);
   } else {
     // calculate loss (pulling necessary factors on demand)
     if (worker_id == 0) ADLOG("No full model pull for eval. Pull factors on demand.");
-    local_train_loss = loss_Nzsl_L2_pull(train_data, kv, local_w_keys, lambda, mf_rank, worker_id);
-    local_test_loss =  loss_Nzsl_L2_pull(test_data,  kv, local_w_keys, 0.0,    mf_rank, worker_id);
+    local_train_loss = loss_Nzsl_L2_pull(train_data, kv, local_w_keys, lambda, mf_rank, worker_id, add_w_l2);
+    local_test_loss =  loss_Nzsl_L2_pull(test_data,  kv, local_w_keys, 0.0,    mf_rank, worker_id, add_w_l2);
   }
   // ADLOG("Local training loss (worker " << worker_id << "): " << local_train_loss);
   // ADLOG("Local test loss (worker " << worker_id << "): " << local_test_loss);
@@ -240,8 +228,8 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
   // Load train data
   sw["read_data"].start();
-  mf::DataPart data = read_sparse_matrix_part(dataset + string("train.mmc"), true, num_workers, worker_id, num_rows, num_cols, customer_id, algorithm == Alg::dsgd, kv);
-  mf::DataPart data_test = read_sparse_matrix_part(dataset + string("test.mmc"), true, num_workers, worker_id, num_rows, num_cols, customer_id, algorithm == Alg::dsgd, kv);
+  mf::DataPart data =      read_sparse_matrix_part(dataset + string("train.mmc"), true, num_workers, worker_id, Postoffice::Get()->num_servers(), ps::MyRank(), num_rows, num_cols, customer_id, algorithm, kv);
+  mf::DataPart data_test = read_sparse_matrix_part(dataset + string("test.mmc"),  true, num_workers, worker_id, Postoffice::Get()->num_servers(), ps::MyRank(), num_rows, num_cols, customer_id, algorithm, kv);
   sw["read_data"].stop();
   ALOG("Finished reading train data in worker " << worker_id << " (" << sw["read_data"] << ")");
 
@@ -260,8 +248,9 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
   std::vector<Key> local_h_keys ( data.num_cols_per_block() );
   std::vector<Key> local_w_keys ( data.num_rows_per_block() );
+  int my_block = (algorithm == Alg::columnwise ? ps::MyRank() : worker_id); // per-process blocks in columnwise
   for(size_t z=0; z!=data.num_rows_per_block(); ++z) {
-    local_w_keys[z] = row_key(data.num_rows_per_block() * worker_id + z);
+    local_w_keys[z] = row_key(data.num_rows_per_block() * my_block + z);
   }
 
   boost::random::uniform_real_distribution<> factor_generator(0,1);
@@ -286,6 +275,25 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     }
     kv.Wait(kv.StaggeredPush(full_h_keys, init_h));
     sw["read_factors"].stop();
+
+    // optional: write out initial random factors
+    if (!write_generated_factors.empty()) {
+      std::ofstream out (write_generated_factors + "H.mma");
+      if (!out.is_open()) {
+        ALOG("Cannot open file to write initial factors: " << write_generated_factors << "H.mma");
+        abort();
+      }
+
+      out << "%%MatrixMarket matrix array real general" << std::endl;
+      out << "% First line: ROWS COLUMNS" << std::endl;
+      out << "% Subsequent lines: entries in column-major order" << std::endl;
+      out << mf_rank << " " << num_cols << std::endl;
+      for (size_t z=0; z!=init_h.size(); ++z) {
+        out << init_h[z] << "\n";
+      }
+      out.close();
+    }
+
     ALOG("Initialized H (" << sw["read_factors"] << "): " << init_h[0] << " " << init_h[1] << " " << init_h[2] << " ..");
   }
 
@@ -307,6 +315,22 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
       ALOG("Init W randomly (seed " << model_seed << ")");
       boost::random::mt19937 rng_W (model_seed);
 
+      // optional: write out initial random factors
+      std::ofstream out {};
+      if (!write_generated_factors.empty()) {
+        out.open(write_generated_factors + "W.mma");
+        if (!out.is_open()) {
+          ALOG("Cannot open file to write initial factors: " << write_generated_factors << "W.mma");
+          abort();
+        }
+
+        // write header
+        out << "%%MatrixMarket matrix array real general" << std::endl;
+        out << "% First line: ROWS COLUMNS" << std::endl;
+        out << "% Subsequent lines: entries in row-major order" << std::endl;
+        out << num_rows << " " << mf_rank << std::endl;
+      }
+
       // use (more complicated) batched implementation so we can run large models on a single machine
       size_t batch_size = 10000;
       vector<Key> partial_w_keys {};
@@ -323,6 +347,10 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
           if (gen == 1) second = r;
           ++gen;
           partial_w.push_back(r);
+
+          if (!write_generated_factors.empty()) {
+            out << r << "\n";
+          }
         }
 
         // push
@@ -334,6 +362,10 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
       }
       tss.push_back(kv.Push(partial_w_keys, partial_w));
       for (auto ts : tss) kv.Wait(ts);
+
+      if (!write_generated_factors.empty()) {
+        out.close();
+      }
     }
     sw["read_factors"].stop();
     ALOG("Initialized W (" << sw["read_factors"] << "): " << first << " " << second << " ..");
@@ -628,6 +660,7 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("early_stop", po::value<unsigned long>(&early_stop)->default_value(0), "stop an epoch early after N data points (for debugging)")
     ("max_runtime", po::value<long>(&max_runtime)->default_value(std::numeric_limits<long>::max()), "set a maximum run tim, after which the job will be terminated (in seconds)")
     ("prevent_full_model_pull", po::value<bool>(&prevent_full_model_pull)->default_value(false), "prevent a full model pull (slower, but makes it possible to run large models in memory constrained settings)")
+    ("write_generated_factors", po::value<std::string>(&write_generated_factors)->default_value(""), "Whether and to which path to write generated initial factors (default: empty, i.e., don't write factors)")
     ;
 
   // add system options
@@ -703,7 +736,8 @@ int main(int argc, char *argv[]) {
     // Start the server system
     int server_customer_id = 0; // server gets customer_id=0, workers 1..n
     Start(server_customer_id);
-    auto server = new ServerT(num_keys, mf_rank, &hotspot_keys);
+    HandleT handle (num_keys, mf_rank);
+    auto server = new ServerT(server_customer_id, handle, &hotspot_keys);
     RegisterExitCallback([server](){ delete server; });
 
     // make sure all servers are set up
