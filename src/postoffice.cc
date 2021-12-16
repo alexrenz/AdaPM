@@ -36,7 +36,7 @@ void Postoffice::Start(int customer_id, const char* argv0, const bool do_barrier
     if (argv0) {
       dmlc::InitLogging(argv0);
     } else {
-      dmlc::InitLogging("lapse\0");
+      dmlc::InitLogging("ps\0");
     }
 
     // init node info. // note: when co-locating, num_workers_=0

@@ -73,7 +73,8 @@ class SSHLauncher(object):
             # launch jobs
             for i in range(nworker + nserver):
                 pass_envs['DMLC_ROLE'] = 'server' if i < nserver else 'worker'
-                pass_envs['PS_COLOC'] = self.args.coloc
+                if self.args.interface != "":
+                    pass_envs['DMLC_INTERFACE'] = self.args.interface
                 node = self.hosts[i % len(self.hosts)]
                 prog = self.get_env(pass_envs) + ' cd ' + working_dir + '; ' + self.cmd
                 prog = 'ssh -o StrictHostKeyChecking=no ' + node + ' \'' + prog + '\''
@@ -97,8 +98,8 @@ def main():
                         help = 'number of worker nodes to be launched')
     parser.add_argument('-s', '--num-servers', default = 0, type=int,
                         help = 'number of server nodes to be launched')
-    parser.add_argument('-c', '--coloc', default = 0, type=int,
-                        help = 'whether to co-locate servers and workers in the same processes')
+    parser.add_argument('-i', '--interface', default = "", type=str,
+                        help = 'the desired network interface')
     parser.add_argument('-H', '--hostfile', type=str,
                         help = 'the hostfile of all slave nodes')
     parser.add_argument('command', nargs='+',
@@ -114,3 +115,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

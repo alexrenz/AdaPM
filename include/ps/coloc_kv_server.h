@@ -145,14 +145,14 @@ namespace ps {
   public:
 
     /**
-     * Construct a Lapse server with uniform value lengths
+     * Construct a server with uniform value lengths
      */
 
     explicit ColoKVServer(size_t num_keys, size_t uniform_len, std::vector<Key>* keys_to_replicate=nullptr) :
       ColoKVServer(num_keys, std::vector<size_t> {uniform_len}, keys_to_replicate) {}
 
     /**
-     * \brief Construct a Lapse server
+     * \brief Construct a server
      *        The system will replicate all keys that are contained in `keys_to_replicate`.
      *        Replication will be disabled entirely (i.e., no replica mgr thread) if
      *        `keys_to_replicate` is a nullptr or contains 0 keys.
@@ -237,8 +237,14 @@ namespace ps {
 
     /**
      * \brief Enable support for sampling
+     *
+     *        If the sampling function of your application (`sample_key`) draws
+     *        from a _continuous range_ of keys, you can pass the boundaries of
+     *        this range with `min_key` (incl.) and `max_key` (excl.). This
+     *        enables a more memory friendly implementation of local sampling.
+     *
      */
-    void enable_sampling_support(Key (*const sample_key)()) {
+    void enable_sampling_support(Key (*const sample_key)(), const Key min_key=0, const Key max_key=0) {
       auto& sst = SamplingSupport<Val, ColoKVWorker<Val,Handle>>::sampling_strategy;
       switch (sst) {
       case SamplingSupportType::Naive:
@@ -251,7 +257,7 @@ namespace ps {
         sampling_ = new PoolSamplingSupport<Val, ColoKVWorker<Val, Handle>, ColoKVServer<Val, Handle>>(sample_key, this);
         break;
       case SamplingSupportType::OnlyLocal:
-        sampling_ = new OnlyLocalSamplingSupport<Val, ColoKVWorker<Val, Handle>>(sample_key);
+        sampling_ = new OnlyLocalSamplingSupport<Val, ColoKVWorker<Val, Handle>>(sample_key, min_key, max_key);
         break;
       default:
         ALOG("Unkown sampling support type '" << sst << "'. Aborting.");
@@ -274,6 +280,7 @@ namespace ps {
       options.add_options()
         ("sys.keep_unused", po::value<unsigned int>(&keepAroundUnused)->default_value(0), "system option: keep around unused parameters (0: disabled, >0: max time to keep around (in microseconds)")
         ("sys.nw_threads", po::value<int>(&Postoffice::Get()->num_network_threads_)->default_value(3), "number of network threads")
+        ("sys.sender_thread", po::value<int>(&Postoffice::Get()->use_sender_thread_)->default_value(1), "whether and for which messages to use a separate thread in the van to send messages. 0: don't use a separate thread, 1: use the sender thread for server messages, 2: use the sender thread for server and worker messages")
         ;
 
       // replication options
@@ -714,7 +721,7 @@ namespace ps {
       }
     }
 
-    Postoffice::Get()->van()->Send(msg);
+    Postoffice::Get()->van()->Send(msg, SERVER_MSG);
   }
 
 }  // namespace ps

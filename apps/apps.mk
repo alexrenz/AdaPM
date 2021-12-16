@@ -2,7 +2,7 @@ APPS_SRC = $(wildcard apps/*.cc)
 APPS = $(patsubst apps/%.cc, build/apps/%, $(APPS_SRC))
 
 # -ltcmalloc_and_profiler
-APPS_LDFLAGS = -Wl,-rpath,$(DEPS_PATH)/lib $(PS_LDFLAGS_SO) -pthread -l boost_system -l boost_program_options -I apps/eigen3/ ${LAPSE_EXTERNAL_LDFLAGS} -fopenmp
+APPS_LDFLAGS = -Wl,-rpath,$(DEPS_PATH)/lib $(PS_LDFLAGS_SO) -pthread -l boost_system -l boost_program_options -I apps/eigen3/ ${PS_EXTERNAL_LDFLAGS} -fopenmp
 
 build/apps/% : apps/%.cc build/libps.a
 	mkdir -p build/apps

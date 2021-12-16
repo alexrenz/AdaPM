@@ -436,7 +436,7 @@ void KVServer<Val>::Response(const KVMeta& req, const KVPairs<Val>& res) {
     }
   }
 
-  Postoffice::Get()->van()->Send(msg);
+  Postoffice::Get()->van()->Send(msg, SERVER_MSG);
 }
 
 template <typename Val>

@@ -67,12 +67,13 @@ namespace mf {
     // add a data point to the data structure
     void addDataPoint(SizeT i, SizeT j, ValT x) {
       _data.push_back(DataPoint(i, j, x));
-      ++(_row_nnz[i-_start_row]);
-      ++(_col_nnz[j]);
+      addRowNnz(i);
+      addColNnz(j);
     }
 
-    // add external column count (so that we can use global column count in training)
+    // add external col or row count (so that we can use global nnz count in training)
     void addColNnz(unsigned long j) { ++(_col_nnz[j]); }
+    void addRowNnz(unsigned long i) { ++(_row_nnz[i-_start_row]); }
 
     inline const uint row_nnz(int i) { return _row_nnz[i-_start_row]; }
     inline const uint col_nnz(int j) { return _col_nnz[j]; }

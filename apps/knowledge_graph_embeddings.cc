@@ -1371,7 +1371,7 @@ int main(int argc, char *argv[]) {
     // set up negative sampling
     negs_gen = std::mt19937(model_seed^Postoffice::Get()->my_rank());
     negs_dist = std::uniform_int_distribution<int>{0, static_cast<int>(ne-1)};
-    server->enable_sampling_support(&DrawEntity);
+    server->enable_sampling_support(&DrawEntity, 0, (enforce_random_keys ? 0 : ne)); // if we don't enforce random keys, the sampling range is continuous
 
 
     // run worker(s)

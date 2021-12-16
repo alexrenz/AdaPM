@@ -153,8 +153,8 @@ namespace ps {
         ("sampling.strategy", po::value<SamplingSupportType>(&sampling_strategy)->default_value(SamplingSupportType::Naive), "Sampling strategy (naive [default], preloc, pool, or onlylocal)")
         ("sampling.group_size", po::value<int>(&group_size_)->default_value(250), "(only for 'pool' strategy) Group size, i.e., how may keys should be in one localize")
         ("sampling.reuse", po::value<int>(&reuse_factor_)->default_value(1), "(only for 'pool' strategy) Reuse factor: how often should a sample be used")
-        ("sampling.postpone", po::value<bool>(&postpone_nonlocal_)->default_value(false), "(only for 'pool' strategy) Postpone non-local samples? (default: false)")
         ("sampling.batch_size", po::value<size_t>(&sampling_batch_size_)->default_value(10000), "In local sampling we batch draw samples in batches. This determines the batch size (default: 10000). Usually, you should not need to change this value.")
+        ("sampling.postpone", po::value<bool>(&postpone_nonlocal_)->default_value(true), "(only for 'pool' strategy) Postpone non-local samples? (default: true)")
         ;
     }
   };
@@ -594,9 +594,11 @@ namespace ps {
     using SamplingSupport<Val, Worker>::sampling_batch_size_;
 
   public:
-    OnlyLocalSamplingSupport(Key (*const sample_key)()):
-      NaiveSamplingSupport<Val, Worker>(sample_key), sampled_keys(Postoffice::Get()->num_worker_threads()) {
-      ALOG("OnlyLocal sampling support");
+    OnlyLocalSamplingSupport(Key (*const sample_key)(), const Key min_key, const Key max_key):
+      NaiveSamplingSupport<Val, Worker>(sample_key),
+      sampled_keys(Postoffice::Get()->num_worker_threads()),
+      _min_key(min_key), _max_key(max_key) {
+      ALOG("OnlyLocal sampling support, " << (_min_key == _max_key ? "general" : "memory friendly") << " implementation");
     }
 
     // prepare_sample is identical to the naive one
@@ -619,12 +621,19 @@ namespace ps {
     int pull_sample(SampleID sample_id, std::vector<Key>& keys, std::vector<Val>& vals, const int customer_id) override {
       assert(keys.size() == 1);
       ++num_pulls;
-      bool found_neg = false;
-      while (!found_neg) {
-        keys[0] = sample(customer_id);
-        found_neg = workers[customer_id-1]->PullIfLocal(keys[0], &vals);
-        ++num_checks;
+
+      if (_min_key == _max_key) { // sampling range is not guaranteed to be continuous, so we use the safe implementation
+        bool found_neg = false;
+        while (!found_neg) {
+          keys[0] = sample(customer_id);
+          found_neg = workers[customer_id-1]->PullIfLocal(keys[0], &vals);
+          ++num_checks;
+        }
+      } else { // sampling range is guaranteed to be continuous, so we use the more memory friendly implementation
+        Key start_key = sample(customer_id);
+        keys[0] = workers[customer_id-1]->PullNextLocal(start_key, &vals, _min_key, _max_key, num_checks);
       }
+
       SamplingSupport<Val, Worker>::count_accesses(keys);
       return -1;
     }
@@ -638,6 +647,8 @@ namespace ps {
     unsigned long long num_checks = 0;
     unsigned long long num_pulls = 0;
     std::vector<std::queue<Key>> sampled_keys;
+    const Key _min_key;
+    const Key _max_key;
   };
 
 

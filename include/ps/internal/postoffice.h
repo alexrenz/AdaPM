@@ -159,9 +159,10 @@ class Postoffice {
   inline uint num_worker_threads() { return num_worker_threads_; }
   // end [sysChange]
 
-  // number of network threads [sysChange]
+  /** \brief Get the number of network threads */
   int  get_num_network_threads() { return num_network_threads_; }
-  int num_network_threads_ = 1;
+  /** \brief Get (i) whether and (ii) for which messages a separate thread is used for sending messages in the van */
+  int use_sender_thread() { return use_sender_thread_; }
 
   /**
    * \brief barrier
@@ -187,6 +188,10 @@ class Postoffice {
    * \param t timeout in sec
    */
   std::vector<int> GetDeadNodes(int t = 60);
+
+  // (public so they can be accessed for system options)
+  int num_network_threads_ = 1;
+  int use_sender_thread_ = 1;
 
  private:
   Postoffice();

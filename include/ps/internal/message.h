@@ -21,6 +21,10 @@ static const char* DataTypeName[] = {
   "UINT8", "UINT16", "UINT32", "UINT64",
   "FLOAT", "DOUBLE", "OTHER"
 };
+/** \brief Message origins (used by the van sender thread) */
+const int NO_QUEUING = 0;
+const int SERVER_MSG = 1;
+const int WORKER_MSG = 2;
 /**
  * \brief compare if V and W are the same type
  */

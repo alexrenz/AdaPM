@@ -77,6 +77,9 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("num_values_per_key,v", po::value<size_t>(&num_values_per_key)->default_value(3), "number of values per key")
     ;
 
+  // add system options
+  ServerT::AddSystemOptions(desc);
+
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
   po::notify(vm);

@@ -357,11 +357,45 @@ namespace ps {
       CHECK(key < Postoffice::Get()->max_key())<< "[ERROR] Pull key " << key << ", which is outside the configured key range [0,"<< Postoffice::Get()->max_key() << ")";
 
       // try to check locality without acquiring a lock
-      if (server.request_handle_.nolockNonLocalCheck(key)) {
+      if (server.request_handle_.isNonLocal_noLock(key)) {
         return false;
       }
 
       return server.request_handle_.attemptLocalPull(key, vals->data(), false, false);
+    }
+
+
+    /**
+     * \brief Starting from `key`, pull the next local key, searching upwards.
+     *        I.e., if `key` is local, that key's values are pulled into `vals`;
+     *        o/w, if key `key`+1 is local, that key is pulled;
+     *        o/w, if key `key`+2 is local, that key is pulled;
+     *        and so on ...
+     *        The search wraps around to `min_key` when `max_key` is reached.
+     *
+     *        Returns the key that was pulled
+     */
+    Key PullNextLocal(Key key, std::vector<Val>* vals,
+                      const Key min_key, const Key max_key,
+                      unsigned long long& num_checks) {
+      while (true) {
+        ++num_checks;
+
+        // check whether this key is local
+        if (!server.request_handle_.isNonLocal_noLock(key)) {
+          // key is probably local, try to pull it
+          bool local = server.request_handle_.attemptLocalPull(key, vals->data(), false, false);
+          if (local) {
+            return key;
+          }
+        }
+
+        // this key was not local, move on to the next one
+        ++key;
+        if (key >= max_key) {
+          key = min_key;
+        }
+      }
     }
 
     /**
@@ -658,7 +692,7 @@ namespace ps {
       }
 
       // Send message
-      Postoffice::Get()->van()->Send(msg);
+      Postoffice::Get()->van()->Send(msg, WORKER_MSG);
     }
 
     /**

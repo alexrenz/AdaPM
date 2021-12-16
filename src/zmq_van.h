@@ -126,12 +126,6 @@ class ZMQVan : public Van {
   }
 
   int SendMsg(const Message& msg) override {
-    // pack meta and initialize message data
-    int meta_size; char* meta_buf;
-    PackMeta(msg.meta, &meta_buf, &meta_size);
-    zmq_msg_t meta_msg;
-    zmq_msg_init_data(&meta_msg, meta_buf, meta_size, FreeData, NULL);
-
     std::lock_guard<std::mutex> lk(mu_);
     // find the socket
     int id = msg.meta.recver;
@@ -144,9 +138,13 @@ class ZMQVan : public Van {
     void *socket = it->second;
 
     // send meta
+    int meta_size; char* meta_buf;
+    PackMeta(msg.meta, &meta_buf, &meta_size);
     int tag = ZMQ_SNDMORE;
     int n = msg.data.size();
     if (n == 0) tag = 0;
+    zmq_msg_t meta_msg;
+    zmq_msg_init_data(&meta_msg, meta_buf, meta_size, FreeData, NULL);
     while (true) {
       if (zmq_msg_send(&meta_msg, socket, tag) == meta_size) break;
       if (errno == EINTR) continue;

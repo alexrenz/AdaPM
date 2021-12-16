@@ -43,6 +43,7 @@ namespace ps {
 
 
 
+
   template <typename Val, typename Handle>
   class ReplicaManager {
 
@@ -121,6 +122,7 @@ namespace ps {
     int sync (bool shutdown = false) {
 
       KVPairs<Val> updates;
+      updates.vals.reserve(replicas.vals.size()); // pre-allocate
 
       // collect local updates
       if (shutdown) {
@@ -128,13 +130,19 @@ namespace ps {
         updates.keys[0] = SHUTDOWN;
       } else {
         sw_collect.resume();
-        handle.readReplicas(replicas.keys, updates, sync_threshold);
+        handle.readReplicas(replicas, updates, sync_threshold);
         total += replicas.keys.size();
         updated += updates.keys.size();
         total_since_last_report += replicas.keys.size();
         updated_since_last_report += updates.keys.size();
         sw_collect.stop();
       }
+
+      // store this node's updates (as we have to account for them when we write
+      // the global update to the local replica)
+      KVPairs<Val> my_updates {};
+      my_updates.keys.CopyFrom(updates.keys);
+      my_updates.vals.CopyFrom(updates.vals);
 
       // synchronize updates among all replica managers
       sw_exchange.resume();
@@ -149,12 +157,13 @@ namespace ps {
       sw_write.resume();
       size_t replicas_pos = 0;
       size_t updates_pos = 0;
-      for (size_t i=0, j=0; i!=updates.keys.size(); ++i) {
+      size_t my_updates_pos = 0;
+      for (size_t i=0, j=0, k=0; i!=updates.keys.size(); ++i) {
         Key key = updates.keys[i];
         auto len = handle.get_len(key);
         ++num_updates;
 
-        // move to correct position in state
+        // move to correct position in the replica state
         while (replicas.keys[j] != key) {
           replicas_pos += handle.get_len(replicas.keys[j]);
           ++j;
@@ -164,8 +173,8 @@ namespace ps {
 
         // calculate update vector norm
         double norm = 0;
-        for(size_t k=0; k!=len; ++k) {
-          norm += updates.vals[updates_pos+k]*updates.vals[updates_pos+k];
+        for(size_t z=0; z!=len; ++z) {
+          norm += updates.vals[updates_pos+z]*updates.vals[updates_pos+z];
         }
         norm = sqrt(norm);
 
@@ -186,14 +195,26 @@ namespace ps {
           }
         }
 
-        // update replicas
-        for(size_t k=0; k!=len; ++k) {
-          replicas.vals[replicas_pos+k] += updates.vals[updates_pos+k] * update_factor;
+        // scale updates and update state
+        for(size_t z=0; z!=len; ++z) {
+          updates.vals[updates_pos+z] *= update_factor;
+          replicas.vals[replicas_pos+z] += updates.vals[updates_pos+z];
+        }
+
+        // did this node send an update for this key?
+        Val* my_update = nullptr;
+        if (k < my_updates.keys.size() && my_updates.keys[k] == key) {
+          my_update = &my_updates.vals.data()[my_updates_pos];
         }
 
         // write updated state to the local parameter storage
-        handle.writeReplica(key, &replicas.vals.data()[replicas_pos]);
+        handle.writeReplica(key, &updates.vals.data()[updates_pos], my_update);
         updates_pos += len;
+
+        if (my_update != nullptr) {
+          ++k;
+          my_updates_pos += len;
+        }
       }
       sw_write.stop();
 
@@ -685,7 +706,7 @@ namespace ps {
       options.add_options()
         ("rep.sm", po::value<ReplicaSyncMethod>(&rsm)->default_value(ReplicaSyncMethod::BG_BUTTERFLY), "replica synchronization method")
         ("rep.pause", po::value<int>(&sync_pause)->default_value(0), "pause between two background synchronization runs (in milliseconds)")
-        ("rep.syncs_per_sec", po::value<double>(&syncs_per_sec)->default_value(5), "number of synchronization rounds per second (goal) (default: 5 per second)")
+        ("rep.syncs_per_sec", po::value<double>(&syncs_per_sec)->default_value(25), "number of synchronization rounds per second (goal) (default: 5 per second)")
         ("rep.threshold", po::value<double>(&sync_threshold)->default_value(0), "synchronize only updates larger than a threshold. Options: -1 (sync all updates, including zero ones), 0 (sync all non-zero updates [default]), >0 (sync all updates where l2(update)>=threshold, inf (disable sync entirely)")
         ("rep.separate_zmq_context", po::value<bool>(&use_separate_zmq_context)->default_value(false), "use a separate ZMQ context for replica synchronization (i.e., not the same as for push/pull/localize)")
         ("rep.average_updates", po::value<bool>(&average_updates)->default_value(false), "average the updates of replicas")
