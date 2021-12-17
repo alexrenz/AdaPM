@@ -42,7 +42,14 @@ relocation is used, workers pre-localize relocation-managed parameters in groups
 of 500 data points: when a new group of data points is reached, the parameters
 for the next group are pre-localized.
 
-# Dataset generation
+# Datasets
+
+Our datasets are available on kaggle:
+- [Wikidata5M (knowledge graph embeddings)](https://www.kaggle.com/alexrenz/wikidata5m)
+- [One billion words benchmark (word vectors)](https://www.kaggle.com/alexrenz/one-billion-words-benchmark)
+- [10M x 1M, 1B matrix with zipf(1.1) skew (matrix factorization)](https://www.kaggle.com/alexrenz/syncthetic-zipf-1-1-matrix)
+
+### Dataset generation (matrix factorization)
 To generate the set of revealed cells for the matrix factorization dataset, we
 sampled 1 billion random row and column indices from zipf(1.1, 10M) (for rows)
 and zipf(1.1, 1M) (for columns) distributions (rejecting duplicate coordinates
