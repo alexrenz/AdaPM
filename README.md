@@ -40,7 +40,7 @@ sudo apt-get update && sudo apt-get install -y build-essential git libboost-all-
 Then clone and build
 
 ```bash
-git clone https://github.com/alexrenz/lapse-ps
+git clone --branch vldb20 https://github.com/alexrenz/lapse-ps
 cd lapse-ps && make
 ```
 
