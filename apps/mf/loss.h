@@ -28,13 +28,13 @@ double l2(std::vector<double> &w, std::vector<double> &h, uint h_start_index, ui
   double regularization = 0.;
   if (add_w_l2) {
     // w: worker adds reg for local block of w
-    for (uint z=0; z!=w.size() && z<num_rows*mf_rank; z++) {
+    for (long z=0; z!=static_cast<long>(w.size()) && z<num_rows*mf_rank; z++) {
       regularization += w[z] * w[z];
     }
   }
 
   // h: worker i adds reg for i'th block of h
-  for (uint z=h_start_index; z!=h_start_index+h_block_num_scalars && z<num_cols*mf_rank; z++) {
+  for (long z=h_start_index; z!=h_start_index+h_block_num_scalars && z<num_cols*mf_rank; z++) {
     regularization += h[z] * h[z];
   }
 

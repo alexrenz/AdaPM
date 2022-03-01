@@ -32,9 +32,9 @@ relocation-managed parameters when it reads a new sentence.
 
 ## Matrix factorization
 To determine the initial step size ε and the regularization parameter λ, we ran
-a grid search on ε ∈ {0.1, 0.01, 0.001, 0.0001} and λ ∈ {1, 0.1, 0.01, 0.001}.
-We ran each configuration for 5 epochs, using 1 node and chose the combination
-that produced the best test loss after 5 epochs (ε = 0.0001 and λ = 0.01). We
+a grid search on ε ∈ {0.1, 0.01, 0.001, 0.0001} and λ ∈ {10, 1, 0.1, 0.01, 0.001}.
+We ran each configuration for 10 epochs, using 1 node and chose the combination
+that produced the best test loss after 10 epochs (ε = 0.01 and λ = 1). We
 used the bold driver heuristic to automate step size selection after the first
 epoch: step size was increased by 5\% if the training loss had decreased during
 the epoch, and step size was decreased by 50\% if it had increased. Whenever
@@ -54,6 +54,14 @@ To generate the set of revealed cells for the matrix factorization dataset, we
 sampled 1 billion random row and column indices from zipf(1.1, 10M) (for rows)
 and zipf(1.1, 1M) (for columns) distributions (rejecting duplicate coordinates
 until reaching 1 billion unique cells).
+
+To generate values for the set of revealed cells, we randomly generated
+rank-1000 factors, drawing values from `Normal(0, 1/sqrt(sqrt(rank)))` (so that
+the entries in the product matrix have unit variance). We added `Normal(0, 0.1)`
+noise to the revealed cells.
+
+Finally, we randomly permuted columns and rows.
+
 
 # Launch commands
 
@@ -262,19 +270,19 @@ enforce_random_keys: 1
 compute_loss: 1
 algorithm: columnwise
 rep.clip_updates: 2
-prelocalize_groupsize: 500
+prelocalize_groupsize: 250
 
 dataset: [PATH TO DATASET]
 num_rows: 10000000
 num_cols: 1000000
-max_runtime: 3*60*60         # 3h
+max_runtime: 6*60*60         # 6h
 ```
 
 
 ### System variants
 For **NuPS (untuned)**, we set
 ```
-replicate: 4889
+replicate: 755
 prelocate_steps: 1
 ```
 
