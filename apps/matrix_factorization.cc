@@ -60,8 +60,8 @@ bool bold_driver;
 // System config
 uint num_workers;
 int  num_threads;
-int  num_cols;
-int  num_rows;
+long num_cols;
+long num_rows;
 bool shared_memory;
 Alg algorithm;
 bool disable_localize_blocks;
@@ -253,7 +253,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     local_w_keys[z] = row_key(data.num_rows_per_block() * my_block + z);
   }
 
-  boost::random::uniform_real_distribution<> factor_generator(0,1);
+  boost::random::normal_distribution<> factor_generator (0, 1/sqrt(sqrt(mf_rank)));
 
   // push factors into the parameter servers
   kv.BeginSetup();
@@ -380,7 +380,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
   // prep for column-wise access
   std::vector<size_t> my_columns {};
   if (algorithm == Alg::columnwise) {
-    for (int j=0; j!=num_cols; ++j) {
+    for (long j=0; j!=num_cols; ++j) {
       if (data.block_has_nnz(j)) {
         my_columns.push_back(j);
       }
@@ -633,8 +633,8 @@ int process_program_options(const int argc, const char *const argv[]) {
   desc.add_options()
     ("help,h", "produce help message")
     ("dataset,d", po::value<std::string>(&dataset), "Dataset to train from")
-    ("num_rows", po::value<int>(&num_rows), "number of rows in the dataset")
-    ("num_cols", po::value<int>(&num_cols), "number of columns in the dataset")
+    ("num_rows", po::value<long>(&num_rows), "number of rows in the dataset")
+    ("num_cols", po::value<long>(&num_cols), "number of columns in the dataset")
     ("rank,r", po::value<uint>(&mf_rank), "Rank of matrix factorization")
     ("epochs,e", po::value<int>(&epochs), "Number of epochs to run")
     ("lambda,l", po::value<double>(&lambda)->default_value(0.05), "Regularization parameter lambda")
