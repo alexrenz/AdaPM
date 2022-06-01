@@ -2,7 +2,7 @@
 
 We provide (so far experimental) bindings to PyTorch. The bindings are specified in [bindings.cc](bindings.cc), usage examples can be found in [example.py](example.py). 
 
-The bindings provide the three primitives of Lapse: `pull`, `push`, and `localize`. They further provide a `set` variant of the `push` primitive that sets parameter to specific values (instead of adding to the values, as `push` does).
+The bindings provide the three primitives of AdaPS: `pull`, `push`, and `intent`. They further provide a `set` variant of the `push` primitive that sets parameter to specific values (instead of adding to the values, as `push` does).
 
 ### PyTorch tensors
 
@@ -19,8 +19,9 @@ kv.pull(keys, values)
 # set (variant of push)
 kv.set(keys, values)
 
-# localize
-kv.localize(keys)
+# signal intent and advance clock
+kv.intent(keys, 2, 3)
+kv.advance_clock()
 ```
 
 ### NumPy arrays
@@ -39,8 +40,9 @@ kv.pull(keys, values)
 # set (variant of push)
 kv.set(keys, values)
 
-# localize
-kv.localize(keys)
+# signal intent and advance clock
+kv.intent(keys, 2, 3)
+kv.advance_clock()
 ```
 
 ### Synchronous and asynchronous operations
@@ -48,9 +50,8 @@ By default, all operations run synchronously. To run asynchronously, pass `async
 ```python
 kv.pull(keys, values, True)
 kv.push(keys, values, True)
-kv.localize(keys, True)
 ```
-In particular, `localize` and `push` are often executed asynchronously. 
+In particular, `push` is often executed asynchronously. 
 
 `kv.wait()` explicitly waits for the execution of a specific operation: 
 ```python
@@ -60,13 +61,13 @@ timestamp = kv.pull(keys, values, True)
 
 kv.wait(timestamp) # wait for pull to finish
 ```
-All operations (`pull`, `push`, `set`, and `localize`) return a timestamp that can be used this way.
+All operations (`pull`, `push`, `set`, and `intent`) return a timestamp that can be used this way.
 
 
 ## Installation
 
 
-Compile Lapse with `int64` keys (to match PyTorch and NumPy default integer data
+Compile AdaPS with `int64` keys (to match PyTorch and NumPy default integer data
 types) and with the appropriate ABI version, then use [setup.py](setup.py) to
 compile the bindings (see below). Pip PyTorch installations often use the old
 (pre C++11) ABI. The script [lookup_torch_abi.py](lookup_torch_abi.py) reads out
@@ -85,7 +86,7 @@ python setup.py install --user
 ```
 
 
-If successful, you can now use lapse in Python
+If successful, you can now use AdaPS in Python
 
 ```python
 #!/usr/bin/python
