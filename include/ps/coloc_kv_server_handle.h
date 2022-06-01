@@ -8,12 +8,10 @@
 #include <vector>
 #include "ps/coloc_kv_worker.h"
 #include "ps/coloc_kv_server.h"
-#include "ps/coloc_kv_transfers.h"
-#include <valarray>
 #include <thread>
 #include <mutex>
 #include <memory>
-#include <atomic>
+#include <regex>
 
 #include <iostream>
 #include <sstream>
@@ -42,22 +40,17 @@
          local parameters.
 
    The desired backend data structure can be specified with the compilation flag PS_BACKEND in
-   the external variable PS_EXTERNAL_LDFLAGS. E.g, the following compiles the knowledge graph
+   the external variable LAPSE_EXTERNAL_LDFLAGS. E.g, the following compiles the knowledge graph
    embeddings app with an unordered map:
-   export PS_EXTERNAL_LDFLAGS="-DPS_BACKEND=1"; make apps/knowledge_graph_embeddings
+   export LAPSE_EXTERNAL_LDFLAGS="-DPS_BACKEND=1"; make apps/knowledge_graph_embeddings
 
 */
 
 
 // PS back-end data structure variants
 #define PS_BACKEND_STD_UNORDERED_LOCKS 1
-#define PS_BACKEND_GOOGLE_DENSE 2
-#define PS_BACKEND_TBB_CONCURRENT_UNORDERED 4
-#define PS_BACKEND_TBB_CONCURRENT_HASH_MAP 5
 #define PS_BACKEND_VECTOR 10
 #define PS_BACKEND_VECTOR_LOCKS 14
-#define PS_BACKEND_ARRAY 11
-#define PS_BACKEND_ARRAY_ATOMIC 13
 
 #define LOCK_ALL 1
 #define LOCK_SINGLE 0
@@ -71,12 +64,17 @@
 #define PS_BACKEND_LOCKS PS_BACKEND == PS_BACKEND_STD_UNORDERED_LOCKS || PS_BACKEND == PS_BACKEND_VECTOR_LOCKS
 // default number of locks
 #ifndef PS_BACKEND_NUM_LOCKS
-#define PS_BACKEND_NUM_LOCKS 1000
+#define PS_BACKEND_NUM_LOCKS 16384
 #endif
 
 // if we have a vector backend structure, we use LOCK_SINGLE by default, otherwise we use LOCK_ALL
 #ifndef PS_BACKEND_LOCK_STRATEGY
 #define PS_BACKEND_LOCK_STRATEGY PS_BACKEND != PS_BACKEND_VECTOR_LOCKS
+#endif
+
+// trace relocations, replications, and intent for some keys
+#ifndef PS_TRACE_KEYS
+#define PS_TRACE_KEYS 0
 #endif
 
 // backend locality statistics
@@ -85,35 +83,73 @@
 #endif
 namespace ps {
 
-  // relocation statistics
-#ifdef PS_RELOC_STATS
-  extern std::atomic<long> STATS_num_localizes;
-  extern std::atomic<long> STATS_num_localizes_local;
-  extern std::atomic<long> STATS_num_localizes_queue;
-#endif
+  // For key tracing
+  enum class Event {ALLOC, DEALLOC, REPLICA_SETUP, REPLICA_DROP, INTENT_START, INTENT_STOP};
+  struct Trace {
+    Trace (std::chrono::time_point<std::chrono::high_resolution_clock> t,
+           Key k, Event e): time{t}, key{k}, event{e} {};
+    std::chrono::time_point<std::chrono::high_resolution_clock> time;
+    Key key;
+    Event event;
+  };
+  std::ostream& operator<<(std::ostream &o, const Event& e) {
+    switch(e) {
+    case Event::ALLOC: return o << "alloc";
+    case Event::DEALLOC: return o << "dealloc";
+    case Event::REPLICA_SETUP: return o << "replica_setup";
+    case Event::REPLICA_DROP: return o << "replica_drop";
+    case Event::INTENT_START: return o << "intent_start";
+    case Event::INTENT_STOP: return o << "intent_stop";
+    default: return o << "unknown";
+    }
+  }
+
+  struct Intent {
+    Intent(): start{std::numeric_limits<Clock>::max()}, end{-1} {}
+    Intent(Clock s, Clock e): start{s}, end{e} {}
+    Clock start;
+    Clock end;
+  };
+
+  std::ostream& operator<<(std::ostream& os, const Intent i) {
+    std::stringstream ss;
+    ss << "[" << i.start << "-" << i.end << "]";
+    os << ss.str();
+    return os;
+  }
+
 
   /* A parameter in the local parameter server */
   template <typename Val>
     struct Parameter {
       // Constructor: normal feature, no inital value
-      Parameter(size_t len): val(len) {}
+    Parameter(size_t len):
+      val(len),
+      local_intents{} {}
       // Constructor: normal feature, initial value given
-      Parameter(Val* init_val, size_t len): val(init_val, len) {}
-      Parameter() {}
+    Parameter(Val* init_val, size_t len):
+      val(init_val, init_val+len),
+      local_intents{} {}
 
       // the parameter value
-      std::valarray<Val> val;
+      std::vector<Val> val;
+
+      // for replicas: the version of the last sync
+      std::vector<Val> sync_state;
 
       // indicates whether this parameter is a replica
       bool replica = false;
 
-      // indicates whether this parameter was updated since the last replica sync
+      // indicates whether this parameter was updated since the last sync
       bool updated = false;
 
-      // data for keeping around values of unused parameters
-      bool keptAround = false; // is the available value a kept around value?
-      std::chrono::time_point<std::chrono::steady_clock> removeTime; // time of removal
-      long numUses = 0; // number of times this parameter was accessed while at this node
+      // number of updates to (the main copy) of this parameter
+      Version version = 0;
+
+      Version relocation_counter = 0;
+
+      // which workers require this replica until which clock?
+      std::unordered_map<int, Clock> local_intents;
     };
 
 template <typename Val>
@@ -121,101 +157,117 @@ struct DefaultColoServerHandle {
 public:
 
   // Uniform parameter lengths: each parameter value has the same length
-  DefaultColoServerHandle(size_t num_keys, size_t uniform_len): DefaultColoServerHandle(num_keys, std::vector<size_t> {uniform_len}) { }
+  DefaultColoServerHandle(size_t uniform_len): DefaultColoServerHandle(std::vector<size_t> {uniform_len}) { }
 
   // Non-uniform parameter lengths: each parameter can have its own value length
-  DefaultColoServerHandle(size_t num_keys, const std::vector<size_t>& value_lengths):
-    transfers {num_keys}, value_lengths {value_lengths},
-    keepAroundUnused{ColoKVServer<Val,DefaultColoServerHandle>::keepAroundUnused != 0},
-    maxKeepAround{std::chrono::microseconds(ColoKVServer<Val,DefaultColoServerHandle>::keepAroundUnused)} {
+  DefaultColoServerHandle(const std::vector<size_t>& value_lengths):
+    value_lengths {value_lengths},
+    replicas     (Postoffice::Get()->num_channels()),
+    replicas_mus (Postoffice::Get()->num_channels()),
+    p_num_channels_(std::log2(Postoffice::Get()->num_channels())) {
 
-    long store_max = Postoffice::Get()->GetServerKeyRanges().back().end();
-    ADLOG("Creating handle for " << num_keys << " (max " << store_max << ") keys with " <<
-          (value_lengths.size() == 1 ? "uniform" : "non-uniform") << " lengths " <<
-          " (keep around: " << std::chrono::duration_cast<std::chrono::microseconds>(maxKeepAround).count() << " us)");
+    long store_max = Postoffice::Get()->num_keys();
+    ADLOG("Creating handle for " << store_max << " keys with " <<
+          (value_lengths.size() == 1 ? "uniform" : "non-uniform") << " lengths ");
 
 #if PS_BACKEND == PS_BACKEND_STD_UNORDERED_LOCKS
-    std::cout << "Handle data structure: std::unordered_map with " << mu_.size() << " locks" << std::endl;
+    ALOG("Handle data structure: std::unordered_map with " << mu_.size() << " locks");
     store.reserve(store_max);
 
-#elif PS_BACKEND == PS_BACKEND_GOOGLE_DENSE
-    std::cout << "Handle data structure: Google dense" << std::endl;
-    store.set_empty_key(-1);
-
-#elif PS_BACKEND == PS_BACKEND_TBB_CONCURRENT_UNORDERED
-    std::cout << "Handle data structure: TBB concurrent unordered" << std::endl;
-
-#elif PS_BACKEND == PS_BACKEND_TBB_CONCURRENT_HASH_MAP
-    std::cout << "Handle data structure: TBB concurrent hash map" << std::endl;
-
 #elif PS_BACKEND == PS_BACKEND_VECTOR
-    std::cout << "Handle data structure: vector<unique_ptr<Parameter>> (no locks)" << std::endl;
+    ALOG("Handle data structure: vector<unique_ptr<Parameter>> (no locks)");
     store.resize(store_max);
 
 #elif PS_BACKEND == PS_BACKEND_VECTOR_LOCKS
-    std::cout << "Handle data structure: vector<unique_ptr<Parameter>> with " << mu_.size() << " locks" << std::endl;
+    ALOG("Handle data structure: vector<unique_ptr<Parameter>> with " << mu_.size() << " locks");
     store.resize(store_max);
 
-#elif PS_BACKEND == PS_BACKEND_ARRAY
-    std::cout << "Handle data structure: Val[]" << std::endl;
-    CHECK(false) << "The chosen backend data structure is not implemented";
-    // store = new Val[length_of_all_keys];
-    // std::fill_n(store, store_max, 0);
-
-#elif PS_BACKEND == PS_BACKEND_ARRAY_ATOMIC
-    std::cout << "Handle data structure: std::atomic<Val>[]" << std::endl;
-    CHECK(false) << "The chosen backend data structure is not implemented";
-    // store = new std::atomic<Val>[store_max];
-    // std::fill_n(store, store_max, 0);
-
 #else
-    std::cout << "Handle data structure: std::unordered" << std::endl;
+    ALOG("Handle data structure: std::unordered");
 
 #endif
 
 #if PS_BACKEND_LOCKS
 #if PS_BACKEND_LOCK_STRATEGY == LOCK_ALL
-    std::cout << "Locking strategy: LOCK_ALL" << std::endl;
+    ALOG("Locking strategy: LOCK_ALL");
 #elif PS_BACKEND_LOCK_STRATEGY == LOCK_SINGLE
-    std::cout << "Locking strategy: LOCK_SINGLE" << std::endl;
+    ALOG("Locking strategy: LOCK_SINGLE");
 #endif
 #endif
 
+    my_rank = Postoffice::Get()->my_rank(); // to make sure it is available at shut down
+
+    // check that the number of channels is a power of 2 (which we require for our channel assignment method)
+    if ((Postoffice::Get()->num_channels() & (Postoffice::Get()->num_channels() - 1)) != 0) {
+      ALOG("The number of channels should be a power of 2, but you have specified " << Postoffice::Get()->num_channels());
+      abort();
+    }
+
+    // capture detailed locality statistics
 #if PS_LOCALITY_STATS
     ADLOG("Capture locality statistics for " << store_max << " keys");
-    myRank = Postoffice::Get()->my_rank();
     num_accesses.resize(store_max, 0);
     num_accesses_local.resize(store_max, 0);
-    num_accesses_in_transfer.resize(store_max, 0);
-    num_kept_around.resize(store_max, 0);
-    num_kept_around_used.resize(store_max, 0);
-    // clean stats directory
-    if (myRank == 0 && std::system("mkdir -p stats && rm -r stats/locality_stats*.rank.*.tsv")==0)
-      ADLOG("Cleaned locality statistics");
 #endif
 
-    // Insert default values for local keys
-    const Range& myRange = Postoffice::Get()->GetServerKeyRanges()[Postoffice::Get()->my_rank()];
-    lockAll(); // does nothing if we use LOCK-SINGLE
-    for(Key i=myRange.begin(); i!=myRange.end(); ++i) {
-      lockSingle(i); // does nothing if we use LOCK-ALL
-      if(i < static_cast<Key>(num_keys)) {
-        insertKeyUnsafe(i);
-#if PS_BACKEND < 10 // map
-        store[i].numUses = 1;
-# else
-        store[i]->numUses = 1; // disable keep around for initial allocation
-#endif
+    // trace relocations, replications, and intents for some keys
+#if PS_TRACE_KEYS
+    std::istringstream keyList(Postoffice::Get()->get_traced_keys());
+    std::string key;
+    while (std::getline(keyList, key, ',')) {
+      if(key.find("random") != std::string::npos) {
+        // mark a number of randomly drawn keys for tracing
+        std::regex rgx("^random-([0-9]+)-seed-([0-9]+)-range-([0-9]+)-([0-9]+)$");
+        std::smatch matches;
+        if(std::regex_search(key, matches, rgx)) {
+          unsigned long num_keys_to_add = std::stol(matches[1]);
+          long seed = std::stol(matches[2]);
+          Key minkey = std::stol(matches[3]);
+          Key maxkey = std::stol(matches[4]);
+          if (maxkey == 0) maxkey = store_max;
+
+          // randomly draw the specified number of keys
+          std::uniform_int_distribution<Key> key_dist (minkey, maxkey-1);
+          std::mt19937 rng (seed);
+          std::unordered_set<Key> random_keys {};
+          while (random_keys.size() != num_keys_to_add) {
+            random_keys.insert(key_dist(rng));
+          }
+
+          // mark the keys for tracing
+          traced_keys.insert(random_keys.begin(), random_keys.end());
+
+          if (my_rank == 0) ALOG("Trace " << num_keys_to_add << " random keys (seed " << seed << ") in range [" << minkey << ", " << maxkey << "): " << str(random_keys));
+        } else {
+          ALOG("Don't understand how to trace '" << key << ". Abort");
+          abort();
+        }
+      } else if (key.find("all") != std::string::npos) {
+        for (Key k=0; k!=static_cast<Key>(store_max); ++k) {
+          traced_keys.insert(k);
+        }
+
+      } else {
+        // mark a single key for tracing
+        traced_keys.insert(std::stol(key));
       }
-      unlockSingle(i);
     }
-    unlockAll();
+    if (my_rank == 0) ALOG("Trace " << traced_keys.size() << " keys: " << str(traced_keys));
+#endif
+
+    // clean stats folder (if any specified)
+    if (!Postoffice::Get()->get_stats_output_folder().empty() && my_rank == 0) {
+      auto folder = Postoffice::Get()->get_stats_output_folder();
+      auto cmd = std::string("mkdir -p ") + folder + std::string(" && rm ") + folder + std::string("/*.tsv");
+      if (std::system(cmd.c_str()) == 0) {
+        ALOG("Cleaned stats output folder " << folder);
+      } else {
+        ALOG("Failed to clean stats output folder " << folder);
+      }
+    }
   }
 
   ~DefaultColoServerHandle(){
-#if PS_BACKEND == PS_BACKEND_ARRAY_ATOMIC
-    delete[] store;
-#endif
   }
 
 #if PS_BACKEND_LOCKS
@@ -227,12 +279,16 @@ public:
   /**
    * \brief Inserts a key into the local data structure
    */
-  void insertKey(Key key, Val* val=0) {
+  void insertKey(Key key, Val* val=0, bool initial_alloc=false) {
     lockAll();
     lockSingle(key);
     insertKeyUnsafe(key, val);
     unlockSingle(key);
     unlockAll();
+
+    if (initial_alloc) {
+      trace_key(key, Event::ALLOC);
+    }
   }
 
   /**
@@ -271,40 +327,14 @@ public:
   /**
    * \brief Removes a key from the local data structure (without synchronization)
    *
-   *        If the deleted key has not been used while at this node (and keep around is enabled),
-   *        we keep its value around for a short period of time (to serve pulls).
-   *
    *        Warning: this method is not thread safe.
    */
   inline void removeKeyUnsafe(Key key) {
-    // special case: keep a cached value around if the key was not used
 #if PS_BACKEND < 10 // map
-    if (keepAroundUnused && store[key].numUses == 1) {
-# else
-    if (keepAroundUnused && store[key]->numUses == 1) {
-#endif
-      // (`== 1` assumes that a relocation calls `attemptLocalPull` once before `removeKey`
-#if PS_BACKEND < 10 // map
-      auto search = store.find(key);
-      if (search != store.end()) {
-        search->second.keptAround = true;
-        search->second.removeTime = std::chrono::steady_clock::now();
-#if PS_LOCALITY_STATS
-        num_kept_around[key]++;
-#endif
-      }
+    store.erase(key);
 #else
-      if (store[key] != nullptr) {
-        store[key]->keptAround = true;
-        store[key]->removeTime = std::chrono::steady_clock::now();
-#if PS_LOCALITY_STATS
-        num_kept_around[key]++;
+    store[key].reset();
 #endif
-      }
-#endif
-    } else { // normal case: delete the key from the store
-      dropKeyUnsafe(key);
-    }
   }
 
   /**
@@ -314,13 +344,13 @@ public:
    * @param val a pointer to the corresponding values
    * @return true if the key is local (and therefore, was pushed), false otherwise
    */
-  inline bool attemptLocalPush(const Key key, const Val* val, const bool set) {
+  inline bool attemptLocalPush(const Key key, const Val* val, const bool set, bool stats=true) {
     if (isNonLocal_noLock(key)) { return false; } // try to return early
 
 #if PS_BACKEND_LOCKS
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
-    return attemptLocalPushUnsafe(key, val, set);
+    return attemptLocalPushUnsafe(key, val, set, stats);
   }
 
   /**
@@ -328,39 +358,45 @@ public:
    *
    *        Warning: this method is not thread safe.
    */
-  inline bool attemptLocalPushUnsafe(const Key key, const Val* val, const bool set) {
+  inline bool attemptLocalPushUnsafe(const Key key, const Val* val, const bool set, bool stats=true) {
     // attempt to push the value for this key into the local store
 #if PS_BACKEND < 10 // map
     auto search = store.find(key);
-    if (search == store.end() || search->second.keptAround) {
+    if (search == store.end()) {
       return false;
     } else {
-      mergeValue(search->second.val, val, set, get_len(key));
-
-      // if this parameter is replicated, we additionally note the updates separately,
-      // so that we can send delta updates to the server later
-      if (search->second.replica) {
-        search->second.updated = true;
-        ++num_pushs_to_replicas;
-      }
-      search->second.numUses++;
-      return true;
-    }
+      auto& param = search->second;
 #else
-    if (store[key] == nullptr || store[key]->keptAround) {
+    if (store[key] == nullptr) {
       return false;
     } else {
       auto& param = *store[key];
+#endif
+
+      // don't use a replica that isn't properly set up yet
+      if (param.version == -1) {
+        return false;
+      }
+
       mergeValue(param.val, val, set, get_len(key));
 
+      // if this parameter is replicated, we additionally note the updates separately,
+      // so that we can send delta updates to the server later
       if (param.replica) {
         param.updated = true;
         ++num_pushs_to_replicas;
+
+        // set operations do not return meaningful results in the presence of replicas.
+        // for now, let's abort when a set operation is used on a replica
+        assert(!set);
+      } else {
+        // if this is the main copy, increase the version counter
+        ++param.version;
+        assert(param.version != 0); // let's hear about overflows for now
       }
-      ++param.numUses;
+
       return true;
     }
-#endif
   }
 
   /**
@@ -370,7 +406,7 @@ public:
     inline void mergeValue(V1& target, V2& merge, const bool set, const size_t len) {
     if (set) { // set value
       for(uint i=0; i!=len; ++i) {
-        target[i] = merge[i]; // TODO: use memcpy
+        target[i] = merge[i];
       }
     } else { // push (i.e., add) value
       for(uint i=0; i!=len; ++i) {
@@ -386,130 +422,13 @@ public:
    * @param vals the array to put the value into
    * @return true if the key is local (and therefore, the current value is in vals), false otherwise
    */
-  inline bool attemptLocalPull(const Key key, Val* val, const bool stats=true, const bool regularWorkerCall=false) {
+inline bool attemptLocalPull(const Key key, Val* val, const bool stats=true) {
     if (isNonLocal_noLock(key)) { return false; } // try to return early
 
 #if PS_BACKEND_LOCKS
     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
 #endif
-    return attemptLocalPullUnsafe(key, val, stats, regularWorkerCall);
-  }
-
-
-
-  /**
-     \brief Process a local or remote pull request
-   */
-  inline ps::Status processPull(const Key key, Val* val, int ts, Customer* customer, bool localRequest=true, std::shared_ptr<QueuedMessage<Val>> queued_msg = {}) {
-#if PS_BACKEND_LOCKS
-    std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
-#endif
-
-    if ((Postoffice::Get()->shared_memory_access() || !localRequest) && attemptLocalPullUnsafe(key, val, false)) {
-      return ps::Status::LOCAL;
-    } else if (transfers.isInTransferUnsafe(key)) {
-      if (localRequest)
-        transfers.queueLocalRequestUnsafe(key, ts, customer);
-      else
-        transfers.queueRemoteRequestUnsafe(key, queued_msg);
-      transfers.addPullToQueueUnsafe(key, val);
-#if PS_LOCALITY_STATS
-    num_accesses_in_transfer[key]++;
-#endif
-      return ps::Status::IN_TRANSFER;
-    } else {
-      return ps::Status::REMOTE;
-    }
-  }
-
-
-  /**
-     \brief Process a local or remote push request
-  */
-  inline ps::Status processPush(const Key key, Val* val, const int ts, Customer* customer, const bool set, bool localRequest=true,
-                                std::shared_ptr<QueuedMessage<Val>> queued_msg = {},
-                                std::shared_ptr<KVPairs<Val>> data_ptr = {}) {
-#if PS_BACKEND_LOCKS
-    std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
-#endif
-
-    if ((Postoffice::Get()->shared_memory_access() || !localRequest) && attemptLocalPushUnsafe(key, val, set)) {
-      return ps::Status::LOCAL;
-    } else if (transfers.isInTransferUnsafe(key)) {
-      if (localRequest) {
-        transfers.queueLocalRequestUnsafe(key, ts, customer);
-        transfers.addLocalPushToQueueUnsafe(key, val, get_len(key), set);
-      } else {
-        transfers.queueRemoteRequestUnsafe(key, queued_msg);
-        transfers.addRemotePushToQueueUnsafe(key, val, set, data_ptr);
-      }
-
-      return ps::Status::IN_TRANSFER;
-    } else {
-      return ps::Status::REMOTE;
-    }
-  }
-
-  /**
-     \brief Process a local localize request
-   */
-  inline ps::Status processLocalize(const Key key, const int ts, Customer* customer) {
-
-    // special case: don't localize cached parameters
-    if (cached_parameters != nullptr && (*cached_parameters)[key]) {
-      return ps::Status::LOCAL;
-    } else {
-
-#if PS_BACKEND_LOCKS
-    std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
-#endif
-
-#if PS_RELOC_STATS
-      ++STATS_num_localizes;
-#endif
-
-      if (isLocalUnsafe(key)) {
-        // skip the localization: key is already local
-#if PS_RELOC_STATS
-        ++STATS_num_localizes_local;
-#endif
-        return ps::Status::LOCAL;
-      } else if (transfers.isInTransferUnsafe(key)) {
-        // wait for a previously started localize
-        transfers.queueLocalRequestUnsafe(key, ts, customer);
-#if PS_RELOC_STATS
-        ++STATS_num_localizes_queue;
-#endif
-        return ps::Status::IN_TRANSFER;
-      } else {
-        // start a new localize
-        transfers.startTransferUnsafe(key);
-        transfers.queueLocalRequestUnsafe(key, ts, customer);
-        return ps::Status::REMOTE;
-      }
-    }
-  }
-
-  /**
-     \brief Determine whether a key is in transfer to the local PS right now
-   */
-  bool isInTransfer(Key key) {
-#if PS_BACKEND_LOCKS
-    std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
-#endif
-
-    return transfers.isInTransferUnsafe(key);
-  }
-
-  /**
-     \brief Store a subsequent localize (to another PS) for an ongoing localize (to the local PS)
-  */
-  bool noteSubsequentLocalize(Key key, std::shared_ptr<QueuedMessage<Val>>& queued_msg) {
-#if PS_BACKEND_LOCKS
-    std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
-#endif
-
-    return transfers.noteSubsequentLocalizeUnsafe(key, queued_msg);
+    return attemptLocalPullUnsafe(key, val, stats);
   }
 
   /**
@@ -517,7 +436,7 @@ public:
    *
    *        Warning: this method is not thread safe.
    */
-  inline bool attemptLocalPullUnsafe(const Key key, Val* val, const bool stats=true, const bool regularWorkerCall=false) {
+  inline bool attemptLocalPullUnsafe(const Key key, Val* val, const bool stats=true) {
 #if PS_LOCALITY_STATS
     if (stats) num_accesses[key]++;
 #endif
@@ -535,23 +454,15 @@ public:
       auto& param = (*store[key]);
 #endif
 
-      // key is local
-
-      // special case: if this is a "kept around" value, check whether it is current enough
-      if (param.keptAround) {
-        if (!regularWorkerCall) { // use kept values only for `Pull()` calls (and not for system functions or `PullIfLocal`)
-          return false;
-        }
-        if (std::chrono::steady_clock::now() - param.removeTime > maxKeepAround) {
-          // too old: delete the kept value
-          dropKeyUnsafe(key);
-          return false;
-        }
+      // don't use a replica that isn't properly set up yet
+      if (param.version == -1) {
+        return false;
       }
 
-      // the actual pull:copy the stored value to the passed location
+      // key is local
+
+      // the actual pull: copy the stored value to the passed location
       std::copy_n(begin(param.val), get_len(key), val);
-      ++param.numUses;
 
       // stats
       if (param.replica) {
@@ -563,119 +474,389 @@ public:
       if (stats) num_accesses_local[key]++;
 #endif
 
-      // delete the value if this was a "kept around value"
-      if (param.keptAround) {
-#if PS_LOCALITY_STATS
-        num_kept_around_used[key]++;
-#endif
-        dropKeyUnsafe(key);
-      }
       return true;
     }
   }
 
   /**
-   * \brief Initialize replication of specified parameters
+   * \brief Register a set of new intents for one key.
+   *        This stores the intents in the handle and creates the parameter object if necessary
    */
-  void initializeReplication(SArray<Key>& replicated) {
-    lockAll();
-    // insert entries for cached parameters
-    // for (unsigned long i=0; i!=cached_parameters->size(); ++i) {
-    for (Key key : replicated) {
-      lockSingle(key);
+  void registerNewIntentsForKeyUnsafe(const Key key,
+                                      std::vector<WorkerClockPair>& new_intents) {
+
+    // insert key if necessary
+    bool inserted = false;
 #if PS_BACKEND < 10 // map
-      auto search = store.find(key);
-      if (search == store.end())
+    auto search = store.find(key);
+    if (search == store.end())
 #else
-      if(store[key] == nullptr)
+    if(store[key] == nullptr)
 #endif
       {
         insertKeyUnsafe(key);
+        inserted = true;
       }
 
-#if PS_BACKEND < 10 // map
-      auto& param = store[key];
-#else
-      auto& param = (*store[key]);
-#endif
-
-      param.replica = true;
-      unlockSingle(key);
-    }
-    unlockAll();
-  }
-
-  /**
-   * \brief Read locally accumulated updates of replicated parameters.
-   *
-   *        Synchronizes selectively, depending on `threshold`:
-   *        - threshold=-1: synchronize all parameters (including ones with no updates)
-   *        - threshold=0: synchronize parameters with non-zero updates
-   *        - threshold>0: synchronize parameters where norm(updates)>threshold
-   *
-   */
-  void readReplicas(const KVPairs<Val>& state, KVPairs<Val>& updates, const double threshold=-1) {
-
-    assert(updates.keys.size() == 0);
-    assert(updates.vals.size() == 0);
-
-    size_t state_pos = 0;
-    for (unsigned long i=0; i!=state.keys.size(); ++i) {
-      Key key = state.keys[i];
-      auto len = get_len(key);
-#if PS_BACKEND_LOCKS
-      std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
-#endif
-#if PS_BACKEND < 10 // map
-      auto& param = store[key];
-#else
-      auto& param = (*store[key]);
-#endif
-      assert(param.replica);
-
-      // extract update
-      if ((threshold == -1) ||
-          (threshold == 0 && param.updated) ||
-          (threshold > 0 && param.updated && diffl2norm(param.val, &state.vals.data()[state_pos]) >= threshold)) {
-
-        // extract accumulated updates
-        updates.keys.push_back(key);
-        for (size_t k=0; k!=len; ++k) {
-          updates.vals.push_back(param.val[k] - state.vals[state_pos+k]);
-        }
-
-        // mark that we have extracted these updates
-        param.updated = false;
-      }
-      state_pos += len;
-    }
-  }
-
-
-  /**
-   * \brief Write a global update to a replicated parameter
-   */
-  void writeReplica(const Key key, const Val* global_update, const Val* my_update) {
-#if PS_BACKEND_LOCKS
-    std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
-#endif
+    // mark as replica
 #if PS_BACKEND < 10 // map
     auto& param = store[key];
 #else
     auto& param = (*store[key]);
 #endif
-    assert(param.replica);
 
-    // update the replica (the global update contains the node's update, so account for that)
-    if (my_update == nullptr) { // this node did not send an update
-      for (size_t j=0; j!=get_len(key); ++j) {
-        param.val[j] += global_update[j];
-      }
-    } else { // this node did send an update
-      for (size_t j=0; j!=get_len(key); ++j) {
-        param.val[j] += global_update[j] - my_update[j];
+#if PS_TRACE_KEYS
+    if (param.local_intents.size() == 0) {
+      trace_key(key, Event::INTENT_START);
+    }
+#endif
+
+    for (auto& new_intent : new_intents) {
+
+      // is there intent by this worker already?
+      auto search = param.local_intents.find(new_intent.customer_id);
+
+      if (search == param.local_intents.end()) { // if there is no intent yet, add the new one one
+        param.local_intents.insert({new_intent.customer_id, new_intent.end});
+      } else { // o/w, we merge the two intents: keep the later end clock
+        search->second = std::max(search->second, new_intent.end);
       }
     }
+
+    // set up parameter
+    if (inserted) {
+      param.replica = true;
+      param.version = -1; // mark that this replica cannot be used yet (until the sync refreshes it)
+
+      rememberReplica(key);
+    }
+  }
+
+  /**
+   * \brief Does at least one worker on this node currently have intent for `key`?
+   *
+   *        While checking, this method cleans up any intents that are outdated
+   *        because the corresponding worker has already passed the `end` clock
+   *        of the intent.
+   *
+   */
+  bool hasLocalIntentUnsafe(const Key key,
+                            const std::vector<Clock>& worker_clocks) {
+#if PS_BACKEND < 10 // map
+    auto& param = store[key];
+    assert(store[key] != nullptr);
+#else
+    auto& param = (*store[key]);
+#endif
+
+    // fast exit
+    // (note: fast exit is important for the correctness of the key tracing below (INTENT_STOP))
+    if (param.local_intents.size() == 0) {
+      return false;
+    }
+
+    // iterate the current intents
+    auto it = param.local_intents.begin();
+    while (it != param.local_intents.end()) {
+      auto& customer_id = it->first;
+      auto& intent_end = it->second;
+
+      if (worker_clocks[customer_id] < intent_end) {
+        // this is a current intent
+        return true;
+        // note: if we were to continue the loop, we would increase the iterator here: ++it;
+      } else {
+        // this intent is outdated. delete it, then continue to iterate
+        it = param.local_intents.erase(it); // erase() returns an iterator to the next element
+      }
+    }
+
+    // the had intent above (otherwise we would have exited quickly), and now the node doesn't
+    trace_key(key, Event::INTENT_STOP);
+
+    // we found no current intent
+    return false;
+  }
+
+  // quick check for local intent (without cleanup)
+  bool hasLocalIntent_noCleanup_Unsafe(Parameter<Val>& param) {
+    return param.local_intents.size() != 0;
+  }
+
+  /**
+   * \brief Visit a replica for sync and replica deletion, i.e.:
+   *            (1) extract accumulated updates if there are any
+   *            (2) drop the replica if no worker needs it anymore
+   *
+   *        Returns a tuple <dropped, version>, indicating
+   *            (1) whether the method has dropped the replica (because it isn't needed anymore)
+   *            (2) which version the replica has
+   *
+   *        Extracts updates selectively, depending on `threshold`:
+   *        - threshold=-1: always extract an update (also if it is all zero)
+   *        - threshold=0: extract update if the parameter was updated
+   *        - threshold>0: extract update if its norm exceeds the given threshold,
+   *                       i.e., if norm(updates)>threshold; if we drop the replica,
+   *                       any update will be extracted, regardless of the threshold
+   */
+  std::tuple<bool, bool, Version>
+    readAndPotentiallyDropReplica(const Key key, KVPairs<Val>& message,
+                                  const std::vector<Clock>& worker_clocks,
+                                  const double threshold=-1) {
+#if PS_BACKEND_LOCKS
+     std::lock_guard<std::mutex> lk(mu_[lockForKey(key)]);
+#endif
+
+#if PS_BACKEND < 10 // map
+     auto& param = store[key];
+#else // vector
+     auto& param = (*store[key]);
+#endif
+
+     assert(param.replica); // the parameter has to be a replica
+
+     // decide whether this replica should be dropped
+     // (we will drop it if none of the local worker needs it anymore)
+     const bool localIntent = hasLocalIntentUnsafe(key, worker_clocks);
+
+     // determine the current version of the replica (so we can return it later)
+     const auto replica_version = param.version;
+
+     // extract update if desired
+     bool extracted_an_update = false;
+     bool drop = !localIntent;
+     if ((param.version != -1) &&  // no extraction if replica isn't set up yet
+         ((threshold == -1) || // always extract
+          (threshold == 0 && param.updated) || // extract only if updated
+          (threshold > 0 && param.updated && // extract if update exceeds threshold
+           (diffl2norm(param.val, param.sync_state) >= threshold || drop)))) {
+
+       extracted_an_update = true;
+
+       // copy out the updates
+       for (size_t k=0; k!=get_len(key); ++k) {
+         message.vals.push_back(param.val[k] - param.sync_state[k]);
+         param.sync_state[k] = param.val[k];
+        }
+       param.updated = false;
+
+       // We raise the version counter to v+1 to prevent unnecessary refreshes.
+       // We can do so safely because we know that the main copy will increase
+       // its version counter to v+1 for the update that we just extracted. When
+       // there are updates by other nodes, the main version will be >v+1 and
+       // this node's replica will be refreshed.
+       ++param.version;
+     }
+
+     bool refresh;
+     if (localIntent) {
+       refresh = true;
+     } else {
+       assert(!param.updated); // there should not be any update left
+       removeKeyUnsafe(key);
+       forgetReplica(key);
+       refresh = false;
+       trace_key(key, Event::REPLICA_DROP);
+     }
+
+     return std::make_tuple(refresh, extracted_an_update, replica_version);
+   }
+
+  /**
+   * \brief Does this node currently hold own `key`?
+   */
+  bool isOwnerUnsafe(const Key key) {
+#if PS_BACKEND < 10
+    auto search = store.find(key);
+    return search != store.end() && !search->second.replica;
+#else
+    return store[key] != nullptr && !store[key]->replica;
+#endif
+  }
+
+   /**
+    * \brief Touch an owned key for several (all optional) actions:
+    *       (1) [optional] Write an external update into the main replica
+    *       (2) [optional] Copy out the latest value
+    *       (3) [optional] Remove the parameter from the local store (for relocation to another node)
+    *
+    *        In more detail:
+    *        (1) The method writes an external update if `update`!=nullptr.
+    *        (2) The method copies out the latest value (for a replica refresh) if
+    *             (a) a refresh is desired (indicated by `copy`==true)
+    *             (b) there are updates that the requester does not yet have
+    *        (3) The method removes the parameter from the local store if `relocate`==true
+    *
+    *        Returns a pair <bool a, version b> that indicates
+    *         (a) whether the latest value was extracted and
+    *         (b) what the latest version of the main copy is
+    *         (c) the relocation counter oft he parameter
+    */
+  std::tuple<bool, Version, Version>
+    writeCopyDropOwnedKeyUnsafe(const Key key, const Val* update,
+                                const bool copy, KVPairs<Val>& response,
+                                const Version replica_ver, const bool relocate) {
+#if PS_BACKEND < 10 // map
+     auto& param = store[key];
+#else
+     auto& param = (*store[key]);
+#endif
+
+     assert(!param.replica);
+     assert(replica_ver <= param.version);
+
+     // does the main copy have updates that the requester hasn't seen yet
+     // note: important to read main version before the potential update below
+     bool have_unsynced_updates = replica_ver < param.version;
+
+     // merge in the external update
+     if (update != nullptr) {
+       mergeValue(param.val, update, false, get_len(key));
+       ++param.version;
+       assert(param.version != 0); // let's hear about overflows for now
+     }
+
+     // copy out the latest value
+     bool copied = false;
+     if (copy && have_unsynced_updates) {
+       copied = true;
+       std::copy_n(std::begin(param.val), get_len(key), std::back_inserter(response.vals));
+     }
+
+     // if we relocate, drop the parameter from this node's store
+     auto ver = param.version;
+     auto relocation_counter = param.relocation_counter;
+     if (relocate) {
+       assert(copy); // if we drop a parameter, update extraction should be enabled
+       bool localIntent = hasLocalIntent_noCleanup_Unsafe(param);
+       if (Postoffice::Get()->management_techniques() == MgmtTechniques::RELOCATION_ONLY &&
+           localIntent) {
+         // Special case: only relocation is possible + there still is local
+         // intent. We keep the parameter object around (as it stores the local
+         // intent) and localize the parameter again in the next sync round (if
+         // there still is intent then)
+
+         // reset val
+         std::fill(begin(param.val), end(param.val), 0);
+         param.version = -1;
+         param.updated = false;
+
+         // include in next sync round
+         param.replica = true;
+         rememberReplica(key);
+       } else {
+         // Normal case: by design, we know that there is no local intent
+         // anymore (because we relocate only when there is no other intent). So
+         // we can safely drop the parameter.
+         assert(!localIntent);
+         removeKeyUnsafe(key);
+       }
+       trace_key(key, Event::DEALLOC);
+     }
+
+     return std::make_tuple(copied, ver, relocation_counter);
+   }
+
+   /**
+    * \brief Obtain a list of replicas that this node currently holds
+    */
+   std::vector<Key> currentReplicas(const unsigned int channel) {
+     std::lock_guard<std::mutex> lk(replicas_mus[channel]);
+     std::vector<Key> current_replicas (replicas[channel].begin(), replicas[channel].end());
+     return current_replicas;
+   }
+
+   /**
+    * \brief Touch a replicated parameter for multiple (optional) actions:
+    *           (1) [optional] Refresh replica, i.e., write an external update
+    *           (2) [optional] Upgrade the replica to an owned parameter
+    *
+    *        Adds updates that were accumulated since the synchronization mechanism
+    *        last read the replica.
+    */
+   void refreshUpgradeReplicaUnsafe(const Key key, const Val* state, const Version ver,
+                                    const bool upgrade_to_owned, const Version relocation_counter) {
+#if PS_BACKEND < 10 // map
+     auto search = store.find(key);
+     assert (search != store.end());
+     auto& param = search->second;
+#else
+     assert (store[key] != nullptr); // the replica should still be in store
+     auto& param = (*store[key]);
+#endif
+     assert(param.replica);
+
+     // update the replica
+     if (state != nullptr) {
+       if (param.sync_state.size() == 0) {
+         // proceed without previous sync state
+         // (we have this special case to omit the `sync_state` allocation for relocations)
+         for (size_t j=0; j!=get_len(key); ++j) {
+           param.val[j] = state[j] + param.val[j];
+         }
+       } else {
+         for (size_t j=0; j!=get_len(key); ++j) {
+           param.val[j] = state[j] + param.val[j] - param.sync_state[j];
+         }
+       }
+
+       // write last sync state (which is not necessary if this is a relocation)
+       if (!upgrade_to_owned) {
+         if (param.sync_state.size() == 0) {
+           param.sync_state.resize(get_len(key));
+         }
+
+         // update sync state
+         memcpy(param.sync_state.data(), state, get_len(key)*sizeof(Val));
+       }
+
+#if PS_TRACE_KEYS
+       if (param.version == -1) {
+         trace_key(key, Event::REPLICA_SETUP);
+       }
+#endif
+
+       param.version = ver;
+     }
+
+     // relocation: this replica now becomes a parameter that is owned by this node
+     if (upgrade_to_owned) {
+       param.replica = false;
+       param.relocation_counter = relocation_counter;
+       forgetReplica(key);
+
+       // if the replica has been updated in the mean time, these updates lead to a version raise
+       if (param.updated) {
+         ++param.version;
+         param.updated = false;
+       }
+
+#if PS_TRACE_KEYS
+       if (param.version != -1) {
+         trace_key(key, Event::REPLICA_DROP);
+       }
+       trace_key(key, Event::ALLOC);
+#endif
+     }
+   }
+
+  // output stats about the number of local parameters and replicas
+  void stats () {
+    size_t in_store = 0;
+    size_t replica = 0;
+    for(auto& param : store) {
+#if PS_BACKEND < 10 // map
+      ++in_store;
+      if (param.second.replica) ++replica;
+#else
+      if(param != nullptr) {
+        ++in_store;
+        if (param->replica) ++replica;
+      }
+#endif
+    }
+
+    ALOG("RH@" << Postoffice::Get()->my_rank() << ": " << in_store << " in store, " << replica << " replicas");
   }
 
 
@@ -756,9 +937,9 @@ public:
   inline bool isLocalUnsafe(const Key key) {
 #if PS_BACKEND < 10
     auto search = store.find(key);
-    return search != store.end() && !search->second.keptAround;
+    return search != store.end() && search->second.version != -1;
 #else
-    return store[key] != nullptr && !store[key]->keptAround;
+    return store[key] != nullptr && store[key].version != -1;
 #endif
   }
 
@@ -777,38 +958,50 @@ public:
 #endif
   }
 
-  const size_t get_num_keys() const {
-      return transfers.getNumKeys();
-  }
-
   /** Write locality statistics to files */
   void writeStats() {
+    // write out locality stats
 #if PS_LOCALITY_STATS
-    std::string outfile ("stats/locality_stats.rank." + std::to_string(myRank) + ".tsv");
+    std::string outfile (Postoffice::Get()->get_stats_output_folder() + "/locality_stats.rank." + std::to_string(my_rank) + ".tsv");
     std::ofstream statsfile (outfile, ofstream::trunc);
-    long total_accesses = 0, total_accesses_local = 0, total_accesses_in_transfer = 0, total_kept_around = 0, total_kept_around_used = 0;
-    statsfile << "Param\tAccesses\tLocal\tInTransfer\tKeptAround\tKeptAroundUsed\n";
+    long total_accesses = 0, total_accesses_local = 0;
+    statsfile << "Param\tAccesses\tLocal\n";
     for (uint i=0; i!=num_accesses.size(); ++i) {
-      statsfile << i << "\t" << num_accesses[i] << "\t" << num_accesses_local[i] << "\t" << num_accesses_in_transfer[i] << "\t" << num_kept_around[i] << "\t" << num_kept_around_used[i] << "\n";
+      statsfile << i << "\t" << num_accesses[i] << "\t" << num_accesses_local[i] << "\n";
       total_accesses += num_accesses[i];
       total_accesses_local += num_accesses_local[i];
-      total_accesses_in_transfer += num_accesses_in_transfer[i];
-      total_kept_around += num_kept_around[i];
-      total_kept_around_used += num_kept_around_used[i];
     }
     statsfile.close();
-    ADLOG("Wrote locality stats for rank " << myRank << " to " << outfile << ". Total: " << total_accesses << " accesses, " << total_accesses_local << " local, " << total_accesses_in_transfer << " in transfer. \n" << 100.0 * total_kept_around_used / total_kept_around << "% of " << total_kept_around << " kept around used" );
+    ADLOG("Wrote locality stats for rank " << my_rank << " to " << outfile << ". Total: " << total_accesses << " accesses, " << total_accesses_local << " local." );
+#endif
+
+    // write out key traces
+#if PS_TRACE_KEYS
+    std::string outfile (Postoffice::Get()->get_stats_output_folder() + "/traces." + std::to_string(my_rank) + ".tsv");
+    std::ofstream tracefile (outfile, std::ofstream::trunc);
+    std::lock_guard<std::mutex> lk(traces_mu_);
+    while (!traces.empty()) {
+      auto& trace = traces.front();
+      tracefile <<
+        std::chrono::duration_cast<std::chrono::milliseconds>(trace.time.time_since_epoch()).count() << "\t" <<
+        trace.key << "\t" <<
+        my_rank << "\t" <<
+        trace.event << "\n";
+      traces.pop();
+    }
+    tracefile.close();
 #endif
   }
 
   /** Returns the length of the value of a specific key */
-  inline const size_t get_len(Key key) {
+  inline const size_t get_len(Key key) const {
     if (value_lengths.size() == 1) return value_lengths[0];
     else                           return value_lengths[key];
   }
 
   /** Returns the sum of the lengths of a list of keys */
-  inline size_t get_total_len(SArray<Key>& keys) {
+  template<typename C>
+  inline size_t get_total_len(C& keys) {
     size_t total_len = 0;
     for(Key key : keys)
       total_len += get_len(key);
@@ -820,20 +1013,40 @@ public:
   unsigned long get_num_pushs_to_replicas() const { return num_pushs_to_replicas; }
   void reset_replica_stats() { num_pulls_to_replicas=0; num_pushs_to_replicas=0; }
 
-  ColoServerTransfers<Val> transfers; // TODO: make private
+  // get the channel for a key
+  const unsigned int get_channel(const Key key) const {
+    if (Postoffice::Get()->num_channels() == 1) {
+      return 0;
+    }
+
+    const std::uint32_t knuth = 2654435769;
+    const std::uint32_t y = key;
+    return (y * knuth) >> (32 - p_num_channels_);
+
+    // We don't use a naive mod for channel assignment because this causes clashes with key partitioning.
+    // The above is a fast(er) implementation of the Knuth multiplication method. This is equivalent to the following:
+    // const float A = (sqrt(5)-1)/2;
+    // auto slow = std::floor(Postoffice::Get()->num_channels() * (key * A - std::floor(key * A)));
+  }
+
 private:
 
-  /** Actually delete a key from the local store */
-  inline void dropKeyUnsafe(Key key) {
-#if PS_BACKEND < 10 // map
-    store.erase(key);
-#else
-    store[key].reset();
-#endif
+  /** Note down that we have a replica for `key` */
+  void rememberReplica(const Key key) {
+    auto c = get_channel(key);
+    std::lock_guard<std::mutex> lk(replicas_mus[c]);
+    replicas[c].insert(key);
+  }
+
+  /** Delete the node that we have a replica for `key` */
+  void forgetReplica(const Key key) {
+    auto c = get_channel(key);
+    std::lock_guard<std::mutex> lk(replicas_mus[c]);
+    replicas[c].erase(key);
   }
 
   /** Calculate L2-norm of a parameter vector */
-  double diffl2norm(const std::valarray<Val>& updated, const Val* old) const {
+  double diffl2norm(const std::vector<Val>& updated, const std::vector<Val>& old) const {
     double accum = 0;
     for (size_t z=0; z!=updated.size(); ++z) {
       auto diff = updated[z]-old[z];
@@ -842,34 +1055,26 @@ private:
     return sqrt(accum);
   }
 
+  /** Note down one event for one key (write later) */
+  inline void trace_key(const Key key, const Event event) {
+#if PS_TRACE_KEYS
+    if (traced_keys.find(key) != traced_keys.end()) {
+      std::lock_guard<std::mutex> lk(traces_mu_);
+      traces.emplace(std::chrono::system_clock::now(), key, event);
+    }
+#endif
+  }
+
   const std::vector<size_t> value_lengths;
 
 #if PS_BACKEND == PS_BACKEND_STD_UNORDERED_LOCKS
   std::unordered_map<Key, Parameter<Val>> store;
-
-#elif PS_BACKEND == PS_BACKEND_GOOGLE_DENSE
-  google::dense_hash_map<Key,Val> store;
-
-#elif PS_BACKEND == PS_BACKEND_TBB_CONCURRENT_UNORDERED
-  tbb::concurrent_unordered_map<Key, std::valarray<Val>> store; // doesn't support insert/remove
-
-#elif PS_BACKEND == PS_BACKEND_TBB_CONCURRENT_HASH_MAP
-  tbb::concurrent_hash_map<Key, std::valarray<Val>> store;
 
 #elif PS_BACKEND == PS_BACKEND_VECTOR
   std::vector<std::unique_ptr<Parameter<Val>>> store;
 
 #elif PS_BACKEND == PS_BACKEND_VECTOR_LOCKS
   std::vector<std::unique_ptr<Parameter<Val>>> store;
-
-#elif PS_BACKEND == PS_BACKEND_ARRAY
-  Val* store;
-
-#elif PS_BACKEND == PS_BACKEND_ARRAY_ATOMIC
-  std::atomic<Val>* store;
-
-#else
-  std::unordered_map<Key, Parameter<Val>> store;
 
 #endif
 
@@ -878,23 +1083,29 @@ private:
   std::array<std::mutex, PS_BACKEND_NUM_LOCKS> mu_;
 #endif
 
-  // settings for keeping around unused parameters
-  const bool keepAroundUnused;
-  const std::chrono::steady_clock::duration maxKeepAround;
+  // a list of all currently held replicas (one separate list per channel)
+  std::vector<std::unordered_set<Key>> replicas {};
+  std::vector<std::mutex> replicas_mus;
+
+  // the log2 of the number of channels (used for fast channel hashing)
+  const int p_num_channels_;
 
   // replica stats (approximate, as we don't synchronize these counters)
   unsigned long num_pulls_to_replicas = 0;
   unsigned long num_pushs_to_replicas = 0;
 
+  int my_rank; // have a copy of the rank that is available at destruction
+
   // Contains true for the parameters whose value should be cached
-  std::vector<bool>* cached_parameters = nullptr;
 #if PS_LOCALITY_STATS
   std::vector<unsigned long> num_accesses;
   std::vector<unsigned long> num_accesses_local;
-  std::vector<unsigned long> num_accesses_in_transfer;
-  std::vector<unsigned long> num_kept_around;
-  std::vector<unsigned long> num_kept_around_used;
-  int myRank;
+#endif
+
+#if PS_TRACE_KEYS
+  std::unordered_set<Key> traced_keys {}; // which keys to trace
+  std::queue<Trace> traces {}; // stored traces
+  std::mutex traces_mu_; // protects `traces`
 #endif
 };
 

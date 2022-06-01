@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 #include <stdexcept>
+#include <chrono>
+#include <iomanip>
 #include "./base.h"
 
 namespace dmlc {
@@ -120,12 +122,20 @@ inline void InitLogging(const char* argv0) {
 #define DCHECK_EQ(x, y) CHECK((x) == (y))
 #define DCHECK_NE(x, y) CHECK((x) != (y))
 #define ADLOG(x) \
-  { std::stringstream ___s; ___s << x << "\n"; std::cout << ___s.str() << std::flush;} // atomic debug log [sysChange]
+  { ALOG(x) } // atomic debug log [sysChange]
 #endif  // NDEBUG
 
 // ATOMIC LOG
 #define ALOG(x)                                                        \
-  { std::stringstream ___s; ___s << x << "\n"; std::cout << ___s.str() << std::flush;} // atomic log [sysChange]
+  { \
+  const auto ___now = std::chrono::system_clock::now(); \
+  const auto ___tt = std::chrono::system_clock::to_time_t(___now); \
+  const auto ___ms = std::chrono::duration_cast<std::chrono::milliseconds>(___now.time_since_epoch()) % 1000; \
+  std::stringstream ___time; \
+  ___time << "[" << std::put_time(std::localtime(&___tt), "%y-%m-%d %H:%M:%S") \
+          << '.' << std::setfill('0') << std::setw(3) << ___ms.count() << "] "; \
+  std::stringstream ___s; ___s << ___time.str() << x << "\n"; std::cout << ___s.str() << std::flush; \
+} // atomic log [sysChange]
 
 // LOG FOR PARAMETER TRANSFERS
 #define TRANSFER_LOG false

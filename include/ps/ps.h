@@ -14,7 +14,6 @@
 /** \brief communcating with a list of key-value pairs. servers co-located with workers. */
 #include "ps/coloc_kv_worker.h"
 #include "ps/coloc_kv_server.h"
-#include "ps/coloc_kv_transfers.h"
 #include "ps/coloc_kv_server_handle.h"
 namespace ps {
 /** \brief Returns the number of worker nodes */
@@ -27,8 +26,6 @@ inline bool IsWorker() { return Postoffice::Get()->is_worker(); }
 inline bool IsServer() { return Postoffice::Get()->is_server(); }
 /** \brief Returns true if this node is a scheduler node. */
 inline bool IsScheduler() { return Postoffice::Get()->is_scheduler(); }
-/** \brief Returns true if workers and servers are co-located in this PS. [sysChange] */
-inline bool Coloc() { return Postoffice::Get()->coloc(); }
 /** \brief Returns the rank of this node in its group
  *
  * Each worker will have a unique rank within [0, NumWorkers()). So are
@@ -36,31 +33,18 @@ inline bool Coloc() { return Postoffice::Get()->coloc(); }
  */
 inline int MyRank() { return Postoffice::Get()->my_rank(); }
 /**
- * \brief start the system
- *
- * This function will block until every nodes are started.
- * \param argv0 the program name, used for logging
+ * \brief Run the scheduler.
  */
-inline void Start(int customer_id, const char* argv0 = nullptr) {
-  Postoffice::Get()->Start(customer_id, argv0, true);
+inline void Scheduler() {
+  auto scheduler_customer_id = Postoffice::Get()->ps_customer_id(0); // scheduler has the same customer id as the primary PS threads
+  Postoffice::Get()->Start(scheduler_customer_id, nullptr, true);
+  Postoffice::Get()->Finalize(scheduler_customer_id, true);
 }
 /**
- * \brief start the system
- *
- * This function will NOT block.
- * \param argv0 the program name, used for logging
- */
-inline void StartAsync(int customer_id, const char* argv0 = nullptr) {
-  Postoffice::Get()->Start(customer_id, argv0, false);
-}
-/**
- * \brief terminate the system
- *
- * All nodes should call this function before existing. 
- * \param do_barrier whether to block until every node is finalized, default true.
- */
-inline void Finalize(int customer_id, const bool do_barrier = true) {
-  Postoffice::Get()->Finalize(customer_id, do_barrier);
+  * \brief Setup the PS system.
+  */
+inline void Setup(const Key num_keys, const unsigned int num_threads) {
+  Postoffice::Get()->setup(num_keys, num_threads);
 }
 /**
  * \brief Register a callback to the system which is called after Finalize()

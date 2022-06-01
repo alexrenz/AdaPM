@@ -26,10 +26,9 @@ int num_local_workers = 2;
 
 template <typename Val>
 void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
-  Start(customer_id);
-  WorkerT kv(0, customer_id, *server); // app_id, customer_id
+  WorkerT kv(customer_id, *server); // app_id, customer_id
 
-  int worker_id = ps::MyRank()*num_local_workers+customer_id-1; // a unique id for this worker thread
+  int worker_id = ps::MyRank()*num_local_workers+customer_id; // a unique id for this worker thread
   auto num_workers = Postoffice::Get()->num_servers() * num_local_workers;
 
   // wait for all workers to boot up
@@ -68,6 +67,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
         ADLOG("Run " << checkrun << ", initial check failed: actual " << testvals << ", correct " << correctvals);
         error = true;
       }
+      kv.advanceClock();
     }
     kv.Barrier();
 
@@ -77,20 +77,32 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
         std::stringstream s;
         s << "w" << rank << ":" << customer_id << ": run " << run;
       }
-      if(run % 1000 == 0) { // chaos: everyone tries to localize constantly
-        ts_localize.push_back(kv.Localize(keys1));
+      if(run % 100 == 0) { // chaos: send intent some of the time for a couple of clocks
+        ts_localize.push_back(kv.Intent(keys1, kv.currentClock()+10));
       }
 
       vals1[0] = worker_id;
       vals1[1] = worker_id * 2;
       ts.push_back(kv.Push(keys1, vals1));
       ts_pull.push_back(kv.Pull(keys1, &vals2));
+
+      kv.advanceClock();
+    }
+
+    // make sure there is no intent anymore
+    for (size_t i=0; i!=10; ++i) {
+      kv.advanceClock();
     }
 
     // Wait for all pushs and pulls
     for(auto timestamp : ts) kv.Wait(timestamp);
     for(auto timestamp : ts_pull) kv.Wait(timestamp);
+    kv.WaitSync();
     kv.Barrier();
+
+    kv.WaitSync();
+    kv.Barrier();
+
 
     // Check that the current value is correct
     if (worker_id == 0) {
@@ -106,39 +118,36 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
     }
   }
 
-  // stop the program if we detected a mistake
-  assert(!error);
-  // otherwise the test is passed
-  ADLOG("Test PASSED");
+  if (error) {
+    ALOG("Set operation, w " << worker_id << ": FAILED");
+  } else {
+    ALOG("Set operation, w " << worker_id << ": PASSED");
+  }
 
   // wind down
   kv.WaitAll();
-  ADLOG("Worker " << rank << ":" << customer_id << " is finished ");
   kv.Barrier();
-  Finalize(customer_id, barrier);
+  kv.Finalize();
 }
 
 int main(int argc, char *argv[]) {
-  Postoffice::Get()->enable_dynamic_allocation(num_keys, num_local_workers, false);
+  Setup(num_keys, num_local_workers);
 
   std::string role = std::string(getenv("DMLC_ROLE"));
 
   // co-locate server and worker threads into one process
   if (role.compare("scheduler") == 0) {
-    Start(0);
-    Finalize(0, true);
+    Scheduler();
   } else if (role.compare("server") == 0) { // worker+server
 
     // Start the server system
-    int server_customer_id = 0; // server gets customer_id=0, workers 1..n
-    Start(server_customer_id);
-    auto server = new ServerT(num_keys, vpk);
+    auto server = new ServerT(vpk);
     RegisterExitCallback([server](){ delete server; });
 
     // run worker(s)
     std::vector<std::thread> workers {};
     for (int i=0; i!=num_local_workers; ++i)
-      workers.push_back(std::thread(RunWorker<ValT>, i+1, false, server));
+      workers.push_back(std::thread(RunWorker<ValT>, i, false, server));
 
     // wait for the workers to finish
     for (size_t w=0; w!=workers.size(); ++w) {
@@ -146,7 +155,7 @@ int main(int argc, char *argv[]) {
     }
 
     // stop the server
-    Finalize(server_customer_id, true);
+    server->shutdown();
 
   } else {
     LL << "Process started with unkown role '" << role << "'.";

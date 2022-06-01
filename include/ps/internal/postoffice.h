@@ -16,6 +16,8 @@ namespace ps {
  * \brief the center of the system
  */
 class Postoffice {
+  template <typename Val, typename Handle>
+  friend class ColoKVServer;
  public:
   /**
    * \brief return the singleton object
@@ -139,30 +141,58 @@ class Postoffice {
   bool is_recovery() const { return van_->my_node().is_recovery; }
 
   // methods added for co-location and parameter movements. start [sysChange]
-  void enable_dynamic_allocation(const Key key, const size_t nt, const bool use_location_caches=false) {
-    shared_memory_access_ = true; coloc_ = true; set_max_key(key); set_num_worker_threads(nt); location_caches_ = use_location_caches; }
-  /** \brief Return whether to co-locate workers and servers in the same process */
-  inline bool coloc() const { return coloc_; }
-  /** \brief Return whether to access local parameters via shared memory */
-  inline bool shared_memory_access() const { return shared_memory_access_; }
+  void setup(const Key num_keys, const unsigned int num_threads) {
+    num_keys_ = num_keys;
+    num_worker_threads_ = num_threads;
+    customers_.resize(num_threads + num_channels_ + 1); // +1 for sampling customer
+  }
+  /** \brief Return whether to relocate parameters (otherwise, the system will always replicate on intent) */
+  inline MgmtTechniques management_techniques() const { return management_techniques_; }
+  /** \brief Whether and with which target probability to time intent actions */
+  inline double time_intent_actions() const { return time_intent_actions_; }
   /** \brief Returns whether location caches are used */
   inline bool use_location_caches() const { return location_caches_; }
-  /** \brief Returns whether value caches are used */
-  void set_shared_memory_access(bool sm) { shared_memory_access_ = sm; }
-  /** \brief Set the maximum key */
-  void set_max_key(Key key) { kMaxKey = key; }
-  /** \brief Get the configured maximum key */
-  inline Key max_key() {  return kMaxKey; }
-  /** \brief Set the number of worker threads per server process (default 1) */
-  void set_num_worker_threads(size_t nt) { num_worker_threads_ = nt; }
+  /** \brief Returns the number of communication channels */
+  inline unsigned int num_channels() const { return num_channels_; }
+  /** \brief Get the configured number of keys */
+  inline Key num_keys() const { return num_keys_; }
   /** \brief Get the number of worker threads per server process */
-  inline uint num_worker_threads() { return num_worker_threads_; }
+  inline uint num_worker_threads() const { return num_worker_threads_; }
+  // number of network threads
+  int get_num_network_threads() const { return num_network_threads_; }
   // end [sysChange]
 
-  /** \brief Get the number of network threads */
-  int  get_num_network_threads() { return num_network_threads_; }
-  /** \brief Get (i) whether and (ii) for which messages a separate thread is used for sending messages in the van */
-  int use_sender_thread() { return use_sender_thread_; }
+
+   // customer ids (N worker threads, C channels):
+   //  0..(N-1): worker threads
+   //  N..(N+C-1): ps threads (N is primary ps thread)
+  /** \brief Returns whether the given customer id belongs to a PS thread */
+  bool is_ps(const unsigned int customer_id) {
+    return num_worker_threads() <= customer_id && customer_id < num_worker_threads() + num_channels();
+  }
+  /** \brief Returns whether the given customer id belongs to the primary PS thread of this node */
+  bool is_primary_ps(const unsigned int customer_id) {
+    return num_worker_threads() == customer_id;
+  }
+  /** \brief Return the customer id for the PS thread of the corresponding channel (`0` gives the primary PS thread) */
+  int ps_customer_id(const unsigned int channel) {
+    return num_worker_threads() + channel;
+  }
+  // format the channel number for output
+  char fchannel(const unsigned int channel_or_customer_id, const bool given_customer_id=false) const {
+    unsigned int channel = channel_or_customer_id;
+    if (given_customer_id) {
+      assert(channel_or_customer_id >= num_worker_threads());
+      channel = channel_or_customer_id - num_worker_threads();
+    }
+    assert (channel < 52);
+    return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[channel];
+  }
+
+  // stats and key tracing
+  std::string get_stats_output_folder() { return stats_output_folder_; }
+  std::string get_traced_keys() { return traced_keys_list_; }
+
 
   /**
    * \brief barrier
@@ -189,9 +219,6 @@ class Postoffice {
    */
   std::vector<int> GetDeadNodes(int t = 60);
 
-  // (public so they can be accessed for system options)
-  int num_network_threads_ = 1;
-  int use_sender_thread_ = 1;
 
  private:
   Postoffice();
@@ -200,17 +227,18 @@ class Postoffice {
   void InitEnvironment();
   Van* van_;
   mutable std::mutex mu_;
-  // app_id -> (customer_id -> customer pointer)
-  std::unordered_map<int, std::unordered_map<int, Customer*>> customers_;
+  std::vector<Customer*> customers_;
   std::unordered_map<int, std::vector<int>> node_ids_;
   std::mutex server_key_ranges_mu_;
   std::vector<Range> server_key_ranges_;
   bool is_worker_, is_server_, is_scheduler_;
   int num_servers_, num_workers_;
-  bool coloc_; // [sysChange]
-  bool shared_memory_access_ = false; // [sysChange]
-  bool location_caches_ = false; // [sysChange]
   bool replication_ = false; // [sysChange]
+  int num_network_threads_ = 3;
+  MgmtTechniques management_techniques_ = MgmtTechniques::ALL;
+  bool time_intent_actions_ = true;
+  bool location_caches_ = true;
+  int num_channels_ = 4;
   std::unordered_map<int, std::unordered_map<int, bool> > barrier_done_;
   int verbose_;
   std::mutex barrier_mu_;
@@ -224,9 +252,11 @@ class Postoffice {
   std::shared_ptr<Environment> env_ref_;
   time_t start_time_;
   /*! \brief The maximal allowed key value */
-  Key kMaxKey = std::numeric_limits<Key>::max(); // [sysChange] moved here to be able to modify it
+  Key num_keys_ = std::numeric_limits<Key>::max(); // [sysChange] moved here to be able to modify it
   /*! \brief The number of worker threads per server process [sysChange] */
   uint num_worker_threads_ = 1;
+  std::string traced_keys_list_;
+  std::string stats_output_folder_;
   DISALLOW_COPY_AND_ASSIGN(Postoffice);
 };
 

@@ -5,6 +5,7 @@ on: [push]
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v2
@@ -24,3 +25,6 @@ jobs:
 
     - name: Apps
       run: tests/run_apps.sh
+
+    - name: Compile with key tracing
+      run: rm -rf build && export LAPSE_EXTERNAL_LDFLAGS="-DPS_TRACE_KEYS=1" && make

@@ -9,15 +9,33 @@
 #include <valarray>
 #include <memory>
 #include <set>
+#include <unordered_set>
+#include <cassert>
 
 #pragma once
 
 template<typename vT>
 std::string str(vT& v) {
   std::stringstream ss;
-  for(size_t i = 0; i < v.size(); ++i) {
+  for(auto& e : v) {
     ss << "\t";
-    ss << v[i];
+    ss << e;
+  }
+  return ss.str();
+}
+
+template<typename vT>
+std::string str(vT& v, const size_t max) {
+  std::stringstream ss;
+  size_t num_elements = 0;
+  for(auto& e : v) {
+    ss << "\t";
+    ss << e;
+    ++num_elements;
+    if (num_elements >= max) {
+      ss << "\t...";
+      break;
+    }
   }
   return ss.str();
 }
@@ -43,6 +61,17 @@ std::ostream& operator<<(std::ostream& os, const std::valarray<T>& v) {
 // print set
 template<typename T>
 std::ostream& operator<<(std::ostream& os, const std::set<T>& set) {
+  std::stringstream ss;
+  for (auto elem : set) {
+    ss << "\t" << elem;
+  }
+  os << ss.str();
+  return os;
+}
+
+// print unordered set
+template<typename T>
+std::ostream& operator<<(std::ostream& os, const std::unordered_set<T>& set) {
   std::stringstream ss;
   for (auto elem : set) {
     ss << "\t" << elem;
@@ -126,12 +155,6 @@ std::ostream& operator<<(std::ostream& os, util::Stopwatch& sw) {
 }
 
 
-// C++ 11 make_unique
-template<typename T, typename... Args>
-  std::unique_ptr<T> make_unique(Args&&... args) {
-  return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
-}
-
 /**
  * \brief All-Reduce a vector of values among all workers via the parameter server.
           This is designed for occasional use (e.g., to sum local losses to a global loss), _not_ for performance.
@@ -172,3 +195,4 @@ Val ps_allreduce(Val local, int worker_id, Key key, WorkerT& kv) {
   auto global_values = ps_allreduce(local_vector, worker_id, key, kv);
   return global_values[0];
 }
+

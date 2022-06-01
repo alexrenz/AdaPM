@@ -47,6 +47,7 @@ typedef Eigen::Matrix<ValT, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor> DeM
 // Matrix factorization config
 string dataset;
 uint mf_rank;
+uint param_len;
 int epochs;
 double initial_step_size;
 double lambda;
@@ -60,22 +61,19 @@ bool bold_driver;
 // System config
 uint num_workers;
 int  num_threads;
-int  num_cols;
-int  num_rows;
-bool shared_memory;
+long num_cols;
+long num_rows;
 Alg algorithm;
-bool disable_localize_blocks;
-bool disable_localize_left;
-size_t prelocalize_steps;
-size_t prelocalize_groupsize;
+bool   signal_intent_rows;
+size_t signal_intent_cols;
 int init_parameters;
 bool enforce_random_keys;
 unsigned long early_stop;
 bool sync_push;
-size_t replicate;
 long max_runtime;
 bool prevent_full_model_pull;
 std::string write_generated_factors;
+bool enforce_full_replication;
 
 // set by system
 Key first_col_key;
@@ -86,6 +84,7 @@ unsigned model_seed;
 // Shared data
 std::vector<Key> full_h_keys;
 std::vector<ValT> full_h;
+std::vector<ValT> local_w_shared {};
 
 inline Key row_key(size_t i) {
   return enforce_random_keys ? key_assignment[i] : i;
@@ -103,8 +102,8 @@ double calculate_loss(const int epoch, std::vector<Key>& local_w_keys,
 
   // key and vector for aggregation (in PS)
   std::vector<Key> loss_key { num_keys-1 };
-  std::vector<ValT> agg_vec (mf_rank);
-  assert(mf_rank >= 2); // need two elements to aggregate train and test loss
+  std::vector<ValT> agg_vec (param_len);
+  assert(param_len >= 3); // need two elements to aggregate train and test loss
 
 
   // reset aggregation
@@ -115,112 +114,89 @@ double calculate_loss(const int epoch, std::vector<Key>& local_w_keys,
     }
     kv.Wait(kv.Push(loss_key, agg_vec));
   }
+  kv.WaitSync();
   kv.Barrier();
 
   // wait for sync
-  kv.WaitReplicaSync();
+  kv.WaitSync();
 
   // in columnwise SGD, multiple threads hold the same part of w
   // we calculate l2 for this block only in the first of these threads
-  bool add_w_l2 = (algorithm == Alg::columnwise && customer_id != 1 ? false : true);
+  bool add_w_l2 = (algorithm == Alg::columnwise && customer_id != 0 ? false : true);
 
   // calculate local loss
   double local_train_loss = 0;
   double local_test_loss = 0;
+  double local_train_reg = 0;
   if (!prevent_full_model_pull) {
-    // pull local part of W and H (once per process)
     if (worker_id == 0) ADLOG("Pull model for loss calc");
-    std::vector<ValT> local_w (local_w_keys.size() * mf_rank);
-    int t_pullw = kv.Pull(local_w_keys, &local_w); // fetch local part of w
-    if (customer_id == 1) { // fetch full h once per process
-      full_h.resize(num_cols * mf_rank);
+
+    // pull local part of W
+    std::vector<ValT> local_w_worker {};
+    std::vector<ValT>* local_w;
+    if (algorithm != Alg::columnwise) {
+      // normally, each worker has its dedicated local part of w (i.e., no sharing possible)
+      local_w_worker.resize(local_w_keys.size() * param_len);
+      kv.Wait(kv.Pull(local_w_keys, &local_w_worker)); // fetch local part of w
+      local_w = &local_w_worker;
+    } else {
+      // in the columnwise alg, the workers of one process work on the same part
+      // of W, so we share W within a process to save memory and bandwidth
+      if (customer_id == 0) {
+        local_w_shared.resize(local_w_keys.size() * param_len);
+        kv.Wait(kv.Pull(local_w_keys, &local_w_shared));
+      }
+      kv.Barrier();
+      local_w = &local_w_shared;
+    }
+
+    // pull (full) H (once per process)
+    if (customer_id == 0) { // fetch full h once per process
+      full_h.resize(num_cols * param_len);
       kv.Wait(kv.Pull(full_h_keys, &full_h));
     }
-    kv.Wait(t_pullw);
     kv.Barrier();
 
     // calculate loss (with a copy of the model)
-    local_train_loss = loss_Nzsl_L2(train_data, local_w, full_h, lambda, mf_rank, worker_id, add_w_l2);
-    local_test_loss =  loss_Nzsl_L2(test_data,  local_w, full_h, 0.0,    mf_rank, worker_id, add_w_l2);
+    std::tie(local_train_loss, local_train_reg) = loss_Nzsl_L2(train_data, *local_w, full_h, lambda, worker_id, add_w_l2);
+    std::tie(local_test_loss, std::ignore)      = loss_Nzsl_L2(test_data,  *local_w, full_h, 0.0,    worker_id, add_w_l2);
   } else {
     // calculate loss (pulling necessary factors on demand)
     if (worker_id == 0) ADLOG("No full model pull for eval. Pull factors on demand.");
-    local_train_loss = loss_Nzsl_L2_pull(train_data, kv, local_w_keys, lambda, mf_rank, worker_id, add_w_l2);
-    local_test_loss =  loss_Nzsl_L2_pull(test_data,  kv, local_w_keys, 0.0,    mf_rank, worker_id, add_w_l2);
+    std::tie(local_train_loss, local_train_reg) = loss_Nzsl_L2_pull(train_data, kv, local_w_keys, lambda, worker_id, add_w_l2);
+    std::tie(local_test_loss, std::ignore)      = loss_Nzsl_L2_pull(test_data,  kv, local_w_keys, 0.0,    worker_id, add_w_l2);
   }
   // ADLOG("Local training loss (worker " << worker_id << "): " << local_train_loss);
   // ADLOG("Local test loss (worker " << worker_id << "): " << local_test_loss);
 
   // aggregate local losses to global loss (using the PS)
   agg_vec[0] = local_train_loss;
-  agg_vec[1] = local_test_loss;
+  agg_vec[1] = local_train_reg;
+  agg_vec[2] = local_test_loss;
   kv.Wait(kv.Push(loss_key, agg_vec));
   kv.Barrier();
   kv.Wait(kv.Pull(loss_key, &agg_vec));
 
-  auto train_loss = agg_vec[0] / train_data.total_nnz();
-  auto test_loss = agg_vec[1] / test_data.total_nnz();
+  auto train_loss = (agg_vec[0] + agg_vec[1]) / train_data.total_nnz();
+  auto test_loss = (agg_vec[2]) / test_data.total_nnz();
 
   if (worker_id == 0) {
-    ADLOG("(Ep." << epoch << ") Train loss: " << train_loss);
+    ADLOG("(Ep." << epoch << ") Train loss: " << train_loss << " (" << agg_vec[0] / train_data.total_nnz() << " + " << agg_vec[1] / train_data.total_nnz() << ")");
     ADLOG("(Ep." << epoch << ") Test loss:  " << test_loss);
   }
 
   return train_loss;
 }
 
-
-// determine which parameters to replicate:
-// we replicate the factors of the N most frequent columns
-std::vector<Key> determine_hotspot_keys (size_t N_hotspots) {
-  std::vector<Key> hotspot_keys {};
-  if (N_hotspots == 0) return hotspot_keys;
-
-  hotspot_keys.reserve(N_hotspots);
-
-  // stats
-  long freq_replicated = 0;
-  long freq_total = 0;
-
-  // read which relations have not been partitioned
-  ifstream colfreqs_ifs(dataset+"train.mmc.bin.colfreqs.csv", ios::in);
-  if (!colfreqs_ifs.fail()) {
-    long freq;
-    long j;
-    string line;
-
-    // read header line
-    getline(colfreqs_ifs, line);
-
-    while (getline(colfreqs_ifs, line)) {
-      stringstream ss(line);
-      ss >> freq >> j;
-      freq_total += freq;
-      if (hotspot_keys.size() < N_hotspots) {
-        hotspot_keys.push_back(col_key(j));
-        freq_replicated += freq;
-      }
-    }
-    colfreqs_ifs.close();
-  } else {
-    ADLOG("Did not find colfreqs file. Don't know which columns to replicate");
-    abort();
-  }
-  ADLOG("Replicate " << hotspot_keys.size() << " keys. This should cover " << std::setprecision(5) << 100.0*freq_replicated/freq_total << "% of column accesses (and " << 100.0*freq_replicated/(freq_total*2) << "% of all accesses)");
-  // ADLOG("Replicate columns " << hotspot_keys);
-  return hotspot_keys;
-}
-
 void RunWorker(int customer_id, ServerT* server=nullptr) {
-  Start(customer_id);
-  WorkerT kv(0, customer_id, *server);
+  WorkerT kv(customer_id, *server);
 
   boost::random::mt19937 rng(static_cast<unsigned int>(std::time(0)));
   std::unordered_map<std::string, util::Stopwatch> sw {};
   util::Trace trace {"./measurements/mf/mf_trace.csv"};
 
-  UpdateNsqlL2 update_fun {mf_rank, initial_step_size, lambda};
-  int worker_id = ps::MyRank()*num_threads+customer_id-1; // a unique id for this worker thread
+  UpdateNsqlL2Adagrad update_fun {mf_rank, param_len, initial_step_size, lambda};
+  int worker_id = ps::MyRank()*num_threads+customer_id; // a unique id for this worker thread
   Eigen::MatrixXi block_schedule = mf::initBlockSchedule(num_workers);
 
 
@@ -235,11 +211,11 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
   // allocate memory for factors in training loop
   std::vector<Key> factors_keys ( 2 );
-  std::vector<ValT> factors ( factors_keys.size() * mf_rank );
+  std::vector<ValT> factors ( factors_keys.size() * param_len );
   std::vector<ValT> factors_update ( factors.size() );
 
   // allocate memory for factors in loss computation (once per process)
-  if (customer_id == 1) {
+  if (customer_id == 0) {
     full_h_keys.resize(num_cols);
     for(size_t j=0; j!=full_h_keys.size(); ++j) {
       full_h_keys[j] = col_key(j);
@@ -253,7 +229,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     local_w_keys[z] = row_key(data.num_rows_per_block() * my_block + z);
   }
 
-  boost::random::uniform_real_distribution<> factor_generator(0,1);
+  boost::random::normal_distribution<> factor_generator (0, 1/sqrt(sqrt(mf_rank)));
 
   // push factors into the parameter servers
   kv.BeginSetup();
@@ -267,10 +243,13 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     } else if (init_parameters == 2) {
       // init model randomly
       ALOG("Init H randomly (seed " << model_seed << ")");
-      init_h.resize(num_cols * mf_rank);
+      init_h.resize(num_cols * param_len);
       boost::random::mt19937 rng_H (model_seed+133273);
-      for (size_t z=0; z!=init_h.size(); ++z) {
-        init_h[z] = factor_generator(rng_H);
+      for (long col=0; col!=num_cols ; ++col) {
+          for (long r=0; r!=mf_rank; ++r) {
+            init_h[col*param_len+r] = factor_generator(rng_H);
+          }
+          // leave 0's for AdaGrad values (pos mf_rank..param_len)
       }
     }
     kv.Wait(kv.StaggeredPush(full_h_keys, init_h));
@@ -353,6 +332,11 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
           }
         }
 
+        // initialize AdaGrad values with 0
+        for (size_t z=mf_rank; z!=param_len; ++z) {
+          partial_w.push_back(0);
+        }
+
         // push
         if (i % batch_size == batch_size-1) {
           tss.push_back(kv.Push(partial_w_keys, partial_w));
@@ -370,17 +354,29 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     sw["read_factors"].stop();
     ALOG("Initialized W (" << sw["read_factors"] << "): " << first << " " << second << " ..");
   }
-  kv.EndSetup(); // waits for replica sync and does barrier
+  kv.EndSetup(); // waits for sync and does barrier
 
-  // Localize local part of W (left matrix)
-  if (!disable_localize_left) {
-    kv.Wait(kv.Localize(local_w_keys));
+  // replicate all keys on all nodes throughout training
+  // (sensible only in ablation experiments)
+  if (enforce_full_replication && customer_id == 0) {
+  	std::vector<Key> keys (num_keys);
+    std::iota(keys.begin(), keys.end(), 0);
+    kv.Intent(keys, 0, CLOCK_MAX);
+  }
+  kv.WaitSync();
+  kv.Barrier();
+  kv.WaitSync();
+
+  // Signal intent for the parameters of the (statically partitioned) rows
+  if (signal_intent_rows) {
+    kv.Intent(local_w_keys, 0, CLOCK_MAX);
+    kv.WaitSync();
   }
 
   // prep for column-wise access
   std::vector<size_t> my_columns {};
   if (algorithm == Alg::columnwise) {
-    for (int j=0; j!=num_cols; ++j) {
+    for (long j=0; j!=num_cols; ++j) {
       if (data.block_has_nnz(j)) {
         my_columns.push_back(j);
       }
@@ -419,11 +415,11 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
         // get the block this workers works on in this epoch
         sw["comm"].resume();
         int h_block = block_schedule(subepoch, worker_id);
-        if (!disable_localize_blocks) {
+        if (signal_intent_cols != 0) {
           for (size_t z = 0; z!=local_h_keys.size(); ++z) {
             local_h_keys[z] = col_key(h_block * data.num_cols_per_block() + z);
           }
-          kv.Localize(local_h_keys);
+          kv.Intent(local_h_keys, kv.currentClock());
         }
         sw["comm"].stop();
 
@@ -455,6 +451,8 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
         sw["comp"].stop();
 
+        kv.advanceClock();
+
         // wait for all workers to finish the subepoch
         sw["barrier"].resume();
         kv.Barrier();
@@ -472,29 +470,28 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
       // iterate over the nonzeros that are partitioned to this worker
       sw["comp"].resume();
       long col_future=0;
-      long z_total=0;
-      long block_start_future=0;
+      long z_epoch=0;
+      long z_future=0;
       for (unsigned long col=0; col!=my_columns.size(); ++col) {
         auto j = my_columns[col];
 
         // permute data points of this column
         if (use_wor_point_schedule) data.permuteBlock(j);
 
-        for (unsigned long z=data.block_start(j); z!=data.block_end(j); ++z, ++z_total) {
-          const mf::DataPoint& dp = data.data()[data.permutation()[z]];
-
-          // Pre-localize column parameters
-          if (prelocalize_steps != 0 && z_total % prelocalize_groupsize == 0) {
-            vector<Key> localize;
-            localize.reserve(prelocalize_groupsize);
-            long localize_until = z_total + (prelocalize_steps+1)*prelocalize_groupsize; // +1 gets us to the block end
-            while (col_future < static_cast<long>(my_columns.size()) && block_start_future < localize_until) {
-              localize.push_back(col_key(my_columns[col_future]));
-              block_start_future += data.block_size(my_columns[col_future]);
-              ++col_future;
-            }
-            kv.Localize(localize);
+        // signal intent for column parameters
+        if (signal_intent_cols != 0) {
+          while (col_future < static_cast<long>(col + signal_intent_cols) &&
+                 col_future < static_cast<long>(my_columns.size())) {
+            Clock futureClock = kv.currentClock() + z_future - z_epoch;
+            auto col_datapoints = data.block_size(my_columns[col_future]);
+            kv.Intent(col_key(my_columns[col_future]), futureClock, futureClock+col_datapoints);
+            z_future += col_datapoints;
+            ++col_future;
           }
+        }
+
+        for (unsigned long z=data.block_start(j); z!=data.block_end(j); ++z, ++z_epoch) {
+          const mf::DataPoint& dp = data.data()[data.permutation()[z]];
 
           // get factors
           factors_keys[0] = row_key(dp.i);
@@ -508,6 +505,8 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
           // send factor updates
           auto ts = kv.Push(factors_keys, factors_update);
           if (sync_push) kv.Wait(ts);
+
+          kv.advanceClock();
 
           // early stopping (for debugging)
           if(early_stop != 0 && z == early_stop) {
@@ -547,16 +546,15 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
           break;
         }
 
-        // Pre-localize parameters
-        if (prelocalize_steps != 0 && z % prelocalize_groupsize == 0) {
-          vector<Key> localize;
-          localize.reserve(prelocalize_groupsize);
-          while (z_future < z+static_cast<int>((prelocalize_steps+1)*prelocalize_groupsize) && z_future < data.num_nnz()) {
-            const mf::DataPoint& dp_f = data.data()[data.permutation()[z_future]];
-            localize.push_back(col_key(dp_f.j));
+        // signal intent for column parameters
+        if (signal_intent_cols != 0) {
+          while (z_future < z + signal_intent_cols &&
+                 z_future < data.num_nnz()) {
+            Clock futureClock = kv.currentClock() + z_future - z;
+            const mf::DataPoint& dp_future = data.data()[data.permutation()[z_future]];
+            kv.Intent(col_key(dp_future.j), futureClock);
             ++z_future;
           }
-          kv.Localize(localize);
         }
 
         // get factors
@@ -571,6 +569,8 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
         // send factor updates
         auto ts = kv.Push(factors_keys, factors_update);
         if (sync_push) kv.Wait(ts);
+
+        kv.advanceClock();
       }
       sw["comp"].stop();
       sw["epoch.worker"].stop();
@@ -623,7 +623,6 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
   // make sure all workers finished
   LLOG("Worker " << worker_id << " done.");
   kv.Finalize();
-  Finalize(customer_id, false);
 }
 
 
@@ -633,8 +632,8 @@ int process_program_options(const int argc, const char *const argv[]) {
   desc.add_options()
     ("help,h", "produce help message")
     ("dataset,d", po::value<std::string>(&dataset), "Dataset to train from")
-    ("num_rows", po::value<int>(&num_rows), "number of rows in the dataset")
-    ("num_cols", po::value<int>(&num_cols), "number of columns in the dataset")
+    ("num_rows", po::value<long>(&num_rows), "number of rows in the dataset")
+    ("num_cols", po::value<long>(&num_cols), "number of columns in the dataset")
     ("rank,r", po::value<uint>(&mf_rank), "Rank of matrix factorization")
     ("epochs,e", po::value<int>(&epochs), "Number of epochs to run")
     ("lambda,l", po::value<double>(&lambda)->default_value(0.05), "Regularization parameter lambda")
@@ -642,13 +641,9 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("bold_driver", po::value<bool>(&bold_driver)->default_value(true), "Use bold driver for step size selection")
     ("increase_step_factor", po::value<double>(&increase_step_factor)->default_value(1.05), "Factor to increase step size after successful epoch")
     ("decrease_step_factor", po::value<double>(&decrease_step_factor)->default_value(0.5), "Factor to decrease step size after unsuccessful epoch")
-    ("shared_memory", po::value<bool>(&shared_memory)->default_value(true), "access local parameters via shared memory")
     ("algorithm", po::value<Alg>(&algorithm)->default_value(Alg::dsgd), "which algorithm to use. options: (1) dsgd = DSGD, (2) columnwise = access data points by column, (3) plain_sgd")
-    ("disable_localize_blocks", po::value<bool>(&disable_localize_blocks)->default_value(false), "disable localizes for H blocks (relevant only for DSGD)")
-    ("disable_localize_left", po::value<bool>(&disable_localize_left)->default_value(false), "disable localization of left matrix (default: off, i.e., do localize left)")
-    ("prelocalize_steps", po::value<size_t>(&prelocalize_steps)->default_value(0), "localize parameters N steps ahead of time")
-    ("prelocalize_groupsize", po::value<size_t>(&prelocalize_groupsize)->default_value(1000), "number of data points to pre-localize in one call")
-    ("replicate", po::value<size_t>(&replicate)->default_value(0), "number of keys to treat as hotspots (i.e., replicate)")
+    ("signal_intent_rows", po::value<bool>(&signal_intent_rows)->default_value(true), "whether to signal intent for row parameters (default: on, i.e., do localize row parameters)")
+    ("signal_intent_cols", po::value<size_t>(&signal_intent_cols)->default_value(1000), "whether to signal intent for column parameters (0: no signal, N>0 for dsgd: signal at block start, N>0 for colwise+plain: signal N data points ahead of time)")
     ("num_threads,t", po::value<int>(&num_threads)->default_value(1), "number of worker threads to run")
     ("wor_blocks", po::value<bool>(&use_wor_block_schedule)->default_value(true), "use WOR schedule for blocks")
     ("wor_points", po::value<bool>(&use_wor_point_schedule)->default_value(true), "use WOR schedule for data points")
@@ -657,6 +652,7 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("init_parameters", po::value<int>(&init_parameters)->default_value(2), "how to initialize parameters. 0: no init, 1: read factors from files, 2: draw random factors")
     ("model_seed", po::value<unsigned>(&model_seed)->default_value(134827), "seed for model generation")
     ("enforce_random_keys", po::value<bool>(&enforce_random_keys)->default_value(false), "enforce that keys are assigned randomly")
+    ("enforce_full_replication", po::value<bool>(&enforce_full_replication)->default_value(false), "manually enforce full model replication")
     ("early_stop", po::value<unsigned long>(&early_stop)->default_value(0), "stop an epoch early after N data points (for debugging)")
     ("max_runtime", po::value<long>(&max_runtime)->default_value(std::numeric_limits<long>::max()), "set a maximum run tim, after which the job will be terminated (in seconds)")
     ("prevent_full_model_pull", po::value<bool>(&prevent_full_model_pull)->default_value(false), "prevent a full model pull (slower, but makes it possible to run large models in memory constrained settings)")
@@ -681,22 +677,6 @@ int process_program_options(const int argc, const char *const argv[]) {
     return 1;
   }
 
-  if (algorithm == Alg::dsgd && prelocalize_steps > 0) {
-    cout << "Setting `prelocalize_steps` > 0 is invalid when using DSGD\n";
-    cout << desc << "\n";
-    return 1;
-  }
-  if (algorithm != Alg::dsgd && disable_localize_blocks) {
-    cout << "`disable_localize_blocks` = true has no effect when not using DSGD\n";
-    cout << desc << "\n";
-    return 1;
-  }
-  if (algorithm == Alg::dsgd && replicate > 0) {
-    cout << "Both DSGD and replication activated, which does not make sense\n";
-    cout << desc << "\n";
-    return 1;
-  }
-
   return 0;
 }
 
@@ -705,17 +685,21 @@ int main(int argc, char *argv[]) {
   int po_error = process_program_options(argc, argv);
   if(po_error) return 1;
   num_keys = num_cols + num_rows + 50000;
-  Postoffice::Get()->enable_dynamic_allocation(num_keys, num_threads);
-  Postoffice::Get()->set_shared_memory_access(shared_memory);
+
+  Setup(num_keys, num_threads);
 
   std::string role = std::string(getenv("DMLC_ROLE"));
-  std::cout << "mf. " << role << ": " << epochs << " epochs on " << dataset << "\n";
-  std::cout << "localization: disable blocks " << disable_localize_blocks << ". disable left " << disable_localize_left << "\n";
-  std::cout << "replicate " << replicate << "\n";
+  ALOG("mf. " << role << ": " << epochs << " epochs on " << dataset <<
+       "\nsignal intent rows " << signal_intent_rows <<
+       ", cols " << signal_intent_cols);
 
   // calculate H key offset
   num_workers = atoi(Environment::Get()->find("DMLC_NUM_SERVER")) * num_threads;
   first_col_key = round(ceil(1.0*num_rows/num_workers)) * num_workers;
+
+  // we store parameters and AdaGrad values in the same vector.
+  // 0..mf_rank: parameters; mf_rank..param_len: AdaGrad values
+  param_len = mf_rank * 2;
 
   // enforce random parameter allocation
   if (enforce_random_keys) {
@@ -725,18 +709,12 @@ int main(int argc, char *argv[]) {
     random_shuffle(key_assignment.begin(), key_assignment.end());
   }
 
-  // set up replication
-  vector<Key> hotspot_keys = determine_hotspot_keys(replicate);
-
   if (role.compare("scheduler") == 0) {
-    Start(0);
-    Finalize(0, true);
+    Scheduler();
   } else if (role.compare("server") == 0) { // worker+server
 
     // Start the server system
-    int server_customer_id = 0; // server gets customer_id=0, workers 1..n
-    Start(server_customer_id);
-    auto server = new ServerT(num_keys, mf_rank, &hotspot_keys);
+    auto server = new ServerT(param_len);
     RegisterExitCallback([server](){ delete server; });
 
     // make sure all servers are set up
@@ -745,7 +723,7 @@ int main(int argc, char *argv[]) {
     // run worker(s)
     std::vector<std::thread> workers {};
     for (int i=0; i!=num_threads; ++i) {
-      workers.push_back(std::thread(RunWorker, i+1, server));
+      workers.push_back(std::thread(RunWorker, i, server));
       std::string name = std::to_string(ps::MyRank())+"-worker-"+std::to_string(ps::MyRank()*num_threads + i);
       SET_THREAD_NAME((&workers[workers.size()-1]), name.c_str());
     }
@@ -756,6 +734,5 @@ int main(int argc, char *argv[]) {
 
     // stop the server
     server->shutdown();
-    Finalize(server_customer_id, true);
   }
 }

@@ -14,7 +14,9 @@ Customer::Customer(int app_id, int customer_id, const Customer::RecvHandle& recv
   Postoffice::Get()->AddCustomer(this);
   recv_thread_ = std::unique_ptr<std::thread>(new std::thread(&Customer::Receiving, this));
   std::string name = std::to_string(Postoffice::Get()->my_rank()) + "-customer-" + std::to_string(customer_id);
-  if (customer_id == 0) name = std::to_string(Postoffice::Get()->my_rank()) + "-ps";
+  if (Postoffice::Get()->is_ps(customer_id)) {
+    name = std::to_string(Postoffice::Get()->my_rank()) + "-ps-" + Postoffice::Get()->fchannel(customer_id, true);
+  }
   SET_THREAD_NAME(recv_thread_, name.c_str());
 }
 
@@ -73,8 +75,8 @@ void Customer::Receiving() {
     q_size += recv_queue_.WaitAndPop(&recv);
     if (!recv.meta.control.empty() &&
         recv.meta.control.cmd == Control::TERMINATE) {
-      if (customer_id_ == 0) {
-        ADLOG("Mean length of recv queue in ps-" << r << ": " << std::setprecision(5) << 1.0*q_size/iterations);
+      if (Postoffice::Get()->is_ps(customer_id_)) {
+        ADLOG("Mean length of recv queue in ps-" << r << "-" << Postoffice::Get()->fchannel(customer_id_, true) << ": " << std::setprecision(5) << 1.0*q_size/iterations);
       }
       break;
     }

@@ -57,13 +57,11 @@ void Postoffice::Start(int customer_id, const char* argv0, const bool do_barrier
         node_ids_[g].push_back(id);
       }
 
-      // when co-locating, we have worker threads within server processes
+      // for co-locating, we have worker threads within server processes
       // thus, to have a barrier over all worker threads,
       // we create a new kWorkerThreadGroup [sysChange]
-      if (coloc()) {
-        for(uint j=0; j!=num_worker_threads(); ++j) {
-          node_ids_[kWorkerThreadGroup].push_back(id);
-        }
+      for(uint j=0; j!=num_worker_threads(); ++j) {
+        node_ids_[kWorkerThreadGroup].push_back(id);
       }
     }
 
@@ -86,19 +84,19 @@ void Postoffice::Start(int customer_id, const char* argv0, const bool do_barrier
   }
   start_mu_.unlock();
   // do a barrier here (make sure all nodes are up)
-  if (!coloc() || customer_id == 0) { // if we co-locate workers and servers, only the server thread participates in the barrier [sysChange]
+  if (is_primary_ps(customer_id) || is_scheduler_) { // if we co-locate workers and servers, only the (primary) server thread participates in the barrier [sysChange]
     if (do_barrier) Barrier(customer_id, kWorkerGroup + kServerGroup + kScheduler);
   }
 }
 
 void Postoffice::Finalize(const int customer_id, const bool do_barrier) {
   if (do_barrier) Barrier(customer_id, kWorkerGroup + kServerGroup + kScheduler);
-  if (customer_id == 0) {
+  if (is_primary_ps(customer_id)) {
     num_workers_ = 0;
     num_servers_ = 0;
     van_->Stop();
     init_stage_ = 0;
-    customers_.clear();
+    customers_.resize(0);
     node_ids_.clear();
     barrier_done_.clear();
     server_key_ranges_.clear();
@@ -110,12 +108,11 @@ void Postoffice::Finalize(const int customer_id, const bool do_barrier) {
 
 void Postoffice::AddCustomer(Customer* customer) {
   std::lock_guard<std::mutex> lk(mu_);
-  int app_id = CHECK_NOTNULL(customer)->app_id();
   // check if the customer id has existed
   int customer_id = CHECK_NOTNULL(customer)->customer_id();
-  CHECK_EQ(customers_[app_id].count(customer_id), (size_t) 0) << "customer_id " \
+  CHECK_EQ(customers_[customer_id], nullptr) << "customer_id " \
     << customer_id << " already exists\n";
-  customers_[app_id].insert(std::make_pair(customer_id, customer));
+  customers_[customer_id] = customer;
   std::unique_lock<std::mutex> ulk(barrier_mu_);
   for(int node_group=0; node_group!=8; ++node_group) {
     barrier_done_[node_group].insert(std::make_pair(customer_id, false));
@@ -125,30 +122,28 @@ void Postoffice::AddCustomer(Customer* customer) {
 
 void Postoffice::RemoveCustomer(Customer* customer) {
   std::lock_guard<std::mutex> lk(mu_);
-  int app_id = CHECK_NOTNULL(customer)->app_id();
   int customer_id = CHECK_NOTNULL(customer)->customer_id();
-  customers_[app_id].erase(customer_id);
-  if (customers_[app_id].empty()) {
-    customers_.erase(app_id);
-  }
+  customers_[customer_id] = nullptr;
 }
 
 
 Customer* Postoffice::GetCustomer(int app_id, int customer_id, int timeout) const {
-  Customer* obj = nullptr;
-  for (int i = 0; i < timeout * 1000 + 1; ++i) {
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      const auto it = customers_.find(app_id);
-      if (it != customers_.end()) {
-        std::unordered_map<int, Customer*> customers_in_app = it->second;
-        obj = customers_in_app[customer_id];
-        break;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  // fast (normal) mode
+  if (customers_[customer_id] != nullptr) {
+    return customers_[customer_id];
   }
-  return obj;
+
+
+  // in rare cases, the customer might not be set up yet. wait for that
+  for (int i = 0; i < timeout * 1000 + 1; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (customers_[customer_id] != nullptr) {
+      return customers_[customer_id];
+    }
+  }
+
+  ALOG("Failed to find customer " << customer_id << " within timeout " << timeout);
+  return nullptr;
 }
 
 void Postoffice::Barrier(int customer_id, int node_group) {
@@ -183,8 +178,8 @@ const std::vector<Range>& Postoffice::GetServerKeyRanges() {
   if (server_key_ranges_.empty()) {
     for (int i = 0; i < num_servers_; ++i) {
       server_key_ranges_.push_back(Range(
-          std::ceil(1.0 * kMaxKey / num_servers_) * i,    // [sysChange] guarantee that ranges include kMaxKey
-          std::ceil(1.0 * kMaxKey / num_servers_) * (i+1)));
+          std::ceil(1.0 * num_keys_ / num_servers_) * i,    // [sysChange] guarantee that ranges include max. key
+          std::ceil(1.0 * num_keys_ / num_servers_) * (i+1)));
     }
   }
   server_key_ranges_mu_.unlock();

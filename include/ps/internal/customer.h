@@ -15,6 +15,9 @@
 #include "ps/internal/threadsafe_queue.h"
 namespace ps {
 
+// option to send a request without timestamp
+const int WITHOUT_TS = -10;
+
 /**
  * \brief The object for communication.
  *

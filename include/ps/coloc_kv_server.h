@@ -8,6 +8,7 @@
 #include <vector>
 #include <valarray>
 #include <unordered_map>
+#include <unordered_set>
 #include <boost/functional/hash.hpp>
 #include <algorithm>
 #include <atomic>
@@ -15,7 +16,7 @@
 #include "ps/coloc_kv_worker.h"
 #include "ps/addressbook.h"
 #include <limits>
-#include "ps/replica_manager.h"
+#include "ps/sync_manager.h"
 #include "ps/sampling.h"
 
 #include <iostream>
@@ -23,118 +24,24 @@
 
 namespace ps {
 
-#ifdef PS_RELOC_STATS
-  long STATS_total_transfer_time_sum = 0;
-  long STATS_total_transfers = 0;
-  long STATS_total_transfer_time_max = 0;
-  long STATS_total_transfer_time_min = std::numeric_limits<long>::max();
-  std::atomic<long> STATS_num_localizes (0);
-  std::atomic<long> STATS_num_localizes_local (0);
-  std::atomic<long> STATS_num_localizes_queue (0);
-#endif
-
-  /**
-   * \brief The information necessary to notify a waiting worker thread
-   */
-  struct WaitingThread {
-    WaitingThread() {
-      CHECK(false) << "Default constructor of WaitingThread should not be called";
-    }
-  WaitingThread(Customer* c, int timestamp): customer{c}, ts{timestamp} {}
-    Customer* customer;
-    int ts;
-  };
-
-  /**
-   * \brief A message that is queued until one or more keys that will be local soon
-   *        at this server will be local
-   */
-  template<typename Val>
-  struct QueuedMessage {
-    KVPairs<Val> kvs;
-    KVMeta meta;
-    bool sendOnDelete = false;
-  };
-
-  /**
-   * \brief Queue of requests for a key while this key is being localized to this server
-   */
-  // TODO: move this to transfers class
-  template <typename Val>
-    struct Transfer {
-      bool _ongoing = false;
-      std::vector<std::pair<OpType,Val*>> ops; // queued pull and push operations: <0=pull/1=push/2=set, pointer_to_val_location>
-      std::vector<std::shared_ptr<KVPairs<Val>>> push_data_ptrs; // to ensure that push data is still around when transfer is finished
-    std::vector<std::vector<Val>> pushs; // holds copies of to-push values (when they are necessary)
-      std::vector<WaitingThread> threads; // waiting local worker threads
-      std::vector<std::shared_ptr<QueuedMessage<Val>>> messages; // waiting messages for remote worker threads
-      bool subsequentLocalize = false; // did we receive a subsequent localize? (if yes, we forward the key directly when we receive it)
-      std::shared_ptr<QueuedMessage<Val>> subsequentLocalizeMsg; // did we receive a subsequent localize? (if yes, we forward the key directly when we receive it)
-#ifdef PS_RELOC_STATS
-      util::Stopwatch total_transfer_time;
-#endif
-
-      Transfer() {}
-
-      Transfer(Transfer&& q) { // move constructor
-        ops.swap(q.ops);
-        pushs.swap(q.pushs);
-        push_data_ptrs.swap(q.push_data_ptrs);
-        threads.swap(q.threads);
-        messages.swap(q.messages);
-        std::swap(subsequentLocalize, q.subsequentLocalize);
-        std::swap(subsequentLocalizeMsg, q.subsequentLocalizeMsg);
-        std::swap(_ongoing, q._ongoing);
-#ifdef PS_RELOC_STATS
-        std::swap(total_transfer_time, q.total_transfer_time);
-#endif
-      }
-
-      // Copy constructor
-      Transfer(const Transfer& q) {
-        CHECK(false) << "Copy constructor for transfer should not be called";
-      }
-
-      // note a thread as waiting. When the transfer finishes, the thread will receive a wake signal
-      void addThread (Customer* customer, int ts) {
-        CHECK(_ongoing) << "Add thread to queue, but transfer is not ongoing";
-        threads.push_back(WaitingThread(customer, ts));
-      }
-
-      // start a transfer
-      void start() {
-        _ongoing = true;
-#ifdef PS_RELOC_STATS
-        total_transfer_time.start();
-#endif
-      }
-
-      // stop a transfer, i.e., reset the transfer object
-      void reset() {
-        CHECK(_ongoing) << "Resetting transfer that is not ongoing";
-        _ongoing = false;
-        ops.resize(0);
-        pushs.resize(0);
-        push_data_ptrs.resize(0);
-        threads.resize(0);
-        messages.resize(0);
-        subsequentLocalize = false;
-        subsequentLocalizeMsg.reset();
-
-        // statistics
-#ifdef PS_RELOC_STATS
-        total_transfer_time.stop();
-        STATS_total_transfer_time_sum += total_transfer_time.elapsed_ns();
-        ++STATS_total_transfers;
-        STATS_total_transfer_time_max = max(total_transfer_time.elapsed_ns(), STATS_total_transfer_time_max);
-        STATS_total_transfer_time_min = min(total_transfer_time.elapsed_ns(), STATS_total_transfer_time_min);
-#endif
-      }
-
-    public:
-      inline bool ongoing() { return _ongoing; }
-    };
-
+// read management technique from stream
+std::istream& operator>>(std::istream& in, MgmtTechniques& t) {
+  std::string token; in >> token;
+  if (token == "all") t = MgmtTechniques::ALL;
+  else if (token == "replication_only") t = MgmtTechniques::REPLICATION_ONLY;
+  else if (token == "relocation_only") t = MgmtTechniques::RELOCATION_ONLY;
+  else { CHECK(false) << "Fatal! Unknown management technique selection " << token; }
+  return in;
+}
+// write management technique to stream
+std::ostream& operator<<(std::ostream &o, const MgmtTechniques& t) {
+  switch(t) {
+  case MgmtTechniques::ALL: return o << "all";
+  case MgmtTechniques::REPLICATION_ONLY: return o << "replication_only";
+  case MgmtTechniques::RELOCATION_ONLY: return o << "relocation_only";
+  default: return o << "unkown";
+  }
+}
 
   /**
    * \brief A server node for maintaining key-value pairs
@@ -142,30 +49,52 @@ namespace ps {
   template <typename Val, typename Handle>
     class ColoKVServer : public KVServer<Val> {
     friend ColoKVWorker<Val, Handle>;
+    friend SyncManager<Val, Handle>;
+    template<typename V, typename W, typename S>
+    friend class LocalSampling;
   public:
 
     /**
-     * Construct a server with uniform value lengths
+     * Construct a Lapse server with uniform value lengths
      */
 
-    explicit ColoKVServer(size_t num_keys, size_t uniform_len, std::vector<Key>* keys_to_replicate=nullptr) :
-      ColoKVServer(num_keys, std::vector<size_t> {uniform_len}, keys_to_replicate) {}
+    explicit ColoKVServer(size_t uniform_len) :
+      ColoKVServer(std::vector<size_t> {uniform_len}) {}
 
     /**
-     * \brief Construct a server
-     *        The system will replicate all keys that are contained in `keys_to_replicate`.
-     *        Replication will be disabled entirely (i.e., no replica mgr thread) if
-     *        `keys_to_replicate` is a nullptr or contains 0 keys.
+     * \brief Construct a Lapse server
      */
-    explicit ColoKVServer(size_t num_keys, std::vector<size_t> value_lengths, std::vector<Key>* keys_to_replicate=nullptr) :
-      KVServer<Val>(0), request_handle_(num_keys, value_lengths), my_rank{Postoffice::Get()->my_rank()},
-      replica_manager_{request_handle_, keys_to_replicate} {
+    explicit ColoKVServer(std::vector<size_t> value_lengths) :
+      postoffice_setup {Postoffice::Get()->ps_customer_id(0), Postoffice::Get()->num_channels()}, // first of all, set up node connections
+      request_handle_(value_lengths),
+      addressbook{request_handle_},
+      my_rank{Postoffice::Get()->my_rank()},
+      sync_managers_(Postoffice::Get()->num_channels()),
+      workers(Postoffice::Get()->num_worker_threads(), nullptr),
+      final_worker_clocks(Postoffice::Get()->num_worker_threads(), 0) {
 
-      // start the replica manager thread
-      if (keys_to_replicate != nullptr && keys_to_replicate->size() != 0) {
-        replica_manager_thread_  = std::thread (&ReplicaManager<Val,Handle>::thread, &replica_manager_);
-        SET_THREAD_NAME((&replica_manager_thread_), "replica-manager");
+      // initial parameter allocation
+      for(Key key=0; key!=Postoffice::Get()->num_keys(); ++key) {
+        if (addressbook.isManagedHere(key)) {
+          request_handle_.insertKey(key, 0, true);
+        }
       }
+
+      // start the PS thread(s)
+      using namespace std::placeholders;
+      for (unsigned int c=0; c!=Postoffice::Get()->num_channels(); ++c) {
+        this->customers_.push_back(new Customer(0, Postoffice::Get()->ps_customer_id(c),
+                                                std::bind(&ColoKVServer<Val, Handle>::Process, this, c, _1)));
+      }
+
+      // start the sync manager thread(s)
+      for (unsigned int i=0; i!=Postoffice::Get()->num_channels(); ++i) {
+        sync_managers_[i].init(i, &request_handle_, this);
+        sync_manager_threads_.push_back(std::thread (&SyncManager<Val,Handle>::thread, &sync_managers_[i]));
+        std::string name = std::to_string(my_rank)+"-sm-"+Postoffice::Get()->fchannel(i);
+        SET_THREAD_NAME((&sync_manager_threads_.back()), name.c_str());
+      }
+
       lifetime.start();
     }
 
@@ -175,28 +104,26 @@ namespace ps {
     /**
     * \brief Retrieve the number of values per parameter key
     */
-    size_t GetLen(const Key key) const {
+    inline size_t GetLen(const Key key) const {
       return request_handle_.get_len(key);
-    }
-
-    size_t GetNumKeys() const {
-      return request_handle_.get_num_keys();
     }
 
     /**
      * \brief Forward a pull/push request to another parameter server
      */
-    void Forward(int destination, const KVMeta& req, const KVPairs<Val>& fw);
+    void Forward(int destination, const Meta& req, const KVPairs<Val>& fw);
 
     /**
      * \brief Shut down server (mostly writing statistics)
      */
     void shutdown() {
       lifetime.stop();
-      // stop the replica manager thread
-      if (replica_manager_thread_.joinable()) {
-        replica_manager_.stop();
-        replica_manager_thread_.join();
+      // stop the sync manager thread(s)
+      for (auto& rm : sync_managers_) {
+        rm.stop();
+      }
+      for (auto& rmt : sync_manager_threads_) {
+        rmt.join();
       }
 
       // terminate any sampling support activities
@@ -204,35 +131,29 @@ namespace ps {
         sampling_->terminate();
       }
 
+      // let the request handle print its own stats
+      request_handle_.stats();
+
       // output per-server locality statistics
       ALOG(//pulls
             "server " << my_rank << ": " << num_pull_params << " parameters pulled, " <<
             100.0 * num_pull_params_local / num_pull_params << "% local (~" <<
-            100.0 * request_handle_.get_num_pulls_to_replicas() / num_pull_params << "% to replicas), " <<
-            100.0 * num_pull_params_in_transfer / num_pull_params << "% in transfer (" <<
+            100.0 * request_handle_.get_num_pulls_to_replicas() / num_pull_params << "% to replicas) (" <<
             num_pull_ops << " ops, " << 100.0 * num_pull_ops_local / num_pull_ops << "% local)\n" <<
             // pushs
             "server " << my_rank << ": " << num_push_params << " parameters pushed, " <<
             100.0 * num_push_params_local / num_push_params << "% local (~" <<
-            100.0 * request_handle_.get_num_pushs_to_replicas() / num_push_params << "% to replicas), " <<
-            100.0 * num_push_params_in_transfer / num_push_params << "% in transfer (" <<
+            100.0 * request_handle_.get_num_pushs_to_replicas() / num_push_params << "% to replicas) (" <<
             num_push_ops << " ops, " << 100.0 * num_push_ops_local / num_push_ops << "% local)"
             );
 
-      // output relocation statistics
-#ifdef PS_RELOC_STATS
-      if (STATS_total_transfers == 0) STATS_total_transfers = -1; // prevent division by 0
-      auto alive = lifetime.elapsed_s();
-      ADLOG("Relocations at s" << my_rank << ": " << STATS_total_transfers << " (" << STATS_num_localizes_local <<
-            " already local, " << STATS_num_localizes_queue <<  " already running, " << STATS_num_localizes <<
-            " localizes). Total transfer time: " << STATS_total_transfer_time_sum << " ns. " <<
-            STATS_total_transfer_time_sum/STATS_total_transfers << " ns per transfer (" <<
-            STATS_total_transfer_time_min << " min / " << STATS_total_transfer_time_max << " max). " <<
-            STATS_total_transfers/alive << "r/s in " << alive << "s");
-#endif
-
       // write handle access statistics
       request_handle_.writeStats();
+
+      // drop node connections and tear down the server object
+      for (unsigned int c=0; c!=Postoffice::Get()->num_channels(); ++c) {
+        Postoffice::Get()->Finalize(Postoffice::Get()->ps_customer_id(c), c==0);
+      }
     }
 
     /**
@@ -245,22 +166,22 @@ namespace ps {
      *
      */
     void enable_sampling_support(Key (*const sample_key)(), const Key min_key=0, const Key max_key=0) {
-      auto& sst = SamplingSupport<Val, ColoKVWorker<Val,Handle>>::sampling_strategy;
+      auto& sst = Sampling<Val, ColoKVWorker<Val,Handle>, ColoKVServer<Val, Handle>>::scheme;
       switch (sst) {
-      case SamplingSupportType::Naive:
-        sampling_ = new NaiveSamplingSupport<Val, ColoKVWorker<Val, Handle>>(sample_key);
+      case SamplingScheme::Naive:
+        sampling_ = new NaiveSampling<Val, ColoKVWorker<Val, Handle>, ColoKVServer<Val, Handle>>(sample_key, this);
         break;
-      case SamplingSupportType::Preloc:
-        sampling_ = new PrelocSamplingSupport<Val, ColoKVWorker<Val, Handle>>(sample_key);
+      case SamplingScheme::Preloc:
+        sampling_ = new PrelocSampling<Val, ColoKVWorker<Val, Handle>, ColoKVServer<Val, Handle>>(sample_key, this);
         break;
-      case SamplingSupportType::Pool:
-        sampling_ = new PoolSamplingSupport<Val, ColoKVWorker<Val, Handle>, ColoKVServer<Val, Handle>>(sample_key, this);
+      case SamplingScheme::Pool:
+        sampling_ = new PoolSampling<Val, ColoKVWorker<Val, Handle>, ColoKVServer<Val, Handle>>(sample_key, this);
         break;
-      case SamplingSupportType::OnlyLocal:
-        sampling_ = new OnlyLocalSamplingSupport<Val, ColoKVWorker<Val, Handle>>(sample_key, min_key, max_key);
+      case SamplingScheme::Local:
+        sampling_ = new LocalSampling<Val, ColoKVWorker<Val, Handle>, ColoKVServer<Val, Handle>>(sample_key, this, min_key, max_key);
         break;
       default:
-        ALOG("Unkown sampling support type '" << sst << "'. Aborting.");
+        ALOG("Unkown sampling scheme '" << sst << "'. Aborting.");
         abort();
         break;
       }
@@ -271,29 +192,114 @@ namespace ps {
       Postoffice::Get()->Barrier(0, kServerGroup) ;
     }
 
-    // system options
-    static unsigned int keepAroundUnused; // if >0: max. microseconds to keep around the value of an unused parameter
-
     // add system options to an application
     static void AddSystemOptions(boost::program_options::options_description& options) {
       namespace po = boost::program_options;
       options.add_options()
-        ("sys.keep_unused", po::value<unsigned int>(&keepAroundUnused)->default_value(0), "system option: keep around unused parameters (0: disabled, >0: max time to keep around (in microseconds)")
-        ("sys.nw_threads", po::value<int>(&Postoffice::Get()->num_network_threads_)->default_value(3), "number of network threads")
-        ("sys.sender_thread", po::value<int>(&Postoffice::Get()->use_sender_thread_)->default_value(1), "whether and for which messages to use a separate thread in the van to send messages. 0: don't use a separate thread, 1: use the sender thread for server messages, 2: use the sender thread for server and worker messages")
+        ("sys.zmq_threads", po::value<int>(&Postoffice::Get()->num_network_threads_)->default_value(3), "number of ZMQ threads")
+        ("sys.techniques", po::value<MgmtTechniques>(&Postoffice::Get()->management_techniques_)->default_value(MgmtTechniques::ALL), "Which management techniques to use. Options: 'all' (combine relocation and replication), 'replication_only', 'relocation_only'")
+        ("sys.time_intent_actions", po::value<bool>(&Postoffice::Get()->time_intent_actions_)->default_value(true), "Whether to time intent actions. If disabled, the system acts on intent with the next sync. Otherwise, the system will include intent in syncs only when it thinks it is appropriate.")
+        ("sys.location_caches", po::value<bool>(&Postoffice::Get()->location_caches_)->default_value(true), "whether or not to use location caches")
+        ("sys.channels", po::value<int>(&Postoffice::Get()->num_channels_)->default_value(4), "the number of communication channels (per process, we start one PS thread and one replica manager thread per channel). The number of channels should be a power of 2.")
+        ("sys.trace.keys", po::value<std::string>(&Postoffice::Get()->traced_keys_list_)->default_value(""), "Comma-separated list of keys that should be traced. Relocation, replication, and intent will be traced for these keys. Syntax example: '12,3421,37892'. Also possible: 'all' to trace all keys and 'random-10-seed-7-range-0-100' to trace a random sample (seed 7) of 10 keys in the range [0, 100). To enable tracing, compile with flag 'PS_TRACE_KEYS=1'")
+        ("sys.stats.out", po::value<std::string>(&Postoffice::Get()->stats_output_folder_)->default_value(""), "Where to write statistics (e.g., key traces or locality statistics)")
         ;
 
       // replication options
-      ReplicaManager<Val,Handle>::AddReplicationOptions(options);
+      SyncManager<Val,Handle>::AddSyncOptions(options);
 
       // sampling options
-      SamplingSupport<Val,ColoKVWorker<Val, Handle>>::AddSamplingOptions(options);
+      Sampling<Val,ColoKVWorker<Val, Handle>, ColoKVServer<Val, Handle>>::AddSamplingOptions(options);
+    }
+
+    // store a pointer to each worker (so that the server can access them if needed)
+    void registerWorker(int customer_id, ColoKVWorker<Val, Handle>* worker) {
+      workers[customer_id] = worker;
+      ++workers_num_registered;
+    }
+
+    // note that a worker has exited
+    void deregisterWorker(int customer_id) {
+      final_worker_clocks[customer_id] = workers[customer_id]->currentClock(); // store the final clock of the worker
+      workers[customer_id] = nullptr;
+    }
+
+    // wait until all workers have been started
+    void ensureAllWorkersAreRegistered() {
+      while (workers_num_registered < Postoffice::Get()->num_worker_threads()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+    }
+
+    // obtain a pointer to the worker with `customer_id`
+    ColoKVWorker<Val, Handle>* getWorker(const int customer_id) {
+      return workers[customer_id];
+    }
+
+    // obtain the current clocks of all local workers
+    std::vector<Clock> getWorkerClocks() {
+      ensureAllWorkersAreRegistered();
+
+      std::vector<Clock> clocks (Postoffice::Get()->num_worker_threads(), 0);
+      for (size_t w=0; w!=Postoffice::Get()->num_worker_threads(); ++w) {
+        if (workers[w] != nullptr) {
+          clocks[w] = workers[w]->currentClock();
+        } else {
+          // worker has exited already
+          clocks[w] = WORKER_FINISHED;
+        }
+      }
+      return clocks;
+    }
+
+    // obtain the total number of clock ticks by local workers
+    Clock getTotalTicks() {
+      Clock total_ticks = 0;
+      for (size_t w=0; w!=Postoffice::Get()->num_worker_threads(); ++w) {
+        if (workers[w] != nullptr) {
+          total_ticks += workers[w]->currentClock();
+        } else {
+          total_ticks += final_worker_clocks[w];
+        }
+      }
+      return total_ticks;
+    }
+
+    // pushes an update into the local store if possible; returns directions otherwise
+    inline int localPushOrDirections(const Key key, const Val* val, const bool set) {
+      request_handle_.lockSingle(key);
+
+      auto direction = request_handle_.attemptLocalPushUnsafe(key, val, set, true) ?
+        LOCAL :
+        addressbook.getDirectionsUnsafe(key, true); // use location cache
+
+      request_handle_.unlockSingle(key);
+      return direction;
+    }
+
+    // pulls a parameter value from the local store if possible; returns directions otherwise
+    inline int localPullOrDirections(const Key key, Val* val) {
+      request_handle_.lockSingle(key);
+
+      auto direction = request_handle_.attemptLocalPullUnsafe(key, val, true) ?
+        LOCAL :
+        addressbook.getDirectionsUnsafe(key, true); // use location cache
+
+      request_handle_.unlockSingle(key);
+      return direction;
+    }
+
+    // output selected management techniques as string
+    std::string management_techniques_str() {
+      std::stringstream ss;
+      ss << Postoffice::Get()->management_techniques();
+      return ss.str();
     }
 
   private:
 
     // Send out forward messages (to other servers)
-    void sendForwards(std::vector<KVPairs<Val>>& forwards, KVMeta& meta) {
+    void sendForwards(std::vector<KVPairs<Val>>& forwards, const Meta& meta) {
 
       for (unsigned int i=0; i!=forwards.size(); ++i) {
         if (!forwards[i].keys.empty()) {
@@ -307,85 +313,53 @@ namespace ps {
       }
     }
 
+    PostofficeSetup postoffice_setup; // helper object to set up postoffice before anything else happens
     Handle request_handle_; // hides the request_handle_ of KVServer
-    bool Process(const Message& msg); // we re-define Process to use the correct request_handle_
-    void ProcessPushPullRequest(std::shared_ptr<KVPairs<Val>>& data, KVPairs<Val>& res,
-                                std::shared_ptr<QueuedMessage<Val>>& queued_msg);
-    void ProcessLocalizeRequest(KVPairs<Val>& data, KVPairs<Val>& res,
-                           std::shared_ptr<QueuedMessage<Val>>& queued_msg);
-    void ProcessLocalizeResponse(const Message& msg);
-    Addressbook addressbook {};
+    bool Process(const unsigned int channel, const Message& msg); // we re-define Process to use the correct request_handle_
+    void ProcessPushPullRequest(const Message& msg);
+    Addressbook<Handle> addressbook;
     int my_rank; // the rank of this server
 
+    // customers for PS threads (replaces `KVServer::obj_`)
+    std::vector<Customer*> customers_;
+
     // replica management
-    ReplicaManager<Val,Handle> replica_manager_;
-    std::thread         replica_manager_thread_;
+    std::vector<SyncManager<Val,Handle>> sync_managers_;
+    std::vector<std::thread>   sync_manager_threads_;
 
     // sampling management
-    SamplingSupport<Val, ColoKVWorker<Val, Handle>>* sampling_=nullptr;
+    Sampling<Val, ColoKVWorker<Val, Handle>, ColoKVServer<Val, Handle>>* sampling_=nullptr;
+
+    // maintain a connection to the worker objects
+    std::vector<ColoKVWorker<Val, Handle>*> workers;
+    std::atomic<size_t> workers_num_registered { 0 };
+
+    // store the last clocks of workers (so that we know this clock after the worker has deregistered)
+    std::vector<Clock> final_worker_clocks;
 
     util::Stopwatch lifetime; // lifetime of this server
 
     long num_pull_ops=0, num_pull_ops_local=0, num_push_ops=0, num_push_ops_local=0;
     long num_pull_params=0, num_pull_params_local=0, num_push_params=0, num_push_params_local=0;
-    long num_pull_params_in_transfer=0, num_push_params_in_transfer=0;
     long num_pull_params_rep=0, num_push_params_rep=0;
   };
-
-  // define (static) program options
-  template <typename Val, typename Handle> unsigned int ColoKVServer<Val,Handle>::keepAroundUnused;
 
 
   /**
    * \brief Process a request to a parameter server
    */
   template <typename Val, typename Handle>
-    bool ColoKVServer<Val, Handle>::Process(const Message& msg) {
+  bool ColoKVServer<Val, Handle>::Process(const unsigned int channel, const Message& msg) {
+    assert(msg.meta.channel != Meta::kEmpty); // every PS-processed message should have channel information
+    assert(static_cast<int>(channel) == msg.meta.channel); // make sure the message has been routed to the correct channel
 
-    if (msg.meta.request) { // process requests (push, pull, and localize)
-
-      // create a shared pointer to a (potentially delayed) response
-      std::shared_ptr<QueuedMessage<Val>> queued_msg(new QueuedMessage<Val>(), [this] (QueuedMessage<Val>* qm) {
-          // we send the message when all "local soon" keys have been answered
-          if(qm->sendOnDelete) {
-            this->Response(qm->meta, qm->kvs);
-          }
-          delete qm;
-        });
-
-      // prepare response header
-      KVMeta& meta = queued_msg.get()->meta;
-      meta.cmd       = msg.meta.head;
-      meta.push      = msg.meta.push;
-      meta.set       = msg.meta.set;
-      meta.sender    = msg.meta.sender;
-      meta.timestamp = msg.meta.timestamp;
-      meta.customer_id = msg.meta.customer_id;
-
-      // parse request key/value data
-      std::shared_ptr<KVPairs<Val>> data_ptr (new KVPairs<Val>());
-      data_ptr->keys = msg.data[0];
-      if (msg.data.size() >= 2) data_ptr->vals = msg.data[1];
-      KVPairs<Val>& data = *data_ptr;
-
-      // prepare response key/value data
-      KVPairs<Val>& res = queued_msg.get()->kvs;
-      if (!meta.push) {
-        // don't know exactly how many keys will be answered locally
-        // overallocate (largest possible case: all keys are local)
-        res.vals.resize(request_handle_.get_total_len(data.keys), 0, false);
-      }
-
-      // process requests
-      if (isLocalize(meta.cmd)) {
-        ProcessLocalizeRequest(data, res, queued_msg);
-      } else {
-        ProcessPushPullRequest(data_ptr, res, queued_msg);
-      }
-    } else if(isLocalize(msg.meta.head)) { // process responses to localizes
-      // note: push/pull responses are handled in the worker threads (i.e., not here)
-      ProcessLocalizeResponse(msg);
-    } else {
+    if (msg.meta.head == Control::SYNC) {
+      sync_managers_[msg.meta.channel].ProcessSyncMessage(msg, false);
+    } else if (msg.meta.head == Control::SYNC_FORWARD) {
+      sync_managers_[msg.meta.channel].ProcessSyncMessage(msg, true);
+    } else if (msg.meta.request) { // process a push or a pull requests
+      ProcessPushPullRequest(msg);
+    }  else {
       LL << "FATAL: unknown type of message in server thread";
     }
     return false;
@@ -395,43 +369,49 @@ namespace ps {
    * \brief Process a regular (i.e., push/pull) request to a parameter server
    */
   template <typename Val, typename Handle>
-    void ColoKVServer<Val, Handle>::ProcessPushPullRequest(std::shared_ptr<KVPairs<Val>>& data_ptr, KVPairs<Val>& res,
-                                                           std::shared_ptr<QueuedMessage<Val>>& queued_msg) {
+    void ColoKVServer<Val, Handle>::ProcessPushPullRequest(const Message& msg) {
+    // parse request key/value data
+    KVPairs<Val> data;
+    data.keys = msg.data[0];
+    if (msg.meta.push) {
+      data.vals = msg.data[1];
+    }
+
+    // prepare response key/value data
+    KVPairs<Val> res;
+    if (!msg.meta.push) {
+      // don't know exactly how many keys will be answered locally
+      // overallocate (largest possible case: all keys are local)
+      res.vals.resize(request_handle_.get_total_len(data.keys), 0, false);
+    }
+
 
     // prepare a couple of forward messages to other servers
     std::vector<KVPairs<Val>> forwards(Postoffice::Get()->num_servers());
 
-    KVMeta& meta = queued_msg.get()->meta;
-
-    KVPairs<Val>& data = *data_ptr;
-
     uint numLocal = 0;
-    uint numLocalSoon = 0;
     size_t len = 0, data_pos = 0, res_pos = 0;
     // for each key, attempt a local pull(/push). forward the keys that are not local
 
     for (size_t i = 0; i < data.keys.size(); ++i) {
       Key key = data.keys[i];
       len = request_handle_.get_len(key);
-      ps::Status status;
-      if (meta.push) // push request
-        status = request_handle_.processPush(key, data.vals.begin()+data_pos, -1, 0, meta.set, false, queued_msg, data_ptr);
+      bool local;
+      if (msg.meta.push) // push request
+        local = request_handle_.attemptLocalPush(key, data.vals.begin()+data_pos, msg.meta.set, false);
       else // pull request
-        status = request_handle_.processPull(key, res.vals.data() + res_pos, -1, 0, false, queued_msg);
+        local = request_handle_.attemptLocalPull(key, res.vals.data()+res_pos, false);
 
-      if (status == ps::Status::LOCAL) {
-        if (!meta.push) { // add key to reply for pull requests
+      if (local) {
+        if (!msg.meta.push) { // add key to reply for pull requests
           res.keys.push_back(key);
           res_pos += len;
         }
         ++numLocal;
-      } else if (status == ps::Status::IN_TRANSFER) {
-        res_pos += len;
-        ++numLocalSoon;
       } else {
-        auto destination = addressbook.getDirections(key); // either the manager or the owner (no caches)
+        auto destination = addressbook.getDirections(key, false); // don't use location cache for forwards
         forwards[destination].keys.push_back(key);
-        if (meta.push) { // forward the "to push" values to the responsible server
+        if (msg.meta.push) { // forward the "to push" values to the responsible server
           std::copy_n(data.vals.begin() + data_pos, len, std::back_inserter(forwards[destination].vals));
         }
       }
@@ -440,274 +420,39 @@ namespace ps {
 
     // if anything was or will be answered locally, send a response to the original sender
     // (either right now or later)
-    if (numLocal != 0 || numLocalSoon != 0) {
-      if(meta.push) {
+    if (numLocal != 0) {
+      if(msg.meta.push) {
         // for a push, we send back the number of locally processed keys
         res.vals.resize(0);
         res.keys.resize(1);
-        res.keys[0] = numLocal + numLocalSoon;
+        res.keys[0] = numLocal;
       } else {
         res.vals.resize(request_handle_.get_total_len(res.keys));
         // need to do this also for the direct message
       }
 
-      if (numLocalSoon == 0) {
-        this->Response(meta, res);
-      } else {
-        // will send response later (when all pips are answered)
-        queued_msg.get()->sendOnDelete = true;
-      }
+      this->Response(msg.meta, res);
     }
 
     // if any key was not answered locally, send forward message(s)
-    if (numLocal + numLocalSoon < data.keys.size()) {
-      sendForwards(forwards, meta);
+    if (numLocal < data.keys.size()) {
+      sendForwards(forwards, msg.meta);
     }
   }
-
-  /**
-   * \brief Process a localize request to a parameter server
-   */
-  template <typename Val, typename Handle>
-    void ColoKVServer<Val, Handle>::ProcessLocalizeRequest(KVPairs<Val>& data, KVPairs<Val>& res,
-                                                      std::shared_ptr<QueuedMessage<Val>>& queued_msg) {
-    KVMeta& meta = queued_msg.get()->meta;
-    auto senderRank = Postoffice::Get()->IDtoRank(meta.sender);
-
-    if (meta.cmd == Control::LOCALIZE) { // first message of a localize: Localize(param), requester->manager
-      // prepare key/value data for TRANSFER messages (one to each involved old owner)
-      std::vector<KVPairs<Val>> transfers(Postoffice::Get()->num_servers());
-      std::vector<short> destinations(data.keys.size()); // store old owners
-
-      // update residence for all keys in this localize request
-      addressbook.lock();
-      for (size_t i = 0; i < data.keys.size(); ++i) {
-        Key key = data.keys[i];
-        if(addressbook.isManagedHere(key)) {
-          destinations[i] = addressbook.updateResidenceUnsafe(key, senderRank);
-          TLOG(key, senderRank, "manager received LOCALIZE. update residence ");
-        } else {
-          // an exception: localize requester was also the manager, so it sent the message to the owner directly
-          // thus, we don't need to update ownership
-          TLOG(key, senderRank, "manager received LOCALIZE. not manager, don't update residence ");
-        }
-      }
-      addressbook.unlock();
-
-      // decide what to to with each parameter in this message. options
-      // 1) this PS is current owner: take out of local PS and send TRANSFER response to requester
-      // 2) this PS is the next designated owner: wait until transfer is finished, then send TRANSFER to requester
-      // 3) send HAND_OVER message to current owner
-      size_t len = 0, pos = 0;
-      request_handle_.lockAll(); // does nothing if we use LOCK_SINGLE locking strategy
-      for (size_t i = 0; i < data.keys.size(); ++i) {
-        Key key = data.keys[i];
-        len = request_handle_.get_len(key);
-        request_handle_.lockSingle(key); // does nothing if we use LOCK_ALL locking strategy
-        bool local = request_handle_.attemptLocalPullUnsafe(key, res.vals.data() + pos);
-        if (local) {
-          // take out of data structure
-          res.keys.push_back(key);
-          request_handle_.removeKeyUnsafe(key);
-          TLOG(key, senderRank, "manager received LOCALIZE. also local. take out and send TRANSFER");
-          pos += len;
-        } else {
-
-          if (destinations[i] == my_rank || !addressbook.isManagedHere(key)) { // HACK
-            // two exceptions. in both cases, we send the TRANSFER message when the ongoing transfer is finished
-            // 1) this node is the next designated owner and the node is currently in transfer
-            // 2) the requester is also the manager and sent a LOCALIZE (instead of a HAND_OVER), but the parameter is still in transfer
-            bool queued = request_handle_.transfers.noteSubsequentLocalizeUnsafe(key, queued_msg);
-            TLOG(key, senderRank, "manager received LOCALIZE. in transfer. wait and send TRANSFER later");
-            CHECK(queued) << "FATAL. got a LOCALIZE for key " << key << " and it should be in transfer, but it isn't. rank " << destinations[i] << " vs " << my_rank << ", " << (addressbook.isManagedHere(key) ? "managed here" : "not managed here");
-          } else {
-            transfers[destinations[i]].keys.push_back(key);
-            TLOG(key, senderRank, "manager received LOCALIZE. send HAND_OVER to owner " << destinations[i]);
-          }
-        }
-        request_handle_.unlockSingle(key);
-      }
-      request_handle_.unlockAll();
-
-      // send out one HAND_OVER message to each involved old owner
-      meta.cmd = Control::LOCALIZE_HAND_OVER;
-      sendForwards(transfers, meta); // sends messages only to affected servers
-
-      // if this node was the owner of any key, send a TRANSFER response to the requester
-      if (res.keys.size() > 0) {
-        meta.cmd = Control::LOCALIZE;
-        res.vals.resize(request_handle_.get_total_len(res.keys));
-        this->Response(meta, res);
-      }
-    } else if (meta.cmd == Control::LOCALIZE_HAND_OVER) { // second message of a transfer: HAND_OVER(param), manager->owner
-      // for each parameter, check whether it is in the local PS
-      // if yes, take it out of PS and send the TRANSFER message to the requester
-      // if not, then it is in transfer to this node right now. wait for the transfer to finish, then send TRANSFER to requester
-      size_t len = 0, pos = 0;
-      request_handle_.lockAll();
-      for (size_t i = 0; i < data.keys.size(); ++i) {
-        Key key = data.keys[i];
-        len = request_handle_.get_len(key);
-        request_handle_.lockSingle(key);
-        bool local = request_handle_.attemptLocalPullUnsafe(key, res.vals.data() + pos);
-
-        if (local) {
-          // take parameter out of local PS and transfer to requester
-          res.keys.push_back(key);
-          request_handle_.removeKeyUnsafe(key);
-          TLOG(key, senderRank, "owner received HAND_OVER. take out and send TRANSFER");
-          pos += len;
-        } else {
-          // must be in transfer. note down and send response later
-          bool queued = request_handle_.transfers.noteSubsequentLocalizeUnsafe(key, queued_msg);
-          TLOG(key, senderRank, "owner received HAND_OVER. key in transfer. queued TRANSFER, send when previous transfer is finished");
-          CHECK(queued) << "FATAL. got a hand_over for key " << key << ", but key is not in transfer at rank " << my_rank;
-        }
-        request_handle_.unlockSingle(key);
-      }
-      request_handle_.unlockAll();
-
-      // send TRANSFER response to localize requester
-      if (res.keys.size() > 0) {
-        meta.cmd = Control::LOCALIZE;
-        res.vals.resize(request_handle_.get_total_len(res.keys));
-        this->Response(meta, res);
-      }
-
-      // update location caches
-      if (Postoffice::Get()->use_location_caches()) {
-        for (size_t i = 0; i < data.keys.size(); ++i) {
-          Key key = data.keys[i];
-          addressbook.updateCacheUnsafe(key, senderRank);
-        }
-      }
-    } else {
-      ADLOG("Unkown type of localize request");
-    }
-  }
-
-  /**
-   * \brief Process a localize response, i.e., the last message of a localize.
-   *        This includes storing the localized parameter in the local parameter server,
-   *        processing queued requests and notifying waiting threads.
-   *        If there is a subsequent localize for a parameter, we directly forward the parameter.
-   */
-  template <typename Val, typename Handle>
-    void ColoKVServer<Val, Handle>::ProcessLocalizeResponse(const Message& msg) {
-    KVPairs<Val> kvs;
-    kvs.keys = msg.data[0];
-    kvs.vals = msg.data[1];
-
-    size_t len = 0, pos = 0;
-    // Lists of threads to notify
-    std::vector<std::vector<WaitingThread>> thread_lists (kvs.keys.size());
-    // Parameters for which a subsequent localize has arrived, grouped by the next owner
-    std::unordered_map<KVMeta*,std::pair<std::shared_ptr<QueuedMessage<Val>>,KVPairs<Val>>> subsequent_localize_map;
-
-    request_handle_.lockAll(); // START CRITICAL SECTION.
-
-    for (size_t i = 0; i < kvs.keys.size(); ++i) {
-      Key key = kvs.keys[i];
-      len = request_handle_.get_len(key);
-      request_handle_.lockSingle(key);
-      Val* val = &kvs.vals[pos];
-      TLOG(key, my_rank, "requester received TRANSFER. localize finished");
-      // manage finished localize for this key
-
-      CHECK(request_handle_.transfers.isInTransferUnsafe(key)) << "FATAL! Did not find key " << key << " in pip map on rank " << my_rank;
-      auto& queue = request_handle_.transfers.getTransferUnsafe(key);
-
-      // process queued pull and push operations
-      for (size_t r=0; r!=queue.ops.size(); ++r) {
-        OpType optype = queue.ops[r].first; // is this op a push or a pull?
-        Val* queued_val = queue.ops[r].second;
-        if (optype == OpType::PUSH || optype == OpType::SET) { // process the queued push: merge into received value
-          bool set = optype == OpType::SET;
-          request_handle_.mergeValue(val, queued_val, set, len);
-        } else { // process the queued pull: copy current value to stored destination
-          std::copy_n(val, len, queued_val);
-        }
-      }
-
-      if (queue.subsequentLocalize) {
-        // the next (subsequent) localize for this parameter has already arrived. so we don't
-        // put the parameter into the local PS. Instead, we forward to the next owner.
-
-        // we group the subsequent localizes by the next owner and send one message
-        // per (next_owner,timestamp) instead of one message per subsequent localizes
-
-        // find the the message for this (next_owner,timestamp)
-        KVMeta* meta = &(queue.subsequentLocalizeMsg->meta);
-        auto search = subsequent_localize_map.find(meta);
-        if(search == subsequent_localize_map.end()) {
-          auto insert = subsequent_localize_map.insert({meta, {queue.subsequentLocalizeMsg, {}}});
-          search = insert.first;
-        }
-        // add this parameter (key and value) to this message
-        auto& subseq_kvs = search->second.second;
-        subseq_kvs.keys.push_back(key);
-        std::copy_n(val, len, std::back_inserter(subseq_kvs.vals));
-      } else {
-        // insert key into local PS
-        request_handle_.insertKeyUnsafe(key, val);
-      }
-
-
-      // note threads to notify (send notifications outside the critical section)
-      std::swap(thread_lists[i], queue.threads);
-      queue.reset();
-      request_handle_.unlockSingle(key);
-
-      pos += len;
-    }
-
-    request_handle_.unlockAll(); // END CRITICAL SECTION
-
-    // Forward the parameters for which a subsequent localize request has already arrived
-    for(auto& sp : subsequent_localize_map) {
-      auto& meta = sp.second.first->meta;
-      auto& skvs = sp.second.second;
-      this->Response(meta, skvs);
-    }
-
-    // Identify the threads we need to notify
-    // TODO: could collect threads in a map earlier, while queuing
-    std::unordered_map<std::pair<Customer*, int>, int, boost::hash<std::pair<Customer*, int>>> thread_responses;
-    for (auto& threads : thread_lists) {
-      for (size_t r=0; r!=threads.size(); ++r) {
-        WaitingThread& thread = threads[r];
-        thread_responses[std::make_pair(thread.customer, thread.ts)]++;
-      }
-    }
-
-    // Notify threads about responses and send wake-up signal if appropriate
-    for (auto& it : thread_responses) {
-      Customer* customer = it.first.first;
-      int timestamp = it.first.second;
-      int numResponses = it.second;
-      bool hasAllResponses = customer->AddResponse(timestamp, numResponses);
-      if (hasAllResponses) { // send wake-up signal
-        Message msg;
-        msg.meta.control.cmd = Control::WAKE_SIGNAL;
-        msg.meta.timestamp = timestamp;
-        customer->Accept(std::move(msg));
-      }
-    }
-  }
-
 
   /**
    * \brief Forward a pull/push request to another parameter server
    */
   template <typename Val, typename Handle>
-    void ColoKVServer<Val, Handle>::Forward(int destination, const KVMeta& req, const KVPairs<Val>& fw) {
+    void ColoKVServer<Val, Handle>::Forward(int destination, const Meta& req, const KVPairs<Val>& fw) {
     Message msg;
-    msg.meta.app_id      = this->obj_->app_id();
+    msg.meta.app_id      = 0;
     msg.meta.customer_id = req.customer_id;
+    msg.meta.channel     = req.channel;
     msg.meta.request     = true;
     msg.meta.push        = req.push;
     msg.meta.set         = req.set;
-    msg.meta.head        = req.cmd;
+    msg.meta.head        = req.head;
     msg.meta.timestamp   = req.timestamp;
     msg.meta.recver      = Postoffice::Get()->ServerRankToID(destination);
     msg.meta.sender      = req.sender;
@@ -715,13 +460,10 @@ namespace ps {
       msg.AddData(fw.keys);
       if (fw.vals.size()) {
         msg.AddData(fw.vals);
-        if (fw.lens.size()) {
-          msg.AddData(fw.lens);
-        }
       }
     }
 
-    Postoffice::Get()->van()->Send(msg, SERVER_MSG);
+    Postoffice::Get()->van()->Send(msg);
   }
 
 }  // namespace ps

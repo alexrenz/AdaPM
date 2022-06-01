@@ -7,36 +7,61 @@
 #include <utility>
 #include <vector>
 #include <tuple>
+#include <queue>
 #include "ps/kv_app.h"
 #include "ps/addressbook.h"
+#include "utils.h"
+#include <boost/math/special_functions/factorials.hpp>
+#include <boost/lockfree/spsc_queue.hpp>
 
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <unordered_set>
 
 namespace ps {
 
-  // forward declaration
+  // forward declarations
   template <typename Val, typename Handle>
     class ColoKVServer;
+  template <typename Val, typename Handle>
+    class SyncManager;
 
-  /**
-   * \brief Holds the information necessary to process a pull/push/set operation
-   *        We use this to pass op information from the worker thread to a
-   *        background thread. The background thread then runs the operation.
-   */
-  template<typename Val>
-  struct AsyncOp {
-    // constructors
-    AsyncOp(int ts_, OpType type_, Key* keys_, size_t num_keys_, Val* vals_):
-      ts(ts_), type(type_), keys(keys_), num_keys(num_keys_), vals(vals_)  {}
-    AsyncOp() {}
+  // Holds information about one future intent of this worker. We use this
+  // to store future intents separately from currently active intents.
+  struct FutureIntent {
+    FutureIntent(const Clock s, const Clock e,
+                 std::shared_ptr<std::unordered_set<Key>>& _keys):
+      start{s}, end{e}, keys{_keys} {}
 
-    int    ts;
-    OpType type;
-    Key*   keys;
-    size_t num_keys;
-    Val*   vals;
+    FutureIntent() {}
+
+    Clock start;
+    Clock end;
+    std::shared_ptr<std::unordered_set<Key>> keys;
+  };
+
+  // we store future intents in a heap, with the "nearest" intents on top
+  class CompareFutureIntent {
+  public:
+    bool operator() (const FutureIntent& lhs, const FutureIntent& rhs) const {
+      return (lhs.start>rhs.start);
+    }
+  };
+
+  // helper class that runs the postoffice setup (before anything else is done)
+  // the Start() call waits until all nodes are ready
+  class PostofficeSetup {
+  public:
+    PostofficeSetup(const int customer_id, const unsigned int start_total=1) {
+      // start primary (worker or server) channel
+      Postoffice::Get()->Start(customer_id, nullptr, true);
+
+      // start additional channels(without barrier). used for additional PS threads
+      for (unsigned int i=1; i!=start_total; ++i) {
+        Postoffice::Get()->Start(customer_id+i, nullptr, false);
+      }
+    }
   };
 
   /**
@@ -63,47 +88,19 @@ namespace ps {
     /**
      * \brief constructor
      *
-     * \param app_id the app id, should match with \ref KVServer's id
      * \param customer_id the customer id which is unique locally
      */
-    explicit ColoKVWorker(const int app_id, const int customer_id, ColoKVServer<Val, Handle>& sserver) : KVWorker<Val>(), server(sserver), customer_id_(customer_id) {
+    explicit ColoKVWorker(const int customer_id, ColoKVServer<Val, Handle>& sserver) :
+      postoffice_setup {customer_id}, server(sserver), customer_id_(customer_id),
+      new_intents (Postoffice::Get()->num_channels()),
+      future_intents (Postoffice::Get()->num_channels()) {
+
+      // create customer
       using namespace std::placeholders;
-      this->obj_ = new Customer(app_id, customer_id, std::bind(&ColoKVWorker<Val, Handle>::Process, this, _1));
+      this->obj_ = new Customer(0, customer_id, std::bind(&ColoKVWorker<Val, Handle>::Process, this, _1));
       // note: obj_ is deleted by the destructor of KVWorker
 
-      // start a background thread for asynchronous processing of API calls
-      async_thread_ = std::unique_ptr<std::thread>(new std::thread(&ColoKVWorker::AsyncLocalProcessing, this));
-      auto my_rank = Postoffice::Get()->my_rank();
-      std::string name = std::to_string(my_rank)+"-async-worker-"+std::to_string(my_rank*Postoffice::Get()->num_worker_threads() + customer_id_-1);
-      SET_THREAD_NAME(async_thread_, name.c_str());
-
-      if(server.sampling_ != nullptr) {
-        server.sampling_->registerWorker(customer_id_, this);
-      }
-    }
-
-    // debug statistics
-    ~ColoKVWorker() {
-      server.num_pull_ops += num_pull_ops;
-      server.num_pull_ops_local += num_pull_ops_local;
-      server.num_push_ops += num_push_ops;
-      server.num_push_ops_local += num_push_ops_local;
-      server.num_pull_params += num_pull_params;
-      server.num_pull_params_local += num_pull_params_local;
-      server.num_pull_params_in_transfer += num_pull_params_in_transfer;
-      server.num_push_params += num_push_params;
-      server.num_push_params_local += num_push_params_local;
-      server.num_push_params_in_transfer += num_push_params_in_transfer;
-
-      // stop the background thread
-      async_ops_queue_.Push({-1, OpType::PULL, nullptr, 0, nullptr});
-      async_thread_->join();
-    }
-
-    // reset re-used data structures
-    inline void reset(size_t size) {
-      local.resize(size);
-      std::fill_n(local.begin(), size, 0);
+      server.registerWorker(customer_id_, this);
     }
 
     /**
@@ -119,25 +116,23 @@ namespace ps {
      * @param set a flag whether the value should be pushed (added) or set
      * @return -1 if all the keys were answered locally, a timestamp otherwise
      */
-    int Push(Key* keys, size_t num_keys, Val* vals, const bool set=false, const bool async=false) {
+    int Push(Key* keys, size_t num_keys, Val* vals, const bool set=false) {
       ++num_push_ops;
       num_push_params += num_keys;
 
       size_t len = 0, pos = 0;
 
       // STEP 1: fast special case (if all parameters are local)
-      reset(num_keys);
+      destinations.resize(num_keys);
       size_t numLocal = 0;
-      if (!async && Postoffice::Get()->shared_memory_access()) {
-        for (size_t i = 0; i < num_keys; ++i) {
-          // try to process the request locally
-          Key key = keys[i];
-          CHECK(key < Postoffice::Get()->max_key())<< "[ERROR] Push key " << key << ", which is outside the configured key range [0,"<< Postoffice::Get()->max_key() << ")";
-          len = server.request_handle_.get_len(key);
-          local[i] = server.request_handle_.attemptLocalPush(key, vals + pos, set);
-          pos += len;
-          numLocal += local[i];
-        }
+      for (size_t i = 0; i < num_keys; ++i) {
+        // try to process the request locally
+        Key key = keys[i];
+        CHECK(key < Postoffice::Get()->num_keys())<< "[ERROR] Push key " << key << ", which is outside the configured key range [0,"<< Postoffice::Get()->num_keys() << ")";
+        len = server.request_handle_.get_len(key);
+        destinations[i] = server.localPushOrDirections(key, vals + pos, set);
+        pos += len;
+        numLocal += (destinations[i] == LOCAL);
       }
       num_push_params_local += numLocal;
       if (numLocal == num_keys) {
@@ -149,65 +144,50 @@ namespace ps {
       // STEP 2: slow general case (send out requests to other servers)
       int ts = obj_->NewRequest(kServerGroup, num_keys);
 
-      if (!async) { // synchronous function call 
-        std::vector<KVPairs<Val>> requests (Postoffice::Get()->num_servers());
-        std::vector<size_t> requests_num_keys (Postoffice::Get()->num_servers());
-        std::vector<size_t> requests_len_vals (Postoffice::Get()->num_servers());
-        std::vector<int> destinations (num_keys);
-        pos = 0; // reset for 2nd pass
+      auto nc = Postoffice::Get()->num_channels();
+      std::vector<KVPairs<Val>> requests (Postoffice::Get()->num_servers() * nc);
+      std::vector<size_t> requests_num_keys (requests.size());
+      std::vector<size_t> requests_len_vals (requests.size());
 
-        // determine which keys are remote and to where we need to send the messages
-        for (size_t i = 0; i <num_keys; ++i) {
-
+      // determine how large the requests will be
+      for (size_t i = 0; i!=num_keys; ++i) {
+        if (destinations[i] != LOCAL) {
           Key key = keys[i];
           len = server.request_handle_.get_len(key);
-          if (!local[i]) {
-            ps::Status status = server.request_handle_.processPush(key, vals+pos, ts, obj_, set);
-            if (status == ps::Status::LOCAL) {
-              local[i] = true;
-              ++numLocal;
-            } else if (status == ps::Status::IN_TRANSFER) {
-              local[i] = true;  // parameter is already on its way to this node, no need to send a message
-              ++num_push_params_in_transfer;
-            } else { // remote
-              destinations[i] = server.addressbook.getDirections(key, true);
-              requests_num_keys[destinations[i]] += 1;
-              requests_len_vals[destinations[i]] += len;
-            }
-          }
-          pos += len;
+          auto c = server.request_handle_.get_channel(key);
+          requests_num_keys[destinations[i]*nc+c] += 1;
+          requests_len_vals[destinations[i]*nc+c] += len;
         }
-
-        // allocate memory for keys and values in the requests
-        for (size_t i = 0; i < requests.size(); ++i) {
-          requests[i].keys.reserve(requests_num_keys[i]);
-          requests[i].vals.reserve(requests_len_vals[i]);
-        }
-
-        // copy keys and values to requests
-        pos = 0;
-        for (size_t i = 0; i < num_keys; ++i) {
-          Key key = keys[i];
-          len = server.request_handle_.get_len(key);
-          if (!local[i]) {
-            requests[destinations[i]].keys.push_back(key);
-            std::copy_n(vals+pos, len, std::back_inserter(requests[destinations[i]].vals));
-          }
-          pos += len;
-        }
-
-        // send out requests
-        SendRequests(ts, true, requests, numLocal, 0, set);
-      } else { // asynchronous function call: offload processing to background thread
-        async_ops_queue_.Push({ts, set ? OpType::SET : OpType::PUSH, keys, num_keys, vals});
       }
+
+      // allocate memory for keys and values in the requests
+      for (size_t z = 0; z!=requests.size(); ++z) {
+        requests[z].keys.reserve(requests_num_keys[z]);
+        requests[z].vals.reserve(requests_len_vals[z]);
+      }
+
+      // copy keys and values to requests
+      pos = 0; // reset for copy pass
+      for (size_t i = 0; i!=num_keys; ++i) {
+        Key key = keys[i];
+        len = server.request_handle_.get_len(key);
+        auto c = server.request_handle_.get_channel(key);
+        if (destinations[i] != LOCAL) {
+          requests[destinations[i]*nc+c].keys.push_back(key);
+          std::copy_n(vals+pos, len, std::back_inserter(requests[destinations[i]*nc+c].vals));
+        }
+        pos += len;
+      }
+
+      // send out requests
+      SendRequests(ts, true, requests, numLocal, 0, set);
       return ts;
     }
 
     /**
      * \brief Push key--values into the PS (overrides KVWorker::Push())
      *
-     * This is a wrapper function that takes an std::vector to the values
+     * This is a wrapper that takes a vector for keys and values
      *
      * @param keys a list of keys
      * @param vals the according values
@@ -215,6 +195,19 @@ namespace ps {
      */
     int Push(std::vector<Key>& keys, std::vector<Val>& vals) {
       return Push(keys.data(), keys.size(), vals.data());
+    }
+
+    /**
+     * \brief Push key--values into the PS (overrides KVWorker::Push())
+     *
+     * This is a wrapper that takes a vector of keys and a raw pointer for values
+     *
+     * @param keys a list of keys
+     * @param vals the according values
+     * @return -1 if all the keys were answered locally, a timestamp otherwise
+     */
+    int Push(std::vector<Key>& keys, Val* val_ptr) {
+      return Push(keys.data(), keys.size(), val_ptr);
     }
 
     /**
@@ -256,8 +249,7 @@ namespace ps {
      * @param vals an array to store the vals into
      * @return -1 if all the keys were answered locally, a timestamp otherwise
      */
-    int Pull(Key* keys, size_t num_keys, Val* vals, SArray<int>* lens = nullptr,
-             int cmd = 0, const Callback& cb = nullptr, const bool async = false) {
+    int Pull(Key* keys, size_t num_keys, Val* vals, const Callback& cb = nullptr) {
       ++num_pull_ops;
       num_pull_params += num_keys;
 
@@ -265,20 +257,18 @@ namespace ps {
 
       // STEP 1: fast special case (if all parameters are local)
       size_t numLocal = 0;
-      reset(num_keys);
-      if (!async && Postoffice::Get()->shared_memory_access()) {
-        for (size_t i = 0; i < num_keys; ++i) {
-          // try to process the request locally
-          Key key = keys[i];
+      destinations.resize(num_keys);
+      for (size_t i = 0; i < num_keys; ++i) {
+        // try to process the request locally
+        Key key = keys[i];
 
-          CHECK(key < Postoffice::Get()->max_key())<< "[ERROR] Pull key " << key << ", which is outside the configured key range [0,"<< Postoffice::Get()->max_key() << ")";
+        CHECK(key < Postoffice::Get()->num_keys())<< "[ERROR] Pull key " << key << ", which is outside the configured key range [0,"<< Postoffice::Get()->num_keys() << ")";
 
-          len = server.request_handle_.get_len(key);
-          local[i] = server.request_handle_.attemptLocalPull(key, vals+pos, true, true);
+        len = server.request_handle_.get_len(key);
+        destinations[i] = server.localPullOrDirections(key, vals+pos);
 
-          pos += len;
-          numLocal += local[i];
-        }
+        pos += len;
+        numLocal += (destinations[i] == LOCAL);
       }
       num_pull_params_local += numLocal;
       if (numLocal == num_keys) {
@@ -295,42 +285,27 @@ namespace ps {
       request_original_kvs_[ts] = std::make_tuple(keys, num_keys, vals);
       orig_kv_mu_.unlock();
 
-      this->AddCallback(ts, [this, ts, keys, vals, lens, cb]() mutable {
+      this->AddCallback(ts, [this, ts, keys, vals, cb]() mutable {
           orig_kv_mu_.lock();
           request_original_kvs_.erase(ts);
           orig_kv_mu_.unlock();
           if (cb) cb();
         });
 
-      pos = 0; // reset for 2nd pass
-      if (!async) { // synchronous function call
-        std::vector<KVPairs<Val>> requests (Postoffice::Get()->num_servers()); // TODO: reuse
+      auto nc = Postoffice::Get()->num_channels();
+      std::vector<KVPairs<Val>> requests (Postoffice::Get()->num_servers() * nc);
 
-        // parse the non-processed keys a second time
-        for (size_t i = 0; i < num_keys; ++i) {
-          Key key = keys[i];
-          len = server.request_handle_.get_len(key);
-
-          if (!local[i]) {
-            ps::Status status = server.request_handle_.processPull(key, vals+pos, ts, obj_);
-            if (status == ps::Status::LOCAL) {
-              ++numLocal;
-            } else if (status == ps::Status::IN_TRANSFER) {
-              ++num_pull_params_in_transfer;
-            } else { // remote
-              auto destination = server.addressbook.getDirections(key, true);
-              requests[destination].keys.push_back(key);
-            }
-          }
-          pos += len;
+      // for all non-local keys, we send out a request
+      for (size_t i = 0; i!=num_keys; ++i) {
+        Key key = keys[i];
+        if (destinations[i] != LOCAL) {
+          auto c = server.request_handle_.get_channel(key);
+          requests[destinations[i]*nc+c].keys.push_back(key);
         }
-
-        // send out messages and return timestamp
-        SendRequests(ts, false, requests, numLocal, 0, false);
-
-      } else { // asynchronous function call: offload processing to background thread
-        async_ops_queue_.Push({ts, OpType::PULL, keys, num_keys, vals});
       }
+
+      // send out messages and return timestamp
+      SendRequests(ts, false, requests, numLocal, 0, false);
 
       return ts;
     }
@@ -338,131 +313,103 @@ namespace ps {
     /**
      * \brief Pull key--values from the PS (overwrites KVWorker::Pull())
      *
-     * This is a wrapper function that takes a pointer to a std::vector for values
+     * This is a wrapper that takes a vector of keys and a (pointer to a) vector for values
      *
      * @param keys a list of keys
      * @param vals a vector to store the vals into
      * @return -1 if all the keys were answered locally, a timestamp otherwise
      */
-    int Pull(std::vector<Key>& keys, std::vector<Val>* vals, SArray<int>* lens = nullptr,
-             int cmd = 0, const Callback& cb = nullptr) {
-      return Pull(keys.data(), keys.size(), vals->data(), lens, cmd, cb);
+    int Pull(std::vector<Key>& keys, std::vector<Val>* vals,
+             const Callback& cb = nullptr) {
+      return Pull(keys.data(), keys.size(), vals->data(), cb);
+    }
+
+    /**
+     * \brief Pull key--values from the PS (overwrites KVWorker::Pull())
+     *
+     * This is a wrapper that takes a vector of keys and a raw pointer for values
+     *
+     * @param keys a list of keys
+     * @param vals a vector to store the vals into
+     * @return -1 if all the keys were answered locally, a timestamp otherwise
+     */
+    int Pull(std::vector<Key>& keys, Val* val_ptr) {
+      return Pull(keys.data(), keys.size(), val_ptr);
     }
 
     /**
      * \brief Pull the value of a parameter if the parameter is local
      *        Returns true and stores value in *val if parameter is local, returns false otherwise
      */
-    bool PullIfLocal(const Key key, std::vector<Val>* vals) {
-      CHECK(key < Postoffice::Get()->max_key())<< "[ERROR] Pull key " << key << ", which is outside the configured key range [0,"<< Postoffice::Get()->max_key() << ")";
+    // raw pointer version
+    bool PullIfLocal(const Key key, Val* vals) {
+      CHECK(key < Postoffice::Get()->num_keys())<< "[ERROR] Pull key " << key << ", which is outside the configured key range [0,"<< Postoffice::Get()->num_keys() << ")";
 
       // try to check locality without acquiring a lock
       if (server.request_handle_.isNonLocal_noLock(key)) {
         return false;
       }
 
-      return server.request_handle_.attemptLocalPull(key, vals->data(), false, false);
+      return server.request_handle_.attemptLocalPull(key, vals, false);
+    }
+    // vector version
+    bool PullIfLocal(const Key key, std::vector<Val>* vals) {
+      return PullIfLocal(key, vals->data());
+    }
+
+    /**
+     * \brief Signal intent for specific parameters, i.e., indicate that this
+     *        worker will access the given parameters during a time period in the future.
+     *
+     *        This period is specified by the given `start` and `end` clocks.
+     *        The `start` clock is inclusive, `end` clock is exclusive, i.e.,
+     *        intent start=14 end=16 means that there is intent in clock 14 and 15
+     *
+     *        The `end` clock is optional. If the `end` clock is omitted, we
+     *        assume that the intent is valid only for the `start` clock, i.e.,
+     *        that the intent ends at clock `start`+1
+    */
+    // set of keys (move)
+    int Intent(const std::unordered_set<Key>&& keys, Clock start, Clock end=0) {
+      return ProcessIntent(std::move(keys), start, end);
+    }
+
+    // set of keys (copy)
+    int IntentWithCopy(const std::unordered_set<Key>& keys, Clock start, Clock end=0) {
+      std::unordered_set<Key> keys_copy (keys);
+      return ProcessIntent(std::move(keys_copy), start, end);
+    }
+
+    // vector of keys
+    int Intent(const std::vector<Key>& keys, Clock start, Clock end=0) {
+      // make sure there are no duplicates
+      std::unordered_set<Key> keys_set (keys.begin(), keys.end());
+      return ProcessIntent(std::move(keys_set), start, end);
+    }
+
+    // array of keys
+    int Intent(const Key* keys, const size_t num_keys, Clock start, Clock end=0) {
+      // make sure there are no duplicates
+      std::unordered_set<Key> keys_set (keys, keys+num_keys);
+      return ProcessIntent(std::move(keys_set), start, end);
+    }
+
+    // single key
+    int Intent(const Key key, Clock start, Clock end=0) {
+      std::unordered_set<Key> keys_set {key};
+      return ProcessIntent(std::move(keys_set), start, end);
     }
 
 
     /**
-     * \brief Starting from `key`, pull the next local key, searching upwards.
-     *        I.e., if `key` is local, that key's values are pulled into `vals`;
-     *        o/w, if key `key`+1 is local, that key is pulled;
-     *        o/w, if key `key`+2 is local, that key is pulled;
-     *        and so on ...
-     *        The search wraps around to `min_key` when `max_key` is reached.
-     *
-     *        Returns the key that was pulled
-     */
-    Key PullNextLocal(Key key, std::vector<Val>* vals,
-                      const Key min_key, const Key max_key,
-                      unsigned long long& num_checks) {
-      while (true) {
-        ++num_checks;
+     * \brief Signal sampling intent
 
-        // check whether this key is local
-        if (!server.request_handle_.isNonLocal_noLock(key)) {
-          // key is probably local, try to pull it
-          bool local = server.request_handle_.attemptLocalPull(key, vals->data(), false, false);
-          if (local) {
-            return key;
-          }
-        }
+     I.e., indicate that this worker will access a parameter sample during the
+     given time period. See `Intent()` for details on the period specification.
 
-        // this key was not local, move on to the next one
-        ++key;
-        if (key >= max_key) {
-          key = min_key;
-        }
-      }
-    }
-
-    /**
-     * \brief Make parameters local to this parameter server
-     *
-     *        Optionally, you can pass a pointer to an integer in which the method
-     *        will store the number of already local keys
-     *
-     * @param keys the list of keys to localize
-     * @return -1 if all the keys were answered locally, a timestamp otherwise
-     */
-    int Localize(Key* keys, size_t num_keys, size_t* extNumLocal = nullptr) {
-
-      // no need to relocate if there is only one node
-      if (Postoffice::Get()->num_servers() == 1) return -1;
-
-      int ts = obj_->NewRequest(kServerGroup, num_keys);
-
-      std::vector<KVPairs<Val>> requests (Postoffice::Get()->num_servers()); // TODO: reuse
-
-      size_t numLocal = 0;
-      for (size_t i = 0; i < num_keys; ++i) {
-        Key key = keys[i];
-        CHECK(key < Postoffice::Get()->max_key())<< "[ERROR] Localize key " << key << ", which is outside the configured key range [0,"<< Postoffice::Get()->max_key() << ")";
-        ps::Status status = server.request_handle_.processLocalize(key, ts, obj_);
-        if (status == ps::Status::LOCAL) {
-          ++numLocal;
-        } else if (status == ps::Status::REMOTE) {
-          auto destination = -1;
-          if (server.addressbook.isManagedHere(key)) {
-            // get the old owner and set new owner atomically
-            auto old_owner = server.addressbook.updateResidence(key, Postoffice::Get()->my_rank());
-            destination = old_owner;
-            TLOG(key, Postoffice::Get()->my_rank(), "self manager. update residence and forward to " << destination);
-          } else {
-            // if this is a localize request and this not is not the manager, we send a request to the manager of the key
-            destination = server.addressbook.getManager(key);
-            TLOG(key, Postoffice::Get()->my_rank(), "start. send to manager " << destination);
-          }
-          // for localize: special treatment
-          requests[destination].keys.push_back(key);
-        }
-      }
-
-      if(extNumLocal != nullptr) *extNumLocal = numLocal;
-
-      // send out messages and return timestamp
-      SendRequests(ts, false, requests, numLocal, Control::LOCALIZE, false);
-      return ts;
-    }
-
-    /**
-     * \brief Make parameters local to this parameter server
-     *
-     * @param keys vector of keys to localize
-     * @return -1 if all the keys were answered locally, a timestamp otherwise
-     */
-    int Localize(std::vector<Key>& keys, size_t* extNumLocal = nullptr) {
-      return Localize(keys.data(), keys.size(), extNumLocal);
-    }
-
-    /**
-     * \brief Prepare a sample of K random keys
-     *        Returns a sample id
-     */
-    SampleID PrepareSample(size_t K) {
-      return server.sampling_->prepare_sample(K, customer_id_);
+    */
+    SampleID PrepareSample(size_t K, Clock start, Clock end=0) {
+      return server.sampling_->prepare_sample(K, customer_id_, start, end);
     }
 
     /**
@@ -470,8 +417,13 @@ namespace ps {
      *        Returns an operation timestamp as `Pull` does. (i.e., it is safe to use
      *        the values in `vals` only after you waited for the returned timestamp)
      */
+    // vector version
     int PullSample(SampleID id, std::vector<Key>& keys, std::vector<Val>& vals) {
-      return server.sampling_->pull_sample(id, keys, vals, customer_id_);
+      return server.sampling_->pull_sample(id, keys.data(), keys.size(), vals.data(), customer_id_);
+    }
+    // raw pointer version
+    int PullSample(SampleID id, Key* keys, size_t num_keys, Val* vals) {
+      return server.sampling_->pull_sample(id, keys, num_keys, vals, customer_id_);
     }
 
     /**
@@ -480,6 +432,26 @@ namespace ps {
      */
     void FinishSample(SampleID id) {
       server.sampling_->finish_sample(id, customer_id_);
+    }
+
+    // helper: calculate an ID for this worker
+    int workerId() const {
+      return Postoffice::Get()->my_rank()*Postoffice::Get()->num_worker_threads()+customer_id_;
+    }
+
+    /**
+     * \brief Advance this worker's clock
+     */
+    void advanceClock() {
+      ++clock;
+      assert(clock >= 0); // prevent overflows
+    }
+
+    /**
+     * \brief Obtain the worker's current clock
+     */
+    Clock currentClock() const {
+      return clock;
     }
 
     /**
@@ -510,11 +482,64 @@ namespace ps {
     }
 
     /**
-     * \brief Wait until all updates that have reached the store by now
-     *        are propagated to all replicas
+     * \brief Wait for 4 timestamps
      */
-    void WaitReplicaSync() {
-      server.replica_manager_.WaitReplicaSync();
+    void Wait(int ts1, int ts2, int ts3, int ts4) {
+      if(ts1 != -1) obj_->WaitRequest(ts1);
+      if(ts2 != -1) obj_->WaitRequest(ts2);
+      if(ts3 != -1) obj_->WaitRequest(ts3);
+      if(ts4 != -1) obj_->WaitRequest(ts4);
+    }
+
+    /**
+     * \brief Wait for 5 timestamps
+     */
+    void Wait(int ts1, int ts2, int ts3, int ts4, int ts5) {
+      if(ts1 != -1) obj_->WaitRequest(ts1);
+      if(ts2 != -1) obj_->WaitRequest(ts2);
+      if(ts3 != -1) obj_->WaitRequest(ts3);
+      if(ts4 != -1) obj_->WaitRequest(ts4);
+      if(ts5 != -1) obj_->WaitRequest(ts5);
+    }
+
+    /**
+     * \brief Wait for one synchronization round to start (in each channel).
+     *        I.e., wait that all updates are sent out to their corresponding
+     *        main copies.
+     */
+    void WaitSync() {
+      // no need to wait if there is only 1 node
+      if (Postoffice::Get()->num_servers() == 1) {
+        return;
+      }
+
+      auto num_channels = Postoffice::Get()->num_channels();
+
+      // determine current sync round (for each channel)
+      std::vector<unsigned long> wait_syncs (num_channels);
+      for (unsigned int c=0; c!=num_channels; ++c) {
+        wait_syncs[c] = server.sync_managers_[c].GetCurrentSync() + 2;
+      }
+
+      // wait for all sync managers to finish 2 sync rounds
+      while (true) {
+        bool allFinished = true;
+        for (unsigned int c=0; c!=num_channels; ++c) {
+          if (server.sync_managers_[c].GetCurrentSync() < wait_syncs[c]) {
+            allFinished = false;
+            break;
+          }
+        }
+
+        if (allFinished) {
+          break;
+        }
+
+        // wait briefly until we try again
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+
+      ADLOG("r" << Postoffice::Get()->my_rank() << "-w" << workerId() << ": Waited for syncs " << str(wait_syncs));
     }
 
     /**
@@ -575,13 +600,30 @@ namespace ps {
      * \brief Finalize this worker, i.e., wait for all requests and callbacks and run a barrier
      */
     void Finalize() {
+      server.deregisterWorker(customer_id_);
+
       // wait for all requests to finish
       WaitAll();
 
       // wait for all callbacks to run
       KVWorker<Val>::WaitCallbacks();
 
+      // wait for one sync
+      WaitSync();
+
       Barrier();
+
+      Postoffice::Get()->Finalize(customer_id_, false);
+
+      // propagate stats to server
+      server.num_pull_ops += num_pull_ops;
+      server.num_pull_ops_local += num_pull_ops_local;
+      server.num_push_ops += num_push_ops;
+      server.num_push_ops_local += num_push_ops_local;
+      server.num_pull_params += num_pull_params;
+      server.num_pull_params_local += num_pull_params_local;
+      server.num_push_params += num_push_params;
+      server.num_push_params_local += num_push_params_local;
     }
 
     /**
@@ -590,22 +632,17 @@ namespace ps {
      *        Pushes are applied to replicas without an aggregation factor
      */
     void BeginSetup() {
-      WaitReplicaSync();
+      WaitSync();
       Barrier();
-      if (customer_id_ == 1) {
-        server.replica_manager_.setInit(true);
-      }
     }
 
     /**
      * \brief End the setup period
      */
     void EndSetup() {
-      WaitReplicaSync();
+      WaitSync();
+      WaitSync();
       Barrier();
-      if (customer_id_ == 1) {
-        server.replica_manager_.setInit(false);
-      }
       ResetStats();
     }
 
@@ -619,10 +656,8 @@ namespace ps {
       num_push_ops_local = 0;
       num_pull_params = 0;
       num_pull_params_local = 0;
-      num_pull_params_in_transfer = 0;
       num_push_params = 0;
       num_push_params_local = 0;
-      num_push_params_in_transfer = 0;
       server.request_handle_.reset_replica_stats();
     }
 
@@ -634,29 +669,97 @@ namespace ps {
     }
 
     size_t GetNumKeys() const {
-      return server.request_handle_.get_num_keys();
+      return Postoffice::Get()->num_keys();
+    }
+
+    // get future intents of this worker until a given clock, and move them to
+    // the passed map
+    void getNewRelevantIntents(const unsigned int channel, const Clock clock_current, const Clock clock_until,
+                               std::unordered_map<Key, std::vector<WorkerClockPair>>& relevant_intents) {
+      // add the intents that were newly added by the worker since the last
+      // synchronization round to the heap of all future intents
+      FutureIntent intent {};
+      while (new_intents[channel].pop(intent)) {
+        future_intents[channel].push(std::move(intent));
+      }
+
+      // extract intents that are relevant for this synchronization round
+      while (!future_intents[channel].empty() &&
+             future_intents[channel].top().start <= clock_until) {
+
+        // move this intent to the by-key map
+        auto& top = future_intents[channel].top();
+        for (Key key : *top.keys.get()) {
+          if (server.request_handle_.get_channel(key) == channel) {
+            if (clock_current < top.end) { // the intent is useful only if the corresp. worker has not passed the end clock already
+              relevant_intents[key].emplace_back(customer_id_, top.end);
+            }
+          }
+        }
+        future_intents[channel].pop();
+      }
     }
 
   private:
 
     /**
+     * \brief Process intent signal
+     *
+     *        Assumes that `keys` contains no duplicates.
+     *
+     *        The `start` clock is inclusive, `end` clock is exclusive, i.e.,
+     *        intent start=14 end=16 means that there is intent in clock 14 and 15
+     *
+     *        If the `end` clock is omitted, we assume that the intent is valid only
+     *        for the `start` clock, i.e., that the intent ends at clock `start`+1
+     */
+    int ProcessIntent(const std::unordered_set<Key>&& keys, Clock start, Clock end=0) {
+      // end clock can be omitted
+      if (end == 0) end = start+1;
+
+      // no need to send intents etc if there is only one node
+      if (Postoffice::Get()->num_servers() == 1) return -1;
+
+      // We store the full set multiple times: once per channel. The
+      // synchronization manager of each channel will parse the set later on,
+      // picking out the keys for its channel. The smart pointer makes sure that
+      // the set is deallocated when all channels have parsed the set.
+      auto keys_shared = std::make_shared<std::unordered_set<Key>>(std::move(keys));
+
+      FutureIntent intent {start, end, keys_shared};
+
+      for (unsigned int channel=0; channel!=Postoffice::Get()->num_channels(); ++channel) {
+        while(!new_intents[channel].push(intent)) {
+          ALOG("[WARNING] The queue for incoming intent of worker " << workerId() << " for channel " << channel << " is full. This hinders performance. You should increase the size of the incoming queues. To do so, increase SIZE in `boost::lockfree::capacity<SIZE>` in coloc_kv_worker.h.");
+        }
+      }
+      return -1;
+    }
+
+    /**
      * \brief Send requests to other parameter servers to answer push/pull/localize calls
      */
-    void SendRequests(const int timestamp, const bool push, const std::vector<KVPairs<Val>>& requests,
+    void SendRequests(const int timestamp, const bool push,
+                      const std::vector<KVPairs<Val>>& requests,
                       const int numLocal, int cmd=0, const bool set=false) {
-      if (numLocal != 0) { // add response count for the requests that were answered already
+      if (timestamp != WITHOUT_TS && numLocal != 0) { // add response count for the requests that were answered already
         obj_->AddResponse(timestamp, numLocal);
       }
       // untypical case: have all responses already -> run callback right now
-      if (obj_->HasAllResponses(timestamp)) {
+      if (timestamp != WITHOUT_TS && obj_->HasAllResponses(timestamp)) {
         this->RunCallback(timestamp);
         obj_->NotifyThreads();
       }
 
       // send out messages to other servers
-      for (unsigned int i=0; i!=requests.size(); ++i) {
-        if (!requests[i].keys.empty()) {
-          this->Request(i, requests[i], push, cmd, timestamp, set);
+      auto ns = Postoffice::Get()->num_servers();
+      auto nc = Postoffice::Get()->num_channels();
+      assert(requests.size() == nc * ns);
+      for (int r=0; r!=ns; ++r) {
+        for (unsigned int c=0; c!=nc; ++c) {
+          if (!requests[r*nc+c].keys.empty()) {
+            this->Request(r, requests[r*nc+c], push, cmd, timestamp, set, c);
+          }
         }
       }
     }
@@ -665,7 +768,7 @@ namespace ps {
      * \brief Send out one request to a specific parameter server
      */
     void Request(const int destination, const KVPairs<Val>& kvs, const bool push,
-                 const int cmd, const int timestamp, const bool set) {
+                 const int cmd, const int timestamp, const bool set, const unsigned int channel) {
       // Message object
       Message msg;
       msg.meta.app_id = obj_->app_id();
@@ -673,26 +776,17 @@ namespace ps {
       msg.meta.request     = true;
       msg.meta.push        = push;
       msg.meta.set         = set;
+      msg.meta.channel     = channel;
       msg.meta.head        = cmd;
       msg.meta.timestamp   = timestamp;
       msg.meta.recver      = Postoffice::Get()->ServerRankToID(destination);
       if (kvs.keys.size()) {
         msg.AddData(kvs.keys);
-        if (!isLocalize(cmd)) { // add values (unless this request belongs to a localize, which contains only keys)
-          msg.AddData(kvs.vals);
-        }
-        if (kvs.lens.size()) {
-          msg.AddData(kvs.lens);
-        }
-      }
-
-      // Debug output
-      if (Postoffice::Get()->shared_memory_access() && msg.meta.recver == Postoffice::Get()->ServerRankToID(Postoffice::Get()->my_rank())) {
-        ADLOG("Customer r" << Postoffice::Get()->my_rank() << "c" << obj_->customer_id() << " sends a remote message to its local PS for ts " << timestamp << ", " << (isLocalize(msg.meta.head) ? "localize" : (msg.meta.push ? (msg.meta.set ? "set" : "push") : "pull")) << " " << (msg.meta.request ? "request" : "response") << ". For key " << kvs.keys[0] << " (" << kvs.keys.size() << " total). local: " << server.request_handle_.isLocal(kvs.keys[0]) << ", pip:" << server.request_handle_.isInTransfer(kvs.keys[0]) << ", manager: " << server.addressbook.getManager(kvs.keys[0]) << ", destination: " << destination << ", me: " << Postoffice::Get()->my_rank() << ", directions: " << server.addressbook.getDirections(kvs.keys[0], true));
+        msg.AddData(kvs.vals);
       }
 
       // Send message
-      Postoffice::Get()->van()->Send(msg, WORKER_MSG);
+      Postoffice::Get()->van()->Send(msg);
     }
 
     /**
@@ -703,8 +797,8 @@ namespace ps {
      */
     bool Process(const Message& msg);
 
-    /** \brief Background thread code: processes local pull/push/set invocations asynchronously */
-    void AsyncLocalProcessing();
+    // helper object to set up postoffice before anything else happens
+    PostofficeSetup postoffice_setup;
 
     /** \brief reference to the parameter server of this process */
     ColoKVServer<Val, Handle>& server;
@@ -716,18 +810,24 @@ namespace ps {
     // The customer id of the thread that owns this KVWorker instance (used for barrier)
     const int customer_id_;
 
-    // Note status (local/not local) of parameters of a request
-    std::vector<bool> local {};
+    // the time of one of the first clocks (we use this to estimate clock rate)
+    std::chrono::time_point<std::chrono::high_resolution_clock> start_clock;
 
-    // A background thread for asynchronously processing push/pull operations
-    std::unique_ptr<std::thread> async_thread_;
+    // The status (either local or a destination) of each key of an operation
+    // The vector is reused across operations in this worker thread
+    std::vector<int> destinations {};
 
-    // Queue of operations that will be processed by the background thread
-    ThreadsafeQueue<AsyncOp<Val>> async_ops_queue_;
+    // This worker's clock
+    std::atomic<Clock> clock {0};
+
+    // All intents that this worker has signaled since the last synchronization round
+    std::vector<boost::lockfree::spsc_queue<FutureIntent, boost::lockfree::capacity<65536>>> new_intents;
+
+    // This worker's future intents (one heap per channel)
+    std::vector<std::priority_queue<FutureIntent, std::vector<FutureIntent>, CompareFutureIntent>> future_intents;
 
     long num_pull_ops=0, num_pull_ops_local=0, num_push_ops=0, num_push_ops_local=0;
     long num_pull_params=0, num_pull_params_local=0, num_push_params=0, num_push_params_local=0;
-    long num_pull_params_in_transfer=0, num_push_params_in_transfer=0;
   };
 
 
@@ -743,7 +843,6 @@ namespace ps {
         KVPairs<Val> kvs;
         kvs.keys = msg.data[0];
         kvs.vals = msg.data[1];
-        if (msg.data.size() > (size_t)2) {kvs.lens = msg.data[2];}
 
         // get reference to original keys + val arrays of this timestamp
         orig_kv_mu_.lock();
@@ -770,7 +869,7 @@ namespace ps {
 
             // update location caches
             if (Postoffice::Get()->use_location_caches()) {
-              server.addressbook.updateCache(key, senderRank);
+              server.addressbook.updateLocationCache(key, senderRank);
             }
 
             // move pointers forward
@@ -789,7 +888,7 @@ namespace ps {
 
         // increase receive count
         obj_->AddResponse(ts, kvs.keys.size());
-      } else if(msg.meta.push && msg.data.size()) { // push call // TODO could update caches if we send back exactly the keys that were processed
+      } else if(msg.meta.push && msg.data.size()) { // push call
         // responses to push messages return the number of keys that were updated successfully by the sending server
         // we use this number to determine when all pushs have gone through
 
@@ -806,90 +905,6 @@ namespace ps {
       this->RunCallback(ts);
     }
     return false;
-  }
-
-  /** \brief Background thread: processes local pull/push/set invocations asynchronously */
-  template <typename Val, typename Handle>
-  void ColoKVWorker<Val, Handle>::AsyncLocalProcessing() {
-    while (true) {
-      AsyncOp<Val> op;
-      async_ops_queue_.WaitAndPop(&op); // wait for next op
-      if (op.ts == -1) { // received termination signal, i.e.: terminate
-        break;
-      }
-
-      if (op.type == OpType::PULL) { // pull operation
-        std::vector<KVPairs<Val>> requests (Postoffice::Get()->num_servers());
-        size_t numLocal = 0;
-
-        // process each key
-        size_t pos = 0;
-        for (size_t i = 0; i < op.num_keys; ++i) {
-          Key key = op.keys[i];
-          auto len = server.request_handle_.get_len(key);
-          ps::Status status = server.request_handle_.processPull(key, op.vals+pos, op.ts, obj_);
-          if (status == ps::Status::LOCAL) {
-            ++numLocal;
-          } else if (status == ps::Status::REMOTE) {
-            auto destination = server.addressbook.getDirections(key, true);
-            requests[destination].keys.push_back(key);
-          }
-          pos += len;
-        }
-
-        num_pull_params_local += numLocal; // not thread safe
-
-        // send out messages if necessary
-        SendRequests(op.ts, false, requests, numLocal, 0, false);
-      } else { // push/set operation
-        std::vector<KVPairs<Val>> requests (Postoffice::Get()->num_servers());
-        std::vector<size_t> requests_num_keys (Postoffice::Get()->num_servers());
-        std::vector<size_t> requests_len_vals (Postoffice::Get()->num_servers());
-        std::vector<int> destinations (op.num_keys, -1);
-
-        size_t numLocal = 0;
-        bool is_set_op = op.type == OpType::SET;
-
-        // process each key
-        size_t pos = 0;
-        for (size_t i = 0; i < op.num_keys; ++i) {
-          Key key = op.keys[i];
-          auto len = server.request_handle_.get_len(key);
-          ps::Status status = server.request_handle_.processPush(key, op.vals+pos, op.ts, obj_, is_set_op);
-          if (status == ps::Status::LOCAL) {
-            ++numLocal;
-          } else if (status == ps::Status::REMOTE) {
-            destinations[i] = server.addressbook.getDirections(key, true);
-            requests_num_keys[destinations[i]] += 1;
-            requests_len_vals[destinations[i]] += len;
-          }
-          pos += len;
-        }
-
-        // allocate memory for keys and values in the requests
-        for (size_t i = 0; i < requests.size(); ++i) {
-          requests[i].keys.reserve(requests_num_keys[i]);
-          requests[i].vals.reserve(requests_len_vals[i]);
-        }
-
-        // copy keys and values to requests
-        pos = 0;
-        for (size_t i = 0; i < op.num_keys; ++i) {
-          Key key = op.keys[i];
-          auto len = server.request_handle_.get_len(key);
-          if (destinations[i] != -1) {
-            requests[destinations[i]].keys.push_back(key);
-            std::copy_n(op.vals+pos, len, std::back_inserter(requests[destinations[i]].vals));
-          }
-          pos += len;
-        }
-
-        num_push_params_local += numLocal; // not thread safe
-
-        // send out messages if necessary
-        SendRequests(op.ts, true, requests, numLocal, 0, is_set_op);
-      }
-    }
   }
 }  // namespace ps
 #endif  // PS_COLOC_KV_WORKER_H_

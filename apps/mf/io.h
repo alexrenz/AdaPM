@@ -121,6 +121,8 @@ bool compareByColThenRow(const ReadDp &a, const ReadDp &b) {
   return (a.j == b.j ? a.i < b.i : a.j < b.j);
 }
 
+// shared among worker in one process
+std::vector<ReadDp> datapoints_node {};
 
 // read matrix for matrix factorization. creates a binary version of the passed mmc file if it doesn't exist yet
 template<typename WorkerT>
@@ -134,7 +136,7 @@ mf::DataPart read_sparse_matrix_part(std::string fname, bool read_partial, int n
 
   ifstream test_binary(fname_binary.c_str());
   if (!test_binary.good()) { // no binary file found. try to create one
-    if (customer_id == 1) {
+    if (customer_id == 0) {
       // create a binary dump
       std::cout << "Worker " << worker_id << ": no binary file for dataset " << fname << " yet. Creating one... " << endl;
       create_binary_from_mmc(fname, fname_binary);
@@ -157,7 +159,7 @@ mf::DataPart read_sparse_matrix_part(std::string fname, bool read_partial, int n
   in.read((char *) &size2, sizeof(size2));
   in.read((char *) &nnz, sizeof(nnz));
   if(static_cast<long>(num_rows) != size1 || static_cast<long>(num_cols) != size2) {
-    ADLOG("Dimensions of the read matrix (" << size1 << "x" << size2 << ") do not match the specified dimensions (" << num_rows << "x" << num_cols << ")");
+    ALOG("Dimensions of the read matrix (" << size1 << "x" << size2 << ") do not match the specified dimensions (" << num_rows << "x" << num_cols << ")");
     abort();
   }
 
@@ -188,8 +190,8 @@ mf::DataPart read_sparse_matrix_part(std::string fname, bool read_partial, int n
   // collect all data points for this node, sort the data points by column, and
   // then assign the data points to workers evenly. That is not the most
   // efficient way, but this works for now (and is not timed).
-  std::vector<ReadDp> datapoints_node {};
-  if (algorithm == Alg::columnwise) {
+  // We can at least share the dataset copy among the workers of one node.
+  if (algorithm == Alg::columnwise && customer_id == 0) {
     datapoints_node.reserve(nnz / num_servers);
   }
 
@@ -200,8 +202,10 @@ mf::DataPart read_sparse_matrix_part(std::string fname, bool read_partial, int n
     // read only the rows for this worker
     if(read_partial && dp.i > min_row && dp.i <= max_row) { // read w_min <= i < max_row (but with index starting at 1 in file)
       if (algorithm == Alg::columnwise) {
-        // collect data points first (so we can sort them by column)
-        datapoints_node.push_back(dp);
+        // collect data points first (so we can sort them by column later)
+        if (customer_id == 0) { // do this only once in each process to save memory
+          datapoints_node.push_back(dp);
+        }
       } else {
         // append to the matrix for the corresponding block
         data.addDataPoint(dp.i-1, dp.j-1, dp.x);
@@ -214,13 +218,16 @@ mf::DataPart read_sparse_matrix_part(std::string fname, bool read_partial, int n
 
   // columnwise: assign data points to workers evenly, by column
   if (algorithm == Alg::columnwise) {
-    std::sort(datapoints_node.begin(),
-              datapoints_node.end(), compareByColThenRow);
+    if (customer_id == 0) {
+      std::sort(datapoints_node.begin(),
+                datapoints_node.end(), compareByColThenRow);
+    }
+    kv.Barrier();
 
     int num_local_workers = num_workers/num_servers;
     long dps_per_worker = round(ceil(1.0*datapoints_node.size()/num_local_workers));
-    size_t min_dp = dps_per_worker * (customer_id-1);
-    size_t max_dp = dps_per_worker * (customer_id-1+1);
+    size_t min_dp = dps_per_worker * (customer_id);
+    size_t max_dp = dps_per_worker * (customer_id+1);
 
     for (size_t z=0; z!=datapoints_node.size(); ++z) {
       auto& dp = datapoints_node[z];
@@ -232,19 +239,28 @@ mf::DataPart read_sparse_matrix_part(std::string fname, bool read_partial, int n
       }
     }
   }
+  auto num_node_dps = datapoints_node.size();
+
+  // free the memory of the large datapoints list
+  kv.Barrier(); // parallel access to datapoints_node has to happen above this barrier
+  if (algorithm == Alg::columnwise && customer_id == 0) {
+    std::vector<ReadDp>().swap(datapoints_node);
+  }
 
   // check that we are at the end of the binary file
-  auto pos = in.tellg();
-  in.seekg(0, ios::end);
-  if (pos != in.tellg()) {
-    ALOG("Something is wrong with the binary file " << fname_binary << " in worker " << worker_id << ": it is longer than expected.");
-    abort();
+  if (algorithm != Alg::columnwise || customer_id == 0) {
+    auto pos = in.tellg();
+    in.seekg(0, ios::end);
+    if (pos != in.tellg()) {
+      ALOG("Something is wrong with the binary file " << fname_binary << " in worker " << worker_id << ": it is longer than expected.");
+      abort();
+    }
   }
 
   in.close();
   data.freeze();
   std::stringstream sc;
-  sc << data.num_nnz() << " of " << datapoints_node.size() << " data points of";
+  sc << data.num_nnz() << " of " << num_node_dps << " data points of";
   LLOG("Data (" << fname.substr(fname.find_last_of("/\\") + 1) << "): " << size1 << "x" << size2 << ". Blocks: " << data.num_rows_per_block() << "x" << data.num_cols_per_block() << ". Worker " << worker_id << " has " << (algorithm == Alg::columnwise ? sc.str() : "") << " rows [" << min_row << "," << max_row << ") (" << data.num_nnz() << " nnz)" );
   return data;
 }
@@ -338,88 +354,5 @@ M read_dense_matrix(std::string fname, bool row_major=true, int row_parts=1, int
   // no freeze for dense matrix
   return m;
 }
-
-
-std::vector<double> read_dense_matrix_part_into_vector(std::string fname, long worker_rank, long block_size, int mf_rank) {
-	std::string line;
-  int lineNumber = 0;
-
-  long size1, size2;
-
-  std::vector<double> error { };
-
-  ifstream in(fname.c_str());
-  if(!in.is_open()) {
-    cout << "Cannot open file " << fname << endl;
-    return error;
-  }
-
-  // check file format
-  if(!getline(in, line)) {
-    cout << "Unexpected EOF in file " << fname << endl;
-    return error;
-  }
-  lineNumber++;
-  if (!boost::trim_right_copy(line).compare("%%MatrixMarket matrix array real general") == 0) {
-    cout << "Wrong matrix-market banner in file " << fname << endl;
-    return error;
-  }
-
-	// skip comment lines
-	while (getline(in, line) && line.at(0)=='%') {
-		lineNumber++;
-	}
-	lineNumber++;
-	if (line.at(0)=='%') {
-      cout << "Unexpected EOF in file " << fname << endl;
-    return error;
-  }
-
-
-  // read dimension
-  if (sscanf(line.c_str(), "%ld %ld[^\n]", &size1, &size2) < 2) {
-    cout << "(2) Invalid matrix dimensions in file " << fname <<  ": " <<  line << endl;
-    return error;
-  }
-
-
-  // init matrix
-  std::vector<double> v (block_size*mf_rank);
-  double x = 0;
-
-
-  long first_row = worker_rank * block_size;
-  long last_row = first_row + block_size;
-
-  // read matrix
-  for (long j=0; j<size2; j++) {
-    for (long i=0; i<size1; i++) {
-			if (!getline(in, line)) {
-        cout << "Unexpected EOF in file " << fname << endl;
-        return error;
-      }
-			lineNumber++;
-
-      sscanf(line.c_str(), "%lg\n", &x);
-
-      if(i >= first_row && i < last_row) {
-        v[(i-first_row)*mf_rank+j] = x;
-      }
-    }
-  }
-
-
-	// check that the rest of the file is empty
-	while (getline(in, line)) {
-		lineNumber++;
-		if (!boost::trim_left_copy(std::string(line)).empty()) {
-			cout << "Unexpected input at at line " << lineNumber << " of " << fname << ": " << line << endl;
-      return error;
-		}
-	}
-
-  return v;
-}
-
 
 

@@ -12,6 +12,9 @@ ifndef DEPS_PATH
 DEPS_PATH = $(shell pwd)/deps
 endif
 
+ifndef BUILD_PATH
+BUILD_PATH = build
+endif
 
 ifndef PROTOC
 PROTOC = ${DEPS_PATH}/bin/protoc
@@ -39,32 +42,34 @@ all: ps tests apps
 include make/deps.mk
 
 clean:
-	rm -rf build
+	rm -rf $(BUILD_PATH)
 
 clean-all: clean
 	find src -name "*.pb.[ch]*" -delete
+	rm -rf $(DEPS_PATH)
 	rm -rf deps/
+	rm -rf deps_bindings/
 	rm -rf protobuf-*
 
 lint:
 	python tests/lint.py ps all include/ps src
 
-ps: build/libps.a
+ps: $(BUILD_PATH)/libps.a
 
-OBJS = $(addprefix build/, customer.o postoffice.o van.o meta.pb.o)
-build/libps.a: $(OBJS)
+OBJS = $(addprefix $(BUILD_PATH)/, customer.o postoffice.o van.o meta.pb.o)
+$(BUILD_PATH)/libps.a: $(OBJS)
 	ar crv $@ $(filter %.o, $?)
 
-build/%.o: src/%.cc ${ZMQ} src/meta.pb.h
+$(BUILD_PATH)/%.o: src/%.cc ${ZMQ} src/meta.pb.h
 	@mkdir -p $(@D)
-	$(CXX) $(INCPATH) -std=c++14 -MM -MT build/$*.o $< >build/$*.d
+	$(CXX) $(INCPATH) -std=c++14 -MM -MT $(BUILD_PATH)/$*.o $< >$(BUILD_PATH)/$*.d
 	$(CXX) $(CFLAGS) -c $< -o $@
 
 src/%.pb.cc src/%.pb.h : src/%.proto ${PROTOBUF}
 	$(PROTOC) --cpp_out=./src --proto_path=./src $<
 
--include build/*.d
--include build/*/*.d
+-include $(BUILD_PATH)/*.d
+-include $(BUILD_PATH)/*/*.d
 
 include tests/test.mk
 tests: $(TESTS)

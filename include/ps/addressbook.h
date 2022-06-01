@@ -21,21 +21,21 @@ namespace ps {
    * This class implements a simple way to manage responsibilities:
    * - For each key, there is two roles: a manager and an owner.
    * - The owner holds the current value for the key, the manager knows which node is the owner.
-   * - To assign a manager to each key, we range partition the parameter space.
-   *   A node is the manager for all keys in its range.
+   * - To assign a manager to each key, we use hash partitioning.
    * - The manager stores who is the owner for each of its keys.
    *
    * Optionally, it caches the locations of keys. Responses to pull requests and outgoing pins update the cache
    */
+  template<typename Handle>
   class Addressbook {
   public:
 
-    Addressbook(): ranges(po.GetServerKeyRanges()) {
-      ownership = std::vector<OwnershipT>(myRange().size(), po.my_rank());
+    Addressbook(Handle& h): handle(h) {
+      ownership = std::vector<OwnershipT>(std::ceil(1.0*Postoffice::Get()->num_keys()/Postoffice::Get()->num_servers()), po.my_rank());
+      relocation_counters = std::vector<Version>(ownership.size(), 0);
 
       if (Postoffice::Get()->use_location_caches()) {
-        locationCache = std::vector<OwnershipT>(Postoffice::Get()->max_key(), NOT_CACHED);
-        useCache = true;
+        locationCache = std::vector<OwnershipT>(Postoffice::Get()->num_keys(), NOT_CACHED);
       }
     }
 
@@ -44,17 +44,15 @@ namespace ps {
      *
      * 1) returns the current owner of the given key if this PS is the mgr for the given key
      * 2) otherwise, (if desired with `checkCache`) checks whether the location of this key
-          is cached, returns the cached location if it is
+            is cached, returns the cached location if it is
      * 3) otherwise, returns the manager for the key
      */
-    unsigned int getDirections(Key key, const bool checkCache = false) {
-      // assert that the key is not local (should be checked before)
-
-      if(isManagedHere(key)) {
-        return ownerOfKey(key);
+    unsigned int getDirectionsUnsafe(Key key, const bool tryToUseLocationCache) {
+      if (isManagedHere(key)) {
+        return ownerOfKeyUnsafe(key);
       } else {
-        if (checkCache && useCache) {
-          auto locCache = getCache(key);
+        if (tryToUseLocationCache && Postoffice::Get()->use_location_caches()) {
+          auto locCache = getLocationCacheUnsafe(key);
           if (locCache != NOT_CACHED) {
             return locationCache[key];
           }
@@ -63,115 +61,116 @@ namespace ps {
       }
     }
 
+    // safe wrapper
+    unsigned int getDirections(Key key, const bool tryToUseLocationCache) {
+      handle.lockSingle(key);
+      auto directions = getDirectionsUnsafe(key, tryToUseLocationCache);
+      handle.unlockSingle(key);
+      return directions;
+    }
+
     /**
      * \brief update the ownership for a key that is managed by this PS
      *        Returns the previous owner.
      */
-    OwnershipT updateResidence(Key key, OwnershipT new_owner) {
+    OwnershipT updateResidence(Key key, OwnershipT new_owner, Version relocation_counter) {
       CHECK(isManagedHere(key)); // can update ownership only for the parameters that this PS manages
       CHECK(new_owner < po.num_servers()); // new_owner has to be a valid node
 
-      std::lock_guard<std::mutex> lck(mu_);
-      return updateResidenceUnsafe(key, new_owner);
+      handle.lockSingle(key);
+      auto ret = updateResidenceUnsafe(key, new_owner, relocation_counter);
+      handle.unlockSingle(key);
+      return ret;
     }
 
     /**
      * \brief update the ownership for a key that is managed by this PS
      *        Returns the previous owner.
      *
-     *        Warning: method is not thread safe. The caller needs to ensure safety manually via lock() and unlock()
+     *        Warning: method is not thread safe
      */
-    inline OwnershipT updateResidenceUnsafe(Key key, OwnershipT new_owner) {
-      auto old_owner = ownership[key-myRange().begin()];
-      ownership[key-myRange().begin()] = new_owner;
+    inline OwnershipT updateResidenceUnsafe(Key key, OwnershipT new_owner, Version relocation_counter) {
+      const auto key_pos = key_position(key);
+      auto old_owner = ownership[key_pos];
+      // we write the new residence only if it is newer than the one that we already have
+      // (in the current setup, it can happen that ownership updates overtake others)
+      if (relocation_counter > relocation_counters[key_pos]) {
+        ownership[key_pos] = new_owner;
+        relocation_counters[key_pos] = relocation_counter;
+      }
       return old_owner;
     }
 
-    // returns true if this node is the manager of this key
-    bool isManagedHere(Key key) {
-      return key >= myRange().begin() && key < myRange().end();
+    // is the node that we are on the manager of `key`?
+    inline bool isManagedHere (const Key key) const {
+      return static_cast<int>(getManager(key)) == po.my_rank();
     }
 
     // returns the manager of a key
-    inline unsigned int getManager(Key key) {
-      for(uint i=0; i!=ranges.size(); ++i) {
-        if(key < ranges[i].end()) {
-          return i;
-        }
+    inline unsigned int getManager(const Key key) const {
+      return key % po.num_servers();
+    }
+
+    inline void updateLocationCache(const Key key, const OwnershipT current_owner) {
+      handle.lockSingle(key);
+      updateLocationCacheUnsafe(key, current_owner);
+      handle.unlockSingle(key);
+    };
+
+    inline void updateLocationCacheUnsafe(const Key key, const OwnershipT current_owner) {
+      if (current_owner == po.my_rank()) {
+        // Ignore any update that tells us that this node is the owner.
+        // We might get updates like that when messages got forwarded a couple of times.
+        // In these cases, the location cache is probably stale, so let's reset it.
+        locationCache[key] = NOT_CACHED;
+      } else {
+        locationCache[key] = current_owner;
       }
-      CHECK(false) << "Fatal: key " << key << " is not in configured key range [0:" << Postoffice::Get()->max_key() << "). Check the configured maximum key.\n";; // should be found
-      return -1;
-    }
-
-    inline void updateCache(Key key, OwnershipT current_owner) {
-      std::lock_guard<std::mutex> lck(mu_);
-      updateCacheUnsafe(key, current_owner);
     };
 
-    inline void updateCacheUnsafe(Key key, OwnershipT current_owner) {
-      locationCache[key] = current_owner;
-    };
-
-    inline OwnershipT getCache(Key key) {
-      std::lock_guard<std::mutex> lck(mu_);
+    inline OwnershipT getLocationCacheUnsafe(const Key key) const {
       return locationCache[key];
-    }
-
-    // lock externally
-    inline void lock() {
-      mu_.lock();
-    }
-
-    // unlock externally
-    inline void unlock() {
-      mu_.unlock();
     }
 
   private:
 
     // returns the owner of a key that is managed by this PS
-    inline unsigned int ownerOfKey(Key key) {
+    inline unsigned int ownerOfKeyUnsafe (const Key key) const {
       // assert key is actually managed by this PS
       CHECK(isManagedHere(key));
 
-      std::lock_guard<std::mutex> lck(mu_);
-      return ownership[key-myRange().begin()];
+      return ownership[key_position(key)];
     }
 
-    inline const Range& myRange() const {
-      return ranges[po.my_rank()];
+    // at which position do we store the ownership and relocation counter for a key?
+    size_t key_position (const Key key) const {
+      return key / po.num_servers();
     }
 
     // Ownership storage: for each managed key, store the current owner of that key
     std::vector<OwnershipT> ownership;
-    std::mutex mu_;
+
+    // store to which relocation the residence information belongs
+    std::vector<Version> relocation_counters;
 
     // reference to post office (for more readable code)
     Postoffice& po = *Postoffice::Get();
 
-    // reference to the Postoffice server ranges (initialized in constructor)
-    const std::vector<Range>& ranges;
-
     // location cache
-    bool useCache = false;
     std::vector<OwnershipT> locationCache;
 
+    Handle& handle;
 
     // ---------------------------------------
     // debug functions
     void debugStr() {
-        printRanges();
-        printOwnership();
-    }
-    void printRanges() {
-      for(uint i=0; i!=ranges.size(); ++i) {
-        std::cout << "Range " << i << ": " << ranges[i].begin() << ":" << ranges[i].end() << "\n";
-      }
-    }
-    void printOwnership() {
       std::cout << "Ownership:" << "\n";
-      for(auto i=myRange().begin(); i!=myRange().end(); ++i) {
-        std::cout << "Key " << i << " at " << ownerOfKey(i) << "\n";
+      for(auto i=0; i!=Postoffice::Get()->num_keys(); ++i) {
+        if (isManagedHere(i)) {
+          handle.lockSingle(i);
+          std::cout << "Key " << i << " at " << ownerOfKeyUnsafe(i) << "\n";
+          handle.unlockSingle(i);
+        }
       }
     }
   }; // class Addressbook

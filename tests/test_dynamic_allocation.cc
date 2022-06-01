@@ -15,19 +15,16 @@ typedef ColoKVWorker<ValT, HandleT> WorkerT;
 
 
 // Config
-bool coloc = false;
 int num_keys = 36;
 size_t vpk = 2;
 
 bool error = false;
 
-bool replicate; // set by command line arg
 
 
 template <typename Val>
 void RunWorker(int customer_id, ServerT* server=nullptr) {
-  Start(customer_id);
-  WorkerT kv(0, customer_id, *server); // app_id, customer_id
+  WorkerT kv(customer_id, *server); // app_id, customer_id
 
   // wait for all workers to boot up
   kv.Barrier();
@@ -52,9 +49,10 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
       s << "w" << rank << ":" << customer_id << ": run " << run;
       // std::cout << s.str() << std::endl;
     }
-    // if(run == runs / NumServers() * rank && customer_id == 1) { // orderly consecutive localizes
-    if(run % 1000 == 0) { // chaos: everyone tries to localize constantly
-      ts_localize.push_back(kv.Localize(keys1));
+    // if(run == runs / NumServers() * rank && customer_id == 0) { // orderly consecutive localizes
+    if(rand() % 50 == 0) { // from time to time, send intent
+      kv.Intent(keys1, kv.currentClock()+10, kv.currentClock()+40);
+      // TEMP: no waiting for intent
     }
 
     vals1[0] = 1; //rand();
@@ -71,19 +69,21 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     // }
     // full async
     // don't wait at all
+    kv.advanceClock();
   }
 
   // wait for all requests before we continue
   for(auto timestamp : ts) kv.Wait(timestamp);
   for(auto timestamp : ts_pull) kv.Wait(timestamp);
-  for(auto timestamp : ts_localize) kv.Wait(timestamp);
+  // for(auto timestamp : ts_localize) kv.Wait(timestamp);
 
   std::cout << "Worker " << rank << ":" << customer_id << " is finished " << std::endl;
-  kv.WaitReplicaSync();
+  kv.WaitSync();
   kv.Barrier();
+  kv.WaitSync();
   duration.stop();
 
-  if(rank == 0 && customer_id == 1) {
+  if(rank == 0 && customer_id == 0) {
     kv.Wait(kv.Pull(keys1, &vals1));
     std::vector<uint> correct {static_cast<uint>(Postoffice::Get()->num_servers() * Postoffice::Get()->num_worker_threads() * runs), 0};
     correct[1] = correct[0] * 2;
@@ -93,47 +93,32 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     std::cout << "Time:  " << duration << "\n";
     if (static_cast<uint>(vals1[0]) == correct[0] &&
         vals1[1] == 2*vals1[0]) {
-      std::cout << "Dynamic Allocation" << (replicate ? " (with replication)" : "") << ": PASSED" << std::endl;
+      std::cout << "Dynamic Allocation: PASSED" << std::endl;
     } else {
-      std::cout << "Dynamic Allocation" << (replicate ? " (with replication)" : "") << ": FAILED" << std::endl;
+      std::cout << "Dynamic Allocation: FAILED" << std::endl;
       error = true;
     }
     std::cout << "--------------------------" << std::endl;
   }
 
+  kv.WaitSync();
+
   kv.Finalize();
-  Finalize(customer_id, false);
 }
 
 int main(int argc, char *argv[]) {
   int num_local_workers = 2;
-  Postoffice::Get()->enable_dynamic_allocation(num_keys, num_local_workers, false);
+  Setup(num_keys, num_local_workers);
 
-  // Colocate servers and workers into one process?
-  coloc = true;
   std::string role = std::string(getenv("DMLC_ROLE"));
 
   // co-locate server and worker threads into one process
   if (role.compare("scheduler") == 0) {
-    Start(0);
-    Finalize(0, true);
+    Scheduler();
   } else if (role.compare("server") == 0) { // worker+server
 
-    // replication
-    std::vector<Key> replicated_keys {};
-    if(argc > 1 && strcmp("replicate", argv[1]) == 0) {
-      ALOG("Replication: on");
-      replicated_keys = {9, 12, 15};
-      replicate = true;
-    } else {
-      ALOG("Replication: off");
-      replicate = false;
-    }
-
     // Start the server system
-    int server_customer_id = 0; // server gets customer_id=0, workers 1..n
-    Start(server_customer_id);
-    auto server = new ServerT(num_keys, vpk, &replicated_keys);
+    auto server = new ServerT(vpk);
     RegisterExitCallback([server](){ delete server; });
 
     // make sure all servers are set up
@@ -142,17 +127,16 @@ int main(int argc, char *argv[]) {
     // run worker(s)
     std::vector<std::thread> workers {};
     for (int i=0; i!=num_local_workers; ++i)
-      workers.push_back(std::thread(RunWorker<ValT>, i+1, server));
+      workers.push_back(std::thread(RunWorker<ValT>, i, server));
 
     // wait for the workers to finish
     for (size_t w=0; w!=workers.size(); ++w) {
       workers[w].join();
-      ADLOG("Customer r" << Postoffice::Get()->my_rank() << ":c" << w+1 << " joined");
+      ADLOG("Customer r" << Postoffice::Get()->my_rank() << ":c" << w << " joined");
     }
 
     // stop the server
     server->shutdown();
-    Finalize(server_customer_id, true);
 
   } else {
     LL << "Process started with unkown role '" << role << "'.";

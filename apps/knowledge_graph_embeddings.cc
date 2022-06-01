@@ -24,6 +24,7 @@
 #include <tuple>
 #include <cassert>
 #include <cstring>
+#include <regex>
 
 
 using namespace ps;
@@ -46,6 +47,8 @@ uint    rel_dim;
 double  eta;
 double  gamma_entity;
 double  gamma_relation;
+double  dropout_entity;
+double  dropout_relation;
 int     neg_ratio;
 uint    num_epochs;
 uint    num_threads;
@@ -65,13 +68,12 @@ unsigned model_seed;
 
 // System parameters
 bool async_push;
-bool localize_relations_initial;
-uint localize_parameters_ahead;
+bool signal_initial_relations_intent;
+uint signal_intent_ahead;
 bool read_partitioned_dataset;
-bool location_caches;
-bool shared_memory;
-bool init_parameters;
+std::string init_parameters;
 bool enforce_random_keys;
+bool enforce_full_replication;
 long max_N_per_thread;
 long max_runtime;
 
@@ -86,9 +88,7 @@ int num_serv; // number of servers
 std::vector<Key> key_assignment;
 
 Key loss_key;
-
-// Replication
-size_t  replicate; // number of parameters to replicate
+Key eval_key;
 
 // positions in eval vector (for distributed evaluation)
 const int _MRR_S     = 0;
@@ -118,9 +118,12 @@ static uniform_real_distribution<double> UNIFORM(0, 1);
 typedef tuple<int, int, int> triplet;
 
 
-// Parameter server functions
-inline const Key entity_key  (const int e) {
+inline Key entity_key  (const int e) {
   return enforce_random_keys ? key_assignment[e] : e;
+}
+
+inline Key relation_key (const int r) {
+  return enforce_random_keys ? key_assignment[ne+r] : ne+r;
 }
 
 
@@ -131,17 +134,6 @@ std::uniform_int_distribution<int> negs_dist;
 // Draw a negative sample
 inline Key DrawEntity() {
   return entity_key(negs_dist(negs_gen));
-}
-
-vector<Key> relation_keys(const int r){
-  if(algorithm == Alg::ComplEx){
-    vector<Key> vec_r{enforce_random_keys ? key_assignment[ne+r] : ne+r};
-    return vec_r;
-  } else {
-    vector<Key> vec_r(embed_dim);
-    std::iota(vec_r.begin(),vec_r.end(), enforce_random_keys ? key_assignment[ne+r] : ne+r*embed_dim);
-    return vec_r;
-  }
 }
 
 
@@ -215,22 +207,23 @@ vector<int> range(int n, int start=0) {  // 0 ... n-1
 
 // pull the entire model from the PS to local vectors
 void pull_full_model(std::vector<ValT>& E, std::vector<ValT>& R, WorkerT& kv) {
-  assert(!enforce_random_keys);
   util::Stopwatch sw_pull;
   sw_pull.start();
 
   // construct data structures for pull
   vector<Key> R_keys (nr);
-  if (algorithm == Alg::RESCAL){
-    R_keys.resize(nr*embed_dim);
+  for(unsigned int r=0; r!=nr; ++r) {
+    R_keys[r] = relation_key(r);
   }
-  std::iota(R_keys.begin(), R_keys.end(), ne);
   R.resize(nr * relation_vector_length);
-  vector<Key> E_keys (ne); std::iota(E_keys.begin(), E_keys.end(), 0);
+  vector<Key> E_keys (ne);
+  for(unsigned int e=0; e!=ne; ++e) {
+    E_keys[e] = entity_key(e);
+  }
   E.resize (ne * entity_vector_length);
 
   // pull
-  kv.WaitReplicaSync();
+  kv.WaitSync();
   kv.Wait(kv.Pull(E_keys, &E), kv.Pull(R_keys, &R));
 
   sw_pull.stop();
@@ -318,7 +311,6 @@ class Model {
 
 protected:
     double eta;
-    const double init_b = 1e-2;
     const double init_e = 1e-6;
 
     vector<vector<double>> E;
@@ -409,21 +401,17 @@ public:
     }
   }
 
-
-  // TEMP
-  // void load(const string& fname) {
-  //     ifstream ifs(fname, ios::in);
-
-  //     for (unsigned i = 0; i < E.size(); i++)
-  //         for (unsigned j = 0; j < E[i].size(); j++)
-  //             ifs >> E[i][j];
-
-  //     for (unsigned i = 0; i < R.size(); i++)
-  //         for (unsigned j = 0; j < R[i].size(); j++)
-  //             ifs >> R[i][j];
-
-  //     ifs.close();
-  // }
+  // randomly zeroes some elements of the given vector and scales
+  // other elements by 1 / (1-p)
+  void do_dropout(double* v, const size_t len, const double p) {
+    for (unsigned i = 0; i != len; i++) {
+      if (UNIFORM(GLOBAL_GENERATOR) < p) {
+        v[i] = 0;
+      } else {
+        v[i] *= 1 / (1-p);
+      }
+    }
+  }
 
     void adagrad_update(double* E_s, double* R_r, double* E_o,
                       double* d_s, double* d_r, double* d_o) {
@@ -457,7 +445,7 @@ public:
       vector<double> update_o  (embed_o.size());
 
       vector<Key> key_s (1);
-      vector<Key> key_r = relation_keys(r);
+      vector<Key> key_r {relation_key(r)};
       vector<Key> key_o (1);
       int ts_s, ts_r, ts_o;
 
@@ -467,7 +455,6 @@ public:
       } else { // true subject
         key_s[0] = entity_key(s);
         ts_s = kv.Pull(key_s, &embed_s);
-        if (localize_parameters_ahead != 0 && ts_s != -1) kv.Localize(key_s); // re-localize
       }
 
       // negative sample for the object?
@@ -476,7 +463,6 @@ public:
       } else { // true object
         key_o[0] = entity_key(o);
         ts_o = kv.Pull(key_o, &embed_o);
-        if (localize_parameters_ahead != 0 && ts_o != -1) kv.Localize(key_o); // re-localize
       }
 
       ts_r = kv.Pull(key_r, &embed_r);
@@ -489,6 +475,14 @@ public:
       double* d_r = update_r.data();
       double* d_o = update_o.data();
 
+      // dropout
+      if (dropout_entity != 0) {
+        do_dropout(E_s, embed_dim, dropout_entity);
+        do_dropout(E_o, embed_dim, dropout_entity);
+      }
+      if (dropout_relation != 0) {
+        do_dropout(R_r, rel_dim, dropout_relation);
+      }
 
       double offset = is_positive ? 1 : 0;
       double triple_score = score(E_s, R_r, E_o);
@@ -543,7 +537,7 @@ public:
   virtual void score_grad(double* E_s, double* R_r, double* E_o,
                           double* d_s, double* d_r, double* d_o) {};
 
-  virtual vector<double> init_ps(std::mt19937& gen) = 0;
+  virtual vector<double> init_ps(std::function<double()> init_rand) = 0;
 
 };// end Model
 
@@ -597,16 +591,16 @@ public:
         int N_per_node = ceil(1.0 * N / num_serv);
 
         // allocate evaluation vector (used to aggregated partial evaluation results on PS)
-        std::vector<Key> eval_key { num_keys };
+        std::vector<Key> eval_key_vec { eval_key };
         std::vector<ValT> eval (entity_vector_length);
 
         // reset the evaluation vector (might contain old values from last eval)
         if (worker_id == 0) {
-          kv.Wait(kv.Pull(eval_key, &eval));
+          kv.Wait(kv.Pull(eval_key_vec, &eval));
           for(size_t i=0; i!=eval.size(); ++i) {
             eval[i] = -eval[i];
           }
-          kv.Wait(kv.Push(eval_key, eval));
+          kv.Wait(kv.Push(eval_key_vec, eval));
         }
 
         // wait for reset to finish
@@ -680,7 +674,7 @@ public:
         eval[_HITS10_R] = hits10_r;
         eval[_HITS10_O] = hits10_o;
 
-        kv.Wait(kv.Push(eval_key, eval)); // push partial evaluation results
+        kv.Wait(kv.Push(eval_key_vec, eval)); // push partial evaluation results
 
         // wait for all nodes to finish evaluation
         Postoffice::Get()->Barrier(1, kServerGroup);
@@ -689,7 +683,7 @@ public:
         unordered_map<string, double> info;
         if (worker_id == 0) {
           // pull aggregated results form PS
-          kv.Wait(kv.Pull(eval_key, &eval));
+          kv.Wait(kv.Pull(eval_key_vec, &eval));
 
           info["mrr_s"] = eval[_MRR_S] / N;
           info["mrr_r"] = eval[_MRR_R] / N;
@@ -822,15 +816,13 @@ public:
         this->nh = nh;
   }
 
-  vector<double> init_ps(std::mt19937& gen) {
-    auto l = -init_b;
-    auto h = init_b;
+  vector<double> init_ps(std::function<double()> init_rand) {
     auto c = init_e;
     vector<double> matrix ((ne+nr) * embed_dim * 2);
     for (long i = 0; i!=ne+nr; ++i) {
       double* mpos = matrix.data() + i*nh*2;
       for (long j = 0; j!=nh; ++j) {
-        mpos[j] = (h-l)*UNIFORM(gen) + l;
+        mpos[j] = init_rand();
       }
       for (long j = nh; j != nh*2; ++j) {
         mpos[j] = c;
@@ -877,15 +869,13 @@ public:
     this->nh = nh;
   }
 
-  vector<double> init_ps(std::mt19937& gen) {
-    auto l = -init_b;
-    auto h = init_b;
+  vector<double> init_ps(std::function<double()> init_rand) {
     auto c = init_e;
     vector<double> matrix ((ne+nr*embed_dim) * embed_dim * 2);
     for (long i = 0; i!=ne; ++i) {
       double* mpos = matrix.data() + i*nh*2;
       for (long j = 0; j!=nh; ++j) {
-        mpos[j] = (h-l)*UNIFORM(gen) + l;
+        mpos[j] = init_rand();
       }
       for (long j = nh; j != nh*2; ++j) {
         mpos[j] = c;
@@ -894,7 +884,7 @@ public:
     for (long i = 0; i!=nr; ++i) {
       double* mpos = matrix.data() + ne*nh*2 + i*nh*nh*2;
       for (long j = 0; j!=nh*nh; ++j) {
-        mpos[j] = (h-l)*UNIFORM(gen) + l;
+        mpos[j] = init_rand();
       }
       for (long j = nh*nh; j != nh*nh*2; ++j) {
         mpos[j] = c;
@@ -934,77 +924,8 @@ public:
   }
 };
 
-
-// determine which parameters to replicate
-// we pick the N most frequent ones
-// if we partition by relations, we do not need to replicate (most) relations
-// exceptions: relations that were split up to multiple partitions due to their frequency
-std::vector<Key> determine_hotspot_keys(size_t N_hotspots) {
-  std::vector<Key> to_replicate;
-  if (N_hotspots == 0) return to_replicate;
-
-  to_replicate.reserve(N_hotspots);
-  string line;
-
-  // read which relations have not been partitioned
-  std::set<long> not_partitioned;
-  if (read_partitioned_dataset) {
-    ifstream nonp_ifs(dataset+tr_file+".nonpartitioned.relations.del", ios::in);
-    if (!nonp_ifs.fail()) {
-      long np;
-      while (getline(nonp_ifs, line)) {
-        stringstream ss(line);
-        ss >> np;
-        not_partitioned.insert(np);
-      }
-      nonp_ifs.close();
-    } else {
-      ADLOG("Did not find a list of non-partitioned relations. Assuming that all relations were partitioned.");
-    }
-    ADLOG("Non-partitioned relations: " << not_partitioned);
-  }
-
-  // open parameter frequency file an read line by line
-  ifstream ifs(dataset+"parameter.frequencies.tsv", ios::in);
-  assert(!ifs.fail());
-
-  char type;
-  Key param;
-  long freq;
-  while (getline(ifs, line)) {
-    stringstream ss(line);
-    ss >> type >> param >> freq;
-    if(type == 'r') {
-      if (!localize_relations_initial || not_partitioned.find(param) != not_partitioned.end()) {
-        // add to parameters
-        vector<Key> keys = relation_keys(param);
-        if (keys.size() + to_replicate.size() <= N_hotspots) {
-          std::copy (keys.begin(), keys.end(), std::back_inserter(to_replicate));
-        } else {
-          // (note: in RESCAL, a relation has more parameters than an entity)
-          ADLOG("Cannot replicate relation " << param << ": out of budget. Replicate " << N_hotspots-to_replicate.size() << " entities instead");
-        }
-      }
-    } else if (type == 'e') {
-      to_replicate.push_back(entity_key(param));
-    } else {
-      ADLOG("Unkown parameter type '" << type << "'");
-      assert(false);
-    }
-
-    if (to_replicate.size() == N_hotspots) {
-      break;
-    }
-  }
-
-  ADLOG("Replicate " << to_replicate.size() << " parameters: " << to_replicate << " (relations: >= " << ne <<")");
-  ifs.close();
-  return to_replicate;
-}
-
 // evaluate the current model (on train and validation set)
 void run_eval(const uint epoch, double& best_mrr, const int worker_id, WorkerT& kv) {
-  assert(!enforce_random_keys);
 
   std::vector<ValT> E {};
   std::vector<ValT> R {};
@@ -1041,11 +962,10 @@ void run_eval(const uint epoch, double& best_mrr, const int worker_id, WorkerT& 
 
 
 void RunWorker(int customer_id, ServerT* server=nullptr) {
-  Start(customer_id);
   std::unordered_map<std::string, util::Stopwatch> sw {};
-  WorkerT kv(0, customer_id, *server);
+  WorkerT kv(customer_id, *server);
 
-  int worker_id = ps::MyRank()*num_threads+customer_id-1; // a unique id for this worker thread
+  int worker_id = ps::MyRank()*num_threads+customer_id; // a unique id for this worker thread
 
   int N = sros_tr.size();
   int N_per_thread = ceil(1.0 * N / num_workers);
@@ -1054,36 +974,63 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
   ADLOG("Worker " << worker_id << " reads data points " << pi[0] << ".." << pi[pi.size()-1]);
   std::mt19937 gen_shuffle (model_seed^worker_id);
 
+  // replicate all keys on all nodes throughout training
+  // (sensible only in ablation experiments)
+  if (enforce_full_replication && customer_id == 0) {
+  	std::vector<Key> keys (num_keys);
+    std::iota(keys.begin(), keys.end(), 0);
+    kv.Intent(keys, 0, CLOCK_MAX);
+  }
+  kv.WaitSync();
+  kv.Barrier();
+  kv.WaitSync();
+
   // Initialize model
   kv.BeginSetup();
-  if (init_parameters && worker_id == 0) {
-    ADLOG("Init model (seed " << model_seed << ") ... ");
+  if (init_parameters != "none" && worker_id == 0) {
     vector<Key> keys (num_keys);
     std::iota(keys.begin(), keys.end(), 0);
     std::mt19937 gen_initial(model_seed);
-    vector<double> init_vals = model->init_ps(gen_initial);
+    vector<double> init_vals;
+    const std::regex uniform_regex("uniform\\{([-0-9\\+\\.e]+)/([-0-9\\+\\.e]+)\\}");
+    const std::regex normal_regex("normal\\{([-0-9\\+\\.e]+)/([-0-9\\+\\.e]+)\\}");
+    std::smatch matches;
+
+    if (std::regex_match(init_parameters, matches, uniform_regex)) { // uniform distribution
+      auto low = std::stod(matches[1].str());
+      auto high = std::stod(matches[2].str());
+      ADLOG("Init model (uniform{" << low << "/" << high <<"}, seed " << model_seed << ") ... ");
+      std::uniform_real_distribution<double> dist (low, high);
+      init_vals = model->init_ps([&dist, &gen_initial](){return dist(gen_initial);});
+
+    } else if (std::regex_match(init_parameters, matches, normal_regex)) { // normal distribution
+      auto mean = std::stod(matches[1].str());
+      auto std = std::stod(matches[2].str());
+      ADLOG("Init model (normal{" << mean << "/" << std <<"}, seed " << model_seed << ") ... ");
+      std::normal_distribution<double> dist (mean, std);
+      init_vals = model->init_ps([&dist, &gen_initial](){return dist(gen_initial);});
+
+    } else {
+      ALOG("Invalid init method: " << init_parameters);
+      abort();
+    }
+
     kv.Wait(kv.Push(keys, init_vals));
     ADLOG("Init model done: " << init_vals[0] << " " << init_vals[1] << " " << init_vals[2] << " ... ");
   }
   kv.EndSetup();
 
-  // Localize parameters of local relations
-  if (localize_relations_initial) {
-    std::set<Key> local_relations;
+  // Signal long-term intent for the parameters of local relations
+  if (signal_initial_relations_intent) {
+    std::unordered_set<Key> local_relations;
     for (int i = 0; i < N_per_thread; i++) {
       if(pi[i] >= N) continue;
       triplet sro = sros_tr[pi[i]];
       int r = get<1>(sro);
-      vector<Key> vec_r = relation_keys(r);
-      for(unsigned k = 0; k < vec_r.size(); k++){
-        Key key_r = vec_r[k];
-        local_relations.insert(key_r);
-      }
+      local_relations.insert(relation_key(r));
     }
-    std::vector<ps::Key> to_localize;
-    std::copy(local_relations.begin(), local_relations.end(), std::back_inserter(to_localize));
-    ADLOG("Worker " << worker_id << " localizes relations " << to_localize);
-    kv.Wait(kv.Localize(to_localize));
+    ADLOG("Worker " << worker_id << " has long-term intent for relations " << local_relations);
+    kv.Intent(std::move(local_relations), 0, CLOCK_MAX);
   }
   kv.Barrier();
 
@@ -1093,7 +1040,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
   // initial evaluation
   if (eval_freq != -1 && run_initial_evaluation) {
     // the first worker on each node runs the evaluation
-    if (customer_id == 1) {
+    if (customer_id == 0) {
       run_eval(0, best_mrr, worker_id, kv);
     }
     kv.Barrier(); // wait for evaluation to finish
@@ -1109,35 +1056,42 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     double bce_loss = 0;
     double reg_loss = 0;
     int i_future = 0;
+
+    // iterate over data points
     for (int i = 0; i < N_per_thread; i++) {
-      // Localize embeddings for positive entities that we will need in a future data point
-      // In the first loop iteration, we localize for multiple data points
-      // In later iterations, we localize for exactly one future data point
-      if (localize_parameters_ahead != 0) {
-        while (i_future <= i+static_cast<int>(localize_parameters_ahead) && i_future < N_per_thread) {
-          if(pi[i_future] >= N) {
-            ++i_future;
-            continue;
-          }
-
-          // positive samples
-          auto sro_f = sros_tr[pi[i_future]];
-          vector<Key> localize; localize.reserve((1+neg_ratio) * 2);
-          localize.push_back(entity_key  (get<0>(sro_f)));
-          localize.push_back(entity_key  (get<2>(sro_f)));
-          vector<Key> keys = relation_keys(get<1>(sro_f));
-          std::copy (keys.begin(), keys.end(), std::back_inserter(localize));
-
-          // negative samples: use sampling support of the parameter server
-          sample_ids[i_future] = kv.PrepareSample(neg_ratio * 2);
-
-          kv.Localize(localize);
+      // Prepare future data points. In the first loop iteration, we prepare
+      // multiple data points. In later iterations, we prepare exactly one
+      // future data point
+      while (i_future <= i+static_cast<int>(signal_intent_ahead) && i_future < N_per_thread) {
+        if(pi[i_future] >= N) {
           ++i_future;
+          continue;
         }
+
+        auto futureClock = kv.currentClock()+i_future-i;
+
+        // prepare sample (for negative samples)
+        sample_ids[i_future] = kv.PrepareSample(neg_ratio * 2, futureClock);
+
+        // signal intent for (positive) entities and relations of this data point
+        if (signal_intent_ahead != 0) {
+          auto sro_f = sros_tr[pi[i_future]];
+          std::unordered_set<Key> intent;
+          intent.insert(entity_key  (get<0>(sro_f)));
+          intent.insert(relation_key(get<1>(sro_f)));
+          intent.insert(entity_key  (get<2>(sro_f)));
+
+          kv.Intent(std::move(intent), futureClock);
+        }
+
+        ++i_future;
       }
 
       // the last worker can have less than N_per_thread data points
-      if(pi[i] >= N) continue;
+      if(pi[i] >= N) {
+        kv.advanceClock();
+        continue;
+      }
 
       // run only first N data points per thread (for fast testing)
       if (max_N_per_thread != -1 && i >= max_N_per_thread) {
@@ -1166,6 +1120,8 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
         model->train(ss, r, o, false, kv, bce_loss, reg_loss);
 
       }
+
+      kv.advanceClock();
     }
 
     // make sure all workers finished
@@ -1177,8 +1133,8 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
     // calculate global training loss
     long long num_train_steps = static_cast<long long>(N) * (1+neg_ratio*2);
-    auto global_bce_loss = ps_allreduce(bce_loss, worker_id, static_cast<Key>(num_keys), kv) / num_train_steps;
-    auto global_reg_loss = ps_allreduce(reg_loss, worker_id, static_cast<Key>(num_keys), kv) / num_train_steps;
+    auto global_bce_loss = ps_allreduce(bce_loss, worker_id, loss_key, kv) / num_train_steps;
+    auto global_reg_loss = ps_allreduce(reg_loss, worker_id, loss_key, kv) / num_train_steps;
     auto global_loss = global_bce_loss + global_reg_loss;
 
     if (worker_id == 0) {
@@ -1186,6 +1142,8 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     }
 
     // save checkpoint
+    kv.WaitSync();
+    kv.Barrier();
     if (worker_id == 0 && !model_path.empty() && epoch % save_every_nth_epoch == 0) {
       model->save(epoch, model_path, kv, true, write_end_checkpoint && epoch == num_epochs);
     }
@@ -1194,7 +1152,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     // evaluation
     if (eval_freq != -1 && epoch % eval_freq == 0) {
       // the first worker on each node runs the evaluation
-      if (customer_id == 1) {
+      if (customer_id == 0) {
         run_eval(epoch, best_mrr, worker_id, kv);
       }
     }
@@ -1210,7 +1168,6 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
   }
 
   kv.Finalize();
-  Finalize(customer_id, false);
 }
 
 
@@ -1230,19 +1187,19 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("eta", po::value<double>(&eta)->default_value(0.1), "initial learning rate")
     ("gamma_entity", po::value<double>(&gamma_entity)->default_value(1e-3), "regularization for entities")
     ("gamma_relation", po::value<double>(&gamma_relation)->default_value(1e-3), "regularization for relations")
+    ("dropout_entity", po::value<double>(&dropout_entity)->default_value(0), "During training, randomly zeroes elements of entity embeddings with probability `dropout`. We scale other elements with a factor of 1/(1-p).")
+    ("dropout_relation", po::value<double>(&dropout_relation)->default_value(0), "During training, randomly zeroes elements of relation embeddings with probability `dropout`. 0-> no dropout. We scale other elements with a factor of 1/(1-p).")
     ("neg_ratio", po::value<int>(&neg_ratio)->default_value(6), "negative ratio")
-    ("eval_freq", po::value<int>(&eval_freq)->default_value(1), "evaluation frequency")
+    ("eval_freq", po::value<int>(&eval_freq)->default_value(-1), "evaluation frequency")
     ("num_entities", po::value<long>(&ne)->default_value(14951), "number of entities")
     ("num_relations", po::value<long>(&nr)->default_value(1345), "number of relations")
-    ("localize_parameters_ahead", po::value<uint>(&localize_parameters_ahead)->default_value(0), "number of triples to look ahead")
-    ("async_push", po::value<bool>(&async_push)->default_value(false), "push synchronously (default) or asynchronously (true)")
-    ("localize_relations_initial", po::value<bool>(&localize_relations_initial)->default_value(false), "whether relations are partitioned (true) or not (default)")
-    ("read_partitioned_dataset", po::value<bool>(&read_partitioned_dataset)->default_value(true), "read partitioned dataset")
-    ("location_caches", po::value<bool>(&location_caches)->default_value(false), "use location caches")
-    ("shared_memory", po::value<bool>(&shared_memory)->default_value(true), "use shared memory to access local parameters")
-    ("init_parameters", po::value<bool>(&init_parameters)->default_value(true), "initialize parameters")
+    ("signal_intent_ahead", po::value<uint>(&signal_intent_ahead)->default_value(1000), "number of triples to look ahead")
+    ("async_push", po::value<bool>(&async_push)->default_value(true), "push synchronously (false) or asynchronously (true, default)")
+    ("signal_initial_relations_intent", po::value<bool>(&signal_initial_relations_intent)->default_value(false), "whether to signal long-term intent for relations or not")
+    ("read_partitioned_dataset", po::value<bool>(&read_partitioned_dataset)->default_value(false), "read partitioned dataset")
+    ("init_parameters", po::value<string>(&init_parameters)->default_value("normal{0,0.1}"), "initialize parameters, possible: 'none', 'uniform{a,b}', 'normal{mean,std}'")
     ("enforce_random_keys", po::value<bool>(&enforce_random_keys)->default_value(false), "enforce that keys are assigned randomly")
-    ("replicate", po::value<size_t>(&replicate)->default_value(0), "number of parameters to replicate")
+    ("enforce_full_replication", po::value<bool>(&enforce_full_replication)->default_value(false), "manually enforce full model replication")
     ("eval_truncate_tr", po::value<size_t>(&eval_truncate_tr)->default_value(2048), "truncate training dataset in evaluation (0 for no truncation)")
     ("eval_truncate_va", po::value<size_t>(&eval_truncate_va)->default_value(0), "truncate validation dataset in evaluation (0 for no truncation)")
     ("eval_initial", po::value<bool>(&run_initial_evaluation)->default_value(false), "run initial evaluation (default: no)")
@@ -1267,6 +1224,13 @@ int process_program_options(const int argc, const char *const argv[]) {
     return 1;
   }
 
+  if (dropout_entity < 0 || dropout_entity > 1 ||
+      dropout_relation < 0 || dropout_relation > 1) {
+    cout << "Dropout probability should be in the range 0 <= p <= 1. Given " << dropout_entity << " for entities and " << dropout_relation << " for relations. Usage:\n\n";
+    cout << desc << "\n";
+    return 1;
+  }
+
   return 0;
 }
 
@@ -1279,16 +1243,15 @@ int main(int argc, char *argv[]) {
 
   // set model
   entity_vector_length   = embed_dim * 2;
+  num_keys = ne + nr;
   if (alg == "RESCAL") {
     rel_dim = embed_dim * embed_dim;
     relation_vector_length = embed_dim * embed_dim * 2;
     model = new Rescal (ne, nr, embed_dim, eta);
-    num_keys = ne + nr * embed_dim;
     algorithm = Alg::RESCAL;
   } else if (alg == "ComplEx") {
     rel_dim = embed_dim;
     relation_vector_length = entity_vector_length;
-    num_keys = ne + nr;
     model = new Complex (ne, nr, embed_dim, eta);
     algorithm = Alg::ComplEx;
   } else {
@@ -1304,40 +1267,16 @@ int main(int argc, char *argv[]) {
 
     srand(2); // enforce same seed among different ranks
     random_shuffle(key_assignment.begin(), key_assignment.end());
-
-    // special treatment for RESCAL, because relation parameters can span multiple keys
-    // in detail, each relation maps to `embed_dim` keys
-    // so we add key space after each relation parameter
-    if (algorithm == Alg::RESCAL) {
-      vector<Key> relation_positions;
-      std::copy(key_assignment.begin()+ne, key_assignment.end(), std::back_inserter(relation_positions));
-      sort(relation_positions.begin(), relation_positions.end());
-      for (size_t i=0; i!=key_assignment.size(); ++i) {
-        // how many relations occur before this?
-        auto adjust = lower_bound(relation_positions.begin(), relation_positions.end(), key_assignment[i]) - relation_positions.begin();
-        key_assignment[i] = key_assignment[i] + adjust * (embed_dim-1);
-      }
-    }
   }
 
-  // require vector length of at least 20 for distributed evaluation
-  if (eval_freq != -1) {
-    assert(entity_vector_length >= 20);
-  }
-
-  // enable dynamic parameter allocation
-  Postoffice::Get()->enable_dynamic_allocation(num_keys+1, num_threads, location_caches);
-  Postoffice::Get()->set_shared_memory_access(shared_memory);
-
-  // set up replication
-  vector<Key> hotspot_keys = determine_hotspot_keys(replicate);
+  // setup PS
+  Setup(num_keys+2, num_threads);
 
   std::string role = std::string(getenv("DMLC_ROLE"));
-  std::cout << "kge. Starting " << role << ": running " << num_epochs << " epochs of " << alg << " on " << ne << " entities and " << nr << " relations (" << embed_dim << " depth) on " << dataset << "\n" << num_threads << " threads, " << neg_ratio << " neg_ratio, " << eval_freq << " eval_freq, " << eta << " eta, " << gamma_entity << " gamma entity, " << gamma_relation << " gamma relation, \nasync push " << async_push << ", localize parameters ahead " << localize_parameters_ahead << ", localize relations (initial) " << localize_relations_initial << ", read partitioned dataset " << read_partitioned_dataset << " (" << tr_file << "), enforce_random_keys " << enforce_random_keys << ", replicate " << replicate << ". \n" << ReplicaManager<ValT,HandleT>::PrintOptions() << "\n";
+  ALOG("kge. Starting " << role << ": running " << num_epochs << " epochs of " << alg << " on " << ne << " entities and " << nr << " relations (" << embed_dim << " depth) on " << dataset << "\n" << num_threads << " threads, " << neg_ratio << " neg_ratio, " << eval_freq << " eval_freq, " << eta << " eta, " << gamma_entity << " gamma entity, " << gamma_relation << " gamma relation, \nasync push " << async_push << ", signal intent ahead " << signal_intent_ahead << ", initial relations intent signal " << signal_initial_relations_intent << ", read partitioned dataset " << read_partitioned_dataset << " (" << tr_file << "), enforce_random_keys " << enforce_random_keys << ". \n" << (SyncManager<ValT,HandleT>::PrintOptions()));
 
   if (role.compare("scheduler") == 0) {
-    Start(0);
-    Finalize(0, true);
+    Scheduler();
   } else if (role.compare("server") == 0) { // worker+server
 
 
@@ -1346,7 +1285,6 @@ int main(int argc, char *argv[]) {
     sros_va = create_sros(dataset + "valid.del");
     sros_te = create_sros(dataset + "test.del");
 
-    // TODO-impr: could read this only on the first server
     sros_al.insert(sros_al.end(), sros_tr.begin(), sros_tr.end());
     sros_al.insert(sros_al.end(), sros_va.begin(), sros_va.end());
     sros_al.insert(sros_al.end(), sros_te.begin(), sros_te.end());
@@ -1357,10 +1295,20 @@ int main(int argc, char *argv[]) {
     evaluator_va = new Evaluator(ne, nr, sros_va, sro_bucket_al);
     evaluator_tr = new Evaluator(ne, nr, sros_tr, sro_bucket_al);
 
+    // Value lengths of keys
+    std::vector<size_t> value_lengths {};
+    value_lengths.reserve(ne+nr+2);
+    for (long i=0; i!=ne; ++i) value_lengths.push_back(entity_vector_length); // entity embeddings
+    for (long i=0; i!=nr; ++i) value_lengths.push_back(relation_vector_length); // relation embeddings
+    // loss key
+    loss_key = static_cast<Key>(num_keys);
+    value_lengths.push_back(1);
+    // eval key
+    eval_key = static_cast<Key>(num_keys+1);
+    value_lengths.push_back(20);
+
     // Start the server system
-    int server_customer_id = 0; // server gets customer_id=0, workers 1..n
-    Start(server_customer_id);
-    auto server = new ServerT(num_keys+1, entity_vector_length, &hotspot_keys);
+    auto server = new ServerT(value_lengths);
     RegisterExitCallback([server](){ delete server; });
 
     num_workers = ps::NumServers() * num_threads;
@@ -1377,7 +1325,7 @@ int main(int argc, char *argv[]) {
     // run worker(s)
     std::vector<std::thread> workers {};
     for (size_t i=0; i!=num_threads; ++i) {
-      workers.push_back(std::thread(RunWorker, i+1, server));
+      workers.push_back(std::thread(RunWorker, i, server));
       std::string name = std::to_string(ps::MyRank())+"-worker-"+std::to_string(ps::MyRank()*num_threads + i);
       SET_THREAD_NAME((&workers[workers.size()-1]), name.c_str());
     }
@@ -1388,6 +1336,5 @@ int main(int argc, char *argv[]) {
 
     // stop the server
     server->shutdown();
-    Finalize(server_customer_id, true);
   }
 }

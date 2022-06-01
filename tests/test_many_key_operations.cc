@@ -18,6 +18,7 @@ int num_threads = 4;
 size_t num_keys = 10000;
 size_t vpk = 10;
 size_t runs = 5000;
+size_t signal_intent_ahead = 1000;
 size_t max_keys_at_a_time = 1000;
 
 
@@ -25,8 +26,8 @@ size_t max_concurrent_loops = 10;
 long process_errors = 0;
 
 bool quick;
-bool replicate;
 
+std::stringstream variant;
 
 // generate a list of random keys (for now, a unique list) // TODO: include duplicates
 std::vector<Key> random_keys(const size_t num_keys, const size_t max_n=2000) {
@@ -49,18 +50,10 @@ std::vector<Key> random_keys(const size_t num_keys, const size_t max_n=2000) {
 
 template <typename Val>
 void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
-  Start(customer_id);
-  WorkerT kv(0, customer_id, *server); // app_id, customer_id
-  int worker_id = ps::MyRank()*num_threads+customer_id-1; // a unique id for this worker thread
+  WorkerT kv(customer_id, *server); // app_id, customer_id
+  int worker_id = ps::MyRank()*num_threads+customer_id; // a unique id for this worker thread
   long worker_errors = 0;
   long worker_correct = 0;
-
-  std::stringstream reptype;
-  if (replicate) {
-    reptype << " (with ";
-    reptype <<  ReplicaManager<ValT,HandleT>::get_rsm();
-    reptype << " replication)";
-  }
 
   // wait for all workers to boot up
   kv.Barrier();
@@ -84,7 +77,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
   if (worker_id == 0) {
     kv.Wait(kv.Push(all_keys, init_vals));
   }
-  kv.WaitReplicaSync();
+  kv.WaitSync();
   kv.Barrier();
 
   std::vector<std::vector<Key>> push_keys (runs);
@@ -95,18 +88,28 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
   std::vector<int> pull_ts (runs);
   std::vector<int> push_ts (runs);
 
+  srand(worker_id^13);
 
   // ---------------------------------------------------------------
   // pulls and localizes
 
-  // run workload (pulls and localizes)
+  // generate the workload
   for(size_t i=0; i!=runs; ++i) {
-    // localize a random list of keys
     loc_keys[i] = random_keys(num_keys, max_keys_at_a_time);
-    kv.Localize(loc_keys[i]);
+    pull_keys[i] = random_keys(num_keys, max_keys_at_a_time);
+  }
+
+  // run workload (pulls and localizes)
+  for(size_t i=0, i_future=0; i!=runs; ++i) {
+
+    // signal intent for some random keys
+    while (i_future <= i+signal_intent_ahead && i_future < runs) {
+      auto futureClock = kv.currentClock()+i_future-i;
+      kv.Intent(loc_keys[i_future], futureClock);
+      ++i_future;
+    }
 
     // pull a random list of keys
-    pull_keys[i] = random_keys(num_keys, max_keys_at_a_time);
     pull_vals[i].resize(pull_keys[i].size() * vpk, 12);
     pull_ts[i] = kv.Pull(pull_keys[i], &(pull_vals[i]));
 
@@ -114,6 +117,8 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
     if (i > max_concurrent_loops) {
       kv.Wait(pull_ts[i-max_concurrent_loops]);
     }
+
+    kv.advanceClock();
   }
 
   // check
@@ -125,7 +130,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
         auto pulled = pull_vals.at(run).at(k*vpk+z);
         auto correct = init_vals[key*vpk+z];
         if (pulled != correct) {
-          ADLOG(worker_id << ", run " << run << " Key " << key << ", pos " << z << ": pulled " << pulled << ", but has to be " << correct);
+          ALOG(worker_id << ", run " << run << " Key " << key << ", pos " << z << ": pulled " << pulled << ", but has to be " << correct);
           ++worker_errors;
         } else {
           ++worker_correct;
@@ -133,15 +138,15 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
       }
     }
   }
-  ADLOG("Worker " << worker_id << ": " << worker_errors << " of " << worker_errors+worker_correct << " vals wrong (" << 100.0 * worker_errors / (worker_correct + worker_errors) << "%)");
+  ALOG("Worker " << worker_id << ": " << worker_errors << " of " << worker_errors+worker_correct << " vals wrong (" << 100.0 * worker_errors / (worker_correct + worker_errors) << "%)");
 
   process_errors += worker_errors;
   kv.WaitAll();
   kv.Barrier();
-  ADLOG("Pulls and Localizes" << reptype.str() << ", w" << worker_id << ": " << (worker_errors != 0 ? "FAILED" : "PASSED") << " (" << worker_errors << " errors)");
+  ALOG("Pulls and Localizes" << variant.str() <<", w" << worker_id << ": " << (worker_errors != 0 ? "FAILED" : "PASSED") << " (" << worker_errors << " errors)");
   kv.Barrier();
   duration.stop();
-  if (worker_id == 0) { ADLOG("Pulls and localizes test took " << duration); }
+  if (worker_id == 0) { ALOG("Pulls and localizes test took " << duration); }
 
 
 
@@ -155,20 +160,38 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
   worker_errors = 0;
   worker_correct = 0;
 
+  // generate workload
+  for(size_t i=0; i!=runs; ++i) {
+    loc_keys[i] = random_keys(num_keys, max_keys_at_a_time);
+    pull_keys[i] = random_keys(num_keys, max_keys_at_a_time);
+    push_keys[i] = random_keys(num_keys, max_keys_at_a_time);
+  }
+
+  bool init = false;
 
   // run workload (pushs, pulls, localizes)
-  for(size_t i=0; i!=runs; ++i) {
-    // localize a random list of keys
-    loc_keys[i] = random_keys(num_keys, max_keys_at_a_time);
-    kv.Localize(loc_keys[i]);
+  for(size_t i=0, i_future=0; i!=runs; ++i) {
+
+    // signal intent
+    while (i_future <= i+signal_intent_ahead && i_future < runs) {
+      auto futureClock = kv.currentClock()+i_future-i;
+      kv.Intent(pull_keys[i_future], futureClock);
+      kv.Intent(push_keys[i_future], futureClock);
+      kv.Intent(loc_keys[i_future], futureClock);
+      ++i_future;
+    }
+
+    // make sure intent is processed
+    if(!init) {
+      kv.WaitSync();
+      init = true;
+    }
 
     // pull a random list of keys
-    pull_keys[i] = random_keys(num_keys, max_keys_at_a_time);
     pull_vals[i].resize(pull_keys[i].size() * vpk, 12);
     pull_ts[i] = kv.Pull(pull_keys[i], &(pull_vals[i]));
 
     // push a random list of keys
-    push_keys[i] = random_keys(num_keys, max_keys_at_a_time);
     push_vals[i].resize(push_keys[i].size() * vpk, 12);;
     for(size_t k=0; k!=push_keys[i].size(); ++k) {
       for(size_t z=0; z!=vpk; ++z) {
@@ -183,14 +206,19 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
     if (i > max_concurrent_loops) {
       kv.Wait(pull_ts[i-max_concurrent_loops]);
     }
+
+    kv.advanceClock();
   }
 
   // check
-  kv.WaitReplicaSync();
+  kv.WaitSync();
   kv.Barrier();
 
   for (size_t run=0; run<runs; ++run) {
     kv.Wait(pull_ts[run]);
+    if (pull_ts[run] != -1) {
+      ALOG(worker_id << ", monotonic pushs: pull " << run << " was not local");
+    }
     // check pulls
     for (size_t k=0; k!=pull_keys[run].size(); ++k) {
       Key key = pull_keys[run][k];
@@ -198,7 +226,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
         auto pulled = pull_vals.at(run).at(k*vpk+z);
         auto correct = init_vals[key*vpk+z];
         if (pulled < correct) {
-          ADLOG(worker_id << ", run " << run << " Key " << key << ", pos " << z << ": pulled " << pulled << ", but has to be at least " << correct);
+          ALOG(worker_id << ", run " << run << " Key " << key << ", pos " << z << ": pulled " << pulled << ", but has to be at least " << correct);
           ++worker_errors;
         } else {
           ++worker_correct;
@@ -214,15 +242,15 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
     }
   }
 
-  ADLOG("Worker " << worker_id << ": " << worker_errors << " of " << worker_errors+worker_correct << " vals wrong (" << 100.0 * worker_errors / (worker_correct + worker_errors) << "%)");
+  ALOG("Worker " << worker_id << ": " << worker_errors << " of " << worker_errors+worker_correct << " vals wrong (" << 100.0 * worker_errors / (worker_correct + worker_errors) << "%)");
 
   process_errors += worker_errors;
   kv.WaitAll();
   kv.Barrier();
-  ADLOG("Monotonic pushs" << reptype.str() << ", w" << worker_id << ": " << (worker_errors != 0 ? "FAILED" : "PASSED") << " (" << worker_errors << " errors)");
+  ALOG("Monotonic pushs" << variant.str() << ", w" << worker_id << ": " << (worker_errors != 0 ? "FAILED" : "PASSED") << " (" << worker_errors << " errors)");
   kv.Barrier();
   duration.stop();
-  if (worker_id == 0) { ADLOG("Monotonic pushs test took " << duration); }
+  if (worker_id == 0) { ALOG("Monotonic pushs test took " << duration); }
 
 
 
@@ -243,15 +271,23 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
   kv.Wait(kv.Pull(all_keys, &vals_before));
   kv.Barrier();
 
+  // generate workload
+  for(size_t i=0; i!=runs; ++i) {
+    loc_keys[i] = random_keys(num_keys, max_keys_at_a_time);
+    push_keys[i] = random_keys(num_keys, max_keys_at_a_time);
+  }
 
   // run workload (pushs, localizes)
-  for(size_t i=0; i!=runs; ++i) {
-    // localize a random list of keys
-    loc_keys[i] = random_keys(num_keys, max_keys_at_a_time);
-    kv.Localize(loc_keys[i]);
+  for(size_t i=0, i_future=0; i!=runs; ++i) {
+
+    // signal intent
+    while (i_future <= i+signal_intent_ahead && i_future < runs) {
+      auto futureClock = kv.currentClock()+i_future-i;
+      kv.Intent(loc_keys[i_future], futureClock);
+      ++i_future;
+    }
 
     // push a random list of keys
-    push_keys[i] = random_keys(num_keys, max_keys_at_a_time);
     push_vals[i].resize(push_keys[i].size() * vpk, 12);;
     for(size_t k=0; k!=push_keys[i].size(); ++k) {
       Key key = push_keys[i][k];
@@ -268,16 +304,23 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
     if (i > max_concurrent_loops) {
       kv.Wait(push_ts[i-max_concurrent_loops]);
     }
+
+    kv.advanceClock();
   }
 
   // revert the pushs of this worker
   kv.Push(all_keys, total_pushed);
 
-  // check
+  // make sure all updates are propagated to the main replicas
   kv.WaitAll();
-  kv.WaitReplicaSync();
+  kv.WaitSync();
   kv.Barrier();
 
+  // make sure this node receives all updates
+  kv.WaitSync();
+  kv.Barrier();
+
+  // check
   std::vector<Val> vals_after (num_keys*vpk);
   kv.Wait(kv.Pull(all_keys, &vals_after));
 
@@ -287,7 +330,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
       auto before = vals_before[key*vpk+z];
       auto after = vals_after[key*vpk+z];
       if (before != after) {
-        ADLOG(worker_id << ", Key " << key << ", pos " << z << ", before!=after: " << before << "!=" << after << " (diff: " << after-before << ")");
+        ALOG(worker_id << ", Key " << key << ", pos " << z << ", before!=after: " << before << "!=" << after << " (diff: " << after-before << ")");
         ++worker_errors;
       } else {
         ++worker_correct;
@@ -295,20 +338,19 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
     }
   }
 
-  ADLOG("Worker " << worker_id << ": " << worker_errors << " of " << worker_errors+worker_correct << " vals wrong (" << 100.0 * worker_errors / (worker_correct + worker_errors) << "%)");
+  ALOG("Worker " << worker_id << ": " << worker_errors << " of " << worker_errors+worker_correct << " vals wrong (" << 100.0 * worker_errors / (worker_correct + worker_errors) << "%)");
 
   process_errors += worker_errors;
   kv.WaitAll();
   kv.Barrier();
-  ADLOG("Eventual consistency" << reptype.str() << ", w" << worker_id << ": " << (worker_errors != 0 ? "FAILED" : "PASSED") << " (" << worker_errors << " errors) ");
+  ALOG("Eventual consistency" << variant.str() << ", w" << worker_id << ": " << (worker_errors != 0 ? "FAILED" : "PASSED") << " (" << worker_errors << " errors) ");
   kv.Barrier();
   duration.stop();
-  if (worker_id == 0) { ADLOG("Eventual consistency test took " << duration); }
+  if (worker_id == 0) { ALOG("Eventual consistency test took " << duration); }
 
 
 
   kv.Finalize();
-  Finalize(customer_id, barrier);
 }
 
 
@@ -317,7 +359,6 @@ int process_program_options(const int argc, const char *const argv[]) {
   po::options_description desc("Allowed options");
   desc.add_options()
     ("quick", po::bool_switch(&quick)->default_value(false), "quick mode")
-    ("replicate", po::bool_switch(&replicate)->default_value(false), "replicate")
     ;
 
   // add system options
@@ -335,40 +376,32 @@ int main(int argc, char *argv[]) {
   if(po_error) return 1;
 
 
+  variant << " (";
   if(quick) {
+    variant << "quick";
     ALOG("Quick mode: run a lighter workload");
     runs = 500;
     num_threads = 2;
     num_keys = 100;
     max_keys_at_a_time = 20;
   } else {
+    variant << "heavy";
     ALOG("Heavy mode: run full workload");
   }
 
-  std::vector<Key> hotspot_keys {};
-  if (replicate) {
-    for(Key k=0; k<num_keys; k+=5) {
-      hotspot_keys.push_back(k);
-    }
-    ALOG("Replication: on (" << hotspot_keys.size() << " of " << num_keys << " keys)");
-  } else {
-    ALOG("Replication: off");
-  }
+  variant << ", tech " << Postoffice::Get()->management_techniques() << ", loc. caches " << Postoffice::Get()->use_location_caches() << ")";
 
-  Postoffice::Get()->enable_dynamic_allocation(num_keys, num_threads, false);
+  Setup(num_keys, num_threads);
 
   std::string role = std::string(getenv("DMLC_ROLE"));
 
   // co-locate server and worker threads into one process
   if (role.compare("scheduler") == 0) {
-    Start(0);
-    Finalize(0, true);
+    Scheduler();
   } else if (role.compare("server") == 0) { // worker+server
 
     // Start the server system
-    int server_customer_id = 0; // server gets customer_id=0, workers 1..n
-    Start(server_customer_id);
-    auto server = new ServerT(num_keys, vpk, &hotspot_keys);
+    auto server = new ServerT(vpk);
     RegisterExitCallback([server](){ delete server; });
 
     // make sure all servers are set up
@@ -376,8 +409,11 @@ int main(int argc, char *argv[]) {
 
     // run worker(s)
     std::vector<std::thread> workers {};
-    for (int i=0; i!=num_threads; ++i)
-      workers.push_back(std::thread(RunWorker<ValT>, i+1, false, server));
+    for (int i=0; i!=num_threads; ++i) {
+      workers.push_back(std::thread(RunWorker<ValT>, i, false, server));
+      std::string name = std::to_string(ps::MyRank())+"-worker-"+std::to_string(ps::MyRank()*num_threads + i);
+      SET_THREAD_NAME((&workers[workers.size()-1]), name.c_str());
+    }
 
     // wait for the workers to finish
     for (size_t w=0; w!=workers.size(); ++w) {
@@ -386,7 +422,6 @@ int main(int argc, char *argv[]) {
 
     // stop the server
     server->shutdown();
-    Finalize(server_customer_id, true);
 
   } else {
     LL << "Process started with unkown role '" << role << "'.";

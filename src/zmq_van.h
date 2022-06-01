@@ -100,11 +100,7 @@ class ZMQVan : public Van {
     if (it != senders_.end()) {
       zmq_close(it->second);
     }
-    // worker doesn't need to connect to the other workers. same for server
-    // unless we are co-locating. then we want servers to connect to other servers [sysChange]
-    if (!Postoffice::Get()->coloc() && ((node.role == my_node_.role) && (node.id != my_node_.id))) {
-      return;
-    }
+
     void *sender = zmq_socket(context_, ZMQ_DEALER);
     CHECK(sender != NULL)
         << zmq_strerror(errno)
@@ -126,6 +122,12 @@ class ZMQVan : public Van {
   }
 
   int SendMsg(const Message& msg) override {
+    // pack meta and initialize message data
+    int meta_size; char* meta_buf;
+    PackMeta(msg.meta, &meta_buf, &meta_size);
+    zmq_msg_t meta_msg;
+    zmq_msg_init_data(&meta_msg, meta_buf, meta_size, FreeData, NULL);
+
     std::lock_guard<std::mutex> lk(mu_);
     // find the socket
     int id = msg.meta.recver;
@@ -138,13 +140,9 @@ class ZMQVan : public Van {
     void *socket = it->second;
 
     // send meta
-    int meta_size; char* meta_buf;
-    PackMeta(msg.meta, &meta_buf, &meta_size);
     int tag = ZMQ_SNDMORE;
     int n = msg.data.size();
     if (n == 0) tag = 0;
-    zmq_msg_t meta_msg;
-    zmq_msg_init_data(&meta_msg, meta_buf, meta_size, FreeData, NULL);
     while (true) {
       if (zmq_msg_send(&meta_msg, socket, tag) == meta_size) break;
       if (errno == EINTR) continue;

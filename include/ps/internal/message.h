@@ -7,6 +7,7 @@
 #include <limits>
 #include <string>
 #include <sstream>
+#include <boost/dynamic_bitset.hpp>
 #include "ps/sarray.h"
 namespace ps {
 /** \brief data type */
@@ -21,10 +22,6 @@ static const char* DataTypeName[] = {
   "UINT8", "UINT16", "UINT32", "UINT64",
   "FLOAT", "DOUBLE", "OTHER"
 };
-/** \brief Message origins (used by the van sender thread) */
-const int NO_QUEUING = 0;
-const int SERVER_MSG = 1;
-const int WORKER_MSG = 2;
 /**
  * \brief compare if V and W are the same type
  */
@@ -124,7 +121,7 @@ struct Control {
     return ss.str();
   }
   /** \brief all commands */
-  enum Command { EMPTY, TERMINATE, ADD_NODE, BARRIER, ACK, HEARTBEAT, WAKE_SIGNAL, LOCALIZE, LOCALIZE_HAND_OVER }; // [sysChange]: added WAKE_SIGNAL, LOCALIZE, LOCALIZE_HAND_OVER
+  enum Command { EMPTY, TERMINATE, ADD_NODE, BARRIER, ACK, HEARTBEAT, WAKE_SIGNAL, SYNC, SYNC_FORWARD };
   /** \brief the command */
   Command cmd;
   /** \brief node infos */
@@ -135,9 +132,6 @@ struct Control {
   uint64_t msg_sig=0;
 };
 
-/** \brief returns true if the given cmd indicates that the message belongs to a parameter transfer */
- inline bool isLocalize(int cmd) { return cmd == Control::LOCALIZE || cmd == Control::LOCALIZE_HAND_OVER; }
-
 /**
  * \brief meta info of a message
  */
@@ -146,7 +140,7 @@ struct Meta {
   static const int kEmpty;
   /** \brief default constructor */
   Meta() : head(kEmpty), app_id(kEmpty), customer_id(kEmpty),
-           timestamp(kEmpty), sender(kEmpty), recver(kEmpty),
+           timestamp(kEmpty), sender(kEmpty), recver(kEmpty), channel(kEmpty), hops(0),
            request(false), push(false), set(false), simple_app(false) {}
   std::string DebugString() const {
     std::stringstream ss;
@@ -188,6 +182,10 @@ struct Meta {
   int sender;
   /** \brief the node id of the receiver of this message */
   int recver;
+  /** \brief the channel to which this message belongs */
+  int channel;
+  /** \brief the number of hops this message has travelled*/
+  int hops;
   /** \brief whether or not this is a request message*/
   bool request;
   /** \brief whether or not a push message */
@@ -219,6 +217,32 @@ struct Message {
     CHECK_EQ(data.size(), meta.data_type.size());
     meta.data_type.push_back(GetDataType<V>());
     data.push_back(SArray<char>(val));
+  }
+  /**
+   * \brief Push a dynamic bitset into data
+   */
+  template<typename Block, typename Alloc>
+  void AddData(const boost::dynamic_bitset<Block, Alloc>& bs) {
+    SArray<Block> blocks (bs.num_blocks());
+    boost::to_block_range(bs, blocks.begin());
+    blocks.push_back(bs.size()); // we add the number of bits at the end
+    AddData(blocks);
+  }
+  /**
+   * \brief Get a bitset from a message
+   */
+  boost::dynamic_bitset<> GetBitset(const SArray<char>& blocks_raw) const {
+    boost::dynamic_bitset<> bs;
+    SArray<decltype(bs)::block_type> blocks (blocks_raw);
+    size_t num_bits = blocks.back();
+    blocks.pop_back();
+
+    // copy blocks into bitset
+    bs.resize(num_bits);
+    boost::from_block_range(blocks.begin(), blocks.end(), bs);
+    bs.resize(num_bits);
+
+    return bs;
   }
   std::string DebugString() const {
     std::stringstream ss;

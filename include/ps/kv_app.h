@@ -326,6 +326,8 @@ class KVServer : public SimpleApp {
     obj_ = new Customer(app_id, app_id, std::bind(&KVServer<Val>::Process, this, _1));
   }
 
+  explicit KVServer() : SimpleApp() {} // for use in ColocKVServer
+
   /** \brief deconstructor */
   virtual ~KVServer() { delete obj_; obj_ = nullptr; }
 
@@ -349,6 +351,7 @@ class KVServer : public SimpleApp {
    * \param res the kv pairs that will send back to the worker
    */
   void Response(const KVMeta& req, const KVPairs<Val>& res = KVPairs<Val>());
+  void Response(const Meta& req, const KVPairs<Val>& res = KVPairs<Val>(), const int head=-1);
 
  private:
   /** \brief internal receive handle */
@@ -416,6 +419,7 @@ bool KVServer<Val>::Process(const Message& msg) {
   return true;
 }
 
+// send a response based on a KVMeta
 template <typename Val>
 void KVServer<Val>::Response(const KVMeta& req, const KVPairs<Val>& res) {
   Message msg;
@@ -436,7 +440,37 @@ void KVServer<Val>::Response(const KVMeta& req, const KVPairs<Val>& res) {
     }
   }
 
-  Postoffice::Get()->van()->Send(msg, SERVER_MSG);
+  Postoffice::Get()->van()->Send(msg);
+}
+
+
+// send a response based on a message Meta
+template <typename Val>
+void KVServer<Val>::Response(const Meta& req, const KVPairs<Val>& res, const int head) {
+  Message msg;
+  msg.meta.app_id = req.app_id;
+  msg.meta.customer_id = req.customer_id;
+  msg.meta.channel     = req.channel; // send the channel in responses too (although strictly not necessary)
+  msg.meta.request     = false;
+  msg.meta.push        = req.push;
+  if (head != -1) {
+    msg.meta.head      = head;
+  } else {
+    msg.meta.head      = req.head;
+  }
+  msg.meta.timestamp   = req.timestamp;
+  msg.meta.recver      = req.sender;
+  if (res.keys.size()) {
+    msg.AddData(res.keys);
+    if (res.vals.size()) {
+      msg.AddData(res.vals);
+      if (res.lens.size()) {
+        msg.AddData(res.lens);
+      }
+    }
+  }
+
+  Postoffice::Get()->van()->Send(msg);
 }
 
 template <typename Val>

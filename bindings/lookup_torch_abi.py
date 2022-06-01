@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """Looks up which ABI the default PyTorch installation uses."""
 

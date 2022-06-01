@@ -11,7 +11,6 @@
 #include "./network_utils.h"
 #include "./meta.pb.h"
 #include "./zmq_van.h"
-#include "./resender.h"
 #include <iomanip>
 namespace ps {
 
@@ -215,19 +214,30 @@ void Van::ProcessDataMsg(Message* msg) {
   CHECK_NE(msg->meta.sender, Meta::kEmpty);
   CHECK_NE(msg->meta.recver, Meta::kEmpty);
   CHECK_NE(msg->meta.app_id, Meta::kEmpty);
-  int app_id = msg->meta.app_id;
-  int customer_id = Postoffice::Get()->is_worker() ? msg->meta.customer_id : app_id;
-  if(Postoffice::Get()->coloc()) {
-    // when co-locating, we need to route replies [request=0] to the worker threads [sysChange]
-    // exception: any messages belonging to parameter transfers go to the server thread
-    customer_id = (msg->meta.request || isLocalize(msg->meta.head)) ? 0 : msg->meta.customer_id;
-    // TODO: this should be compatible with the original version. so we can probably just replace the above line.
-  }
+  int app_id = 0; // use app_id=0 throughout [sysChange]
+
+  // we route requests and sync messages to the server thread for the given channel
+  // everything else, we route to the specified customer
+  assert(msg->meta.channel != Meta::kEmpty);
+  bool is_sync_msg = (msg->meta.head == Control::SYNC || msg->meta.head == Control::SYNC_FORWARD);
+  int customer_id = (msg->meta.request || is_sync_msg) ?
+    Postoffice::Get()->ps_customer_id(msg->meta.channel) :
+    msg->meta.customer_id;
+
   auto* obj = Postoffice::Get()->GetCustomer(app_id, customer_id, 5);
-  CHECK(obj) << "timeout (5 sec) to wait App " << app_id << " customer " << customer_id \
-    << " ready at " << my_node_.role;
-  bool placeFront = prioritizeLocalizes && isLocalize(msg->meta.head); // [sysChange]: prioritize localize messages
-  obj->Accept(*msg, placeFront);
+
+  if (obj == nullptr) {
+    if (is_sync_msg) {
+      SArray<Key> keys;
+      keys = msg->data[0];
+      ALOG("Skip sync message " << Postoffice::Get()->IDtoRank(msg->meta.sender) << "->" << Postoffice::Get()->IDtoRank(msg->meta.recver) << " on channel " << msg->meta.channel << " with " << keys.size() << " keys, because we did not find customer id " << customer_id);
+    } else {
+      CHECK(obj) << "timeout (5 sec) to wait App " << app_id << " customer " << customer_id \
+                 << " ready at " << my_node_.role;
+    }
+  } else {
+    obj->Accept(*msg);
+  }
 }
 
 void Van::ProcessAddNodeCommand(Message* msg, Meta* nodes, Meta* recovery_nodes) {
@@ -307,16 +317,6 @@ void Van::Start(int customer_id, int threads) { // [sysChange]
     // connect to the scheduler
     Connect(scheduler_);
 
-    // for debug use
-    if (Environment::Get()->find("PS_DROP_MSG")) {
-      drop_rate_ = atoi(Environment::Get()->find("PS_DROP_MSG"));
-    }
-    // start van-sender
-    if (Postoffice::Get()->use_sender_thread()) {
-      sender_thread_ = std::unique_ptr<std::thread>(
-              new std::thread(&Van::Sending, this));
-      SET_THREAD_NAME(sender_thread_, "van-sender");
-    }
     // start receiver
     receiver_thread_ = std::unique_ptr<std::thread>(
             new std::thread(&Van::Receiving, this));
@@ -325,7 +325,7 @@ void Van::Start(int customer_id, int threads) { // [sysChange]
   }
   start_mu_.unlock();
 
-  if (!is_scheduler_ && (!Postoffice::Get()->coloc() || customer_id == 0)) {
+  if (!is_scheduler_ && Postoffice::Get()->is_primary_ps(customer_id)) {
     // notify the scheduler about this node. when co-locating, notify only from the server thread [sysChange]
 
     // let the scheduler know myself
@@ -346,15 +346,6 @@ void Van::Start(int customer_id, int threads) { // [sysChange]
 
   start_mu_.lock();
   if (init_stage == 1) {
-    // resender
-    if (Environment::Get()->find("PS_RESEND") && atoi(Environment::Get()->find("PS_RESEND")) != 0) {
-      int timeout = 1000;
-      if (Environment::Get()->find("PS_RESEND_TIMEOUT")) {
-        timeout = atoi(Environment::Get()->find("PS_RESEND_TIMEOUT"));
-      }
-      resender_ = new Resender(timeout, 10, this);
-    }
-
     if (!is_scheduler_) {
       // start heartbeat thread
       heartbeat_thread_ = std::unique_ptr<std::thread>(
@@ -370,20 +361,16 @@ void Van::Stop() {
   Message exit;
   exit.meta.control.cmd = Control::TERMINATE;
   exit.meta.recver = my_node_.id;
-  // only customer 0 would call this method
-  exit.meta.customer_id = 0;
-  Message exit_sender = exit;
+  // only this primary PS calls this method
+  if (!is_scheduler_) {
+    ALOG("Van " << Postoffice::Get()->IDtoRank(my_node_.id) << " sent " << 1.0*send_bytes_/1024/1024 << " MB and received " << 1.0*recv_bytes_/1024/1024 << " MB");
+  }
+  exit.meta.customer_id = Postoffice::Get()->ps_customer_id(0);
   int ret = SendMsg(exit);
   CHECK_NE(ret, -1);
-  if (Postoffice::Get()->use_sender_thread()) {
-    send_queue_.Push(exit_sender);
-    sender_thread_->join();
-  }
   receiver_thread_->join();
-  ProcessTerminateCommand();
   init_stage = 0;
   if (!is_scheduler_) heartbeat_thread_->join();
-  if (resender_) delete resender_;
   ready_ = false;
   connected_nodes_.clear();
   shared_node_mapping_.clear();
@@ -393,45 +380,14 @@ void Van::Stop() {
   barrier_count_.clear();
 }
 
-int Van::Send(const Message& msg, const int origin) {
-  if (Postoffice::Get()->use_sender_thread()
-      && origin != NO_QUEUING
-      && origin <= Postoffice::Get()->use_sender_thread()) {
-    // offload sending to the sender thread
-    send_queue_.Push(msg);
-    return 0;
-  } else {
-    // send out the message right away, in this thread
-    int send_bytes = SendMsg(msg);
-    CHECK_NE(send_bytes, -1);
-    send_bytes_ += send_bytes;
-    if (resender_) resender_->AddOutgoing(msg);
-    if (Postoffice::Get()->verbose() >= 2) {
-      PS_VLOG(2) << "Send: " << msg.DebugString();
-    }
-    return send_bytes;
+int Van::Send(const Message& msg) {
+  int send_bytes = SendMsg(msg);
+  CHECK_NE(send_bytes, -1);
+  send_bytes_ += send_bytes;
+  if (Postoffice::Get()->verbose() >= 2) {
+    PS_VLOG(2) << "Send: " << msg.DebugString();
   }
-}
-
-void Van::Sending() {
-  long long q_size = 0;
-  long long iterations = 0;
-
-  while (true) {
-    Message msg;
-    ++iterations;
-
-    q_size += send_queue_.WaitAndPop(&msg);
-
-    if (!msg.meta.control.empty() &&
-        msg.meta.control.cmd == Control::TERMINATE) {
-      ADLOG("Mean length of send queue in ps-" << Postoffice::Get()->my_rank() <<
-            ": " << std::setprecision(5) << 1.0*q_size/iterations );
-      break;
-    }
-
-    Send(msg, NO_QUEUING);
-  }
+  return send_bytes;
 }
 
 void Van::Receiving() {
@@ -442,27 +398,18 @@ void Van::Receiving() {
   while (true) {
     Message msg;
     int recv_bytes = RecvMsg(&msg);
-    // For debug, drop received message
-    if (ready_.load() && drop_rate_ > 0) {
-      unsigned seed = time(NULL) + my_node_.id;
-      if (rand_r(&seed) % 100 < drop_rate_) {
-        LOG(WARNING) << "Drop message " << msg.DebugString();
-        continue;
-      }
-    }
 
     CHECK_NE(recv_bytes, -1);
     recv_bytes_ += recv_bytes;
     if (Postoffice::Get()->verbose() >= 2) {
       PS_VLOG(2) << "Recv: " << msg.DebugString();
     }
-    // duplicated message
-    if (resender_ && resender_->AddIncomming(msg)) continue;
 
     if (!msg.meta.control.empty()) {
       // control msg
       auto& ctrl = msg.meta.control;
       if (ctrl.cmd == Control::TERMINATE) {
+        ProcessTerminateCommand();
         break;
       } else if (ctrl.cmd == Control::ADD_NODE) {
         ProcessAddNodeCommand(&msg, &nodes, &recovery_nodes);
@@ -486,6 +433,8 @@ void Van::PackMeta(const Meta& meta, char** meta_buf, int* buf_size) {
   if (meta.app_id != Meta::kEmpty) pb.set_app_id(meta.app_id);
   if (meta.timestamp != Meta::kEmpty) pb.set_timestamp(meta.timestamp);
   if (meta.sender != Meta::kEmpty) pb.set_sender(meta.sender);
+  if (meta.channel != Meta::kEmpty) pb.set_channel(meta.channel);
+  if (meta.hops != Meta::kEmpty) pb.set_hops(meta.hops);
   if (meta.body.size()) pb.set_body(meta.body);
   pb.set_push(meta.push);
   pb.set_set(meta.set);
@@ -530,6 +479,8 @@ void Van::UnpackMeta(const char* meta_buf, int buf_size, Meta* meta) {
   meta->app_id = pb.has_app_id() ? pb.app_id() : Meta::kEmpty;
   meta->timestamp = pb.has_timestamp() ? pb.timestamp() : Meta::kEmpty;
   meta->sender = pb.has_sender() ? pb.sender() : meta->sender;
+  meta->channel = pb.has_channel() ? pb.channel() : Meta::kEmpty;
+  meta->hops = pb.has_hops() ? pb.hops() : Meta::kEmpty;
   meta->request = pb.request();
   meta->push = pb.push();
   meta->set = pb.set();

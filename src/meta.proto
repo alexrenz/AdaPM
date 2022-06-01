@@ -55,4 +55,8 @@ message PBMeta {
   optional bool simple_app = 7 [default = false];
   // original sender of this message (only needed when forwarding messages)
   optional int32 sender = 12 [default = -1];
+  // number of hops in this message
+  optional int32 hops = 13 [default = 0];
+  // the channel to which this message belongs
+  optional int32 channel = 14 [default = 0];
 }

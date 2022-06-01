@@ -34,7 +34,6 @@ class SSHLauncher(object):
         remote = slave_node + ':' + slave_dir
         logging.info('rsync %s -> %s', local_dir, remote)
 
-        # TODO uses multithread
         prog = 'rsync -az --rsh="ssh -o StrictHostKeyChecking=no" %s %s' % (
             local_dir, remote)
         subprocess.check_call([prog], shell = True)

@@ -16,14 +16,14 @@ typedef ColoKVWorker<ValT, HandleT> WorkerT;
 // Workload settings
 size_t num_threads = 4;
 size_t num_keys = 1000;
-size_t vpk = 1;
+size_t vpk = 5;
 size_t num_samples_per_worker = 10000;
 size_t num_keys_per_sample = 5;
-size_t prep_sample_ahead = 10;
+size_t prep_sample_ahead = 50;
 
 bool quick;
-bool replicate;
 
+std::stringstream variant;
 
 std::vector<std::vector<size_t>> frequencies;
 std::vector<Key> sampling_sequence;
@@ -39,21 +39,34 @@ inline Key SampleKey() {
 
 template <typename Val>
 void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
-  Start(customer_id);
-  WorkerT kv(0, customer_id, *server); // app_id, customer_id
-  int worker_id = ps::MyRank()*num_threads+customer_id-1; // a unique id for this worker thread
+  WorkerT kv(customer_id, *server); // app_id, customer_id
+  int worker_id = ps::MyRank()*num_threads+customer_id; // a unique id for this worker thread
 
   // localize keys away from their home node to make the test a bit more challenging
-  if (customer_id == 1) {
+  if (customer_id == 0) {
     std::vector<Key> loc_keys {};
     for (Key k = ps::MyRank(); k < num_keys; k+=ps::NumServers()) {
       loc_keys.push_back(k);
-      kv.Wait(kv.Localize(loc_keys));
+      kv.Wait(kv.Intent(loc_keys, 0));
     }
   }
 
+  if (worker_id == 0) {
+    std::vector<Key> all_keys (num_keys);
+    std::vector<Val> all_vals (all_keys.size() * vpk);
+    for (unsigned int k=0; k!=num_keys; ++k) {
+      all_keys[k] = k;
+      for (unsigned int j=0; j!=vpk; ++j) {
+        all_vals[k*vpk+j] = k*100+j;
+      }
+    }
+    kv.Wait(kv.Push(all_keys, all_vals));
+  }
+
   // wait for all workers to boot up
+  kv.WaitSync();
   kv.Barrier();
+  kv.WaitSync();
 
   util::Stopwatch duration {};
   duration.start();
@@ -62,20 +75,75 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
   std::vector<Val> pull_vals (pull_keys.size() * vpk);
   std::vector<SampleID> sample_ids (num_samples_per_worker);
 
+  long val_errors = 0;
+  long val_checks = 0;
+  long unique_errors = 0;
+  long unique_checks = 0;
+
+  std::mt19937 wgen {173727LU^worker_id};
+  std::uniform_int_distribution<Key> num_keys_dist {1, vpk};
+
   // run the sampling workload
   size_t i_future = 0;
   for(size_t i=0; i!=num_samples_per_worker; ++i) {
+    Clock futureClock = kv.currentClock()+i_future-i;
     // prep future samples
     while (i_future <= i+prep_sample_ahead && i_future < num_samples_per_worker) {
-      sample_ids[i_future] = kv.PrepareSample(num_keys_per_sample * SamplingSupport<ValT, WorkerT>::reuse_factor_);
+      sample_ids[i_future] = kv.PrepareSample(num_keys_per_sample * Sampling<ValT, WorkerT, ServerT>::reuse_factor_, futureClock);
       ++i_future;
     }
 
+    std::vector<Key> all_pulled_keys {};
+
     // pull samples
-    for (size_t j = 0; j!=num_keys_per_sample * SamplingSupport<ValT, WorkerT>::reuse_factor_; ++j) {
+    for (int keys_remaining = num_keys_per_sample * Sampling<ValT, WorkerT, ServerT>::reuse_factor_; keys_remaining>0; ) {
+
+      // pull 1..keys_remaining keys from this sample
+      int num_keys = num_keys_dist(wgen);
+      if (num_keys > keys_remaining) {
+        num_keys = keys_remaining;
+      }
+      pull_keys.resize(num_keys);
+      pull_vals.resize(num_keys*vpk);
+
       kv.Wait(kv.PullSample(sample_ids[i], pull_keys, pull_vals));
-      frequencies[customer_id-1][pull_keys[0]] += 1;
+
+      // val check
+      for (int k=0; k!=num_keys; ++k) {
+        frequencies[customer_id][pull_keys[k]] += 1;
+        for (unsigned int z=0; z!=vpk; ++z) {
+          if (pull_vals[k*vpk+z] != static_cast<ValT>(pull_keys[k]*100+z)) {
+            ++val_errors;
+            ALOG("ERROR in val check in worker " << worker_id << ": Pos " << z << " of key " << pull_keys[k] << " (key " << k << " in sample) should be " << pull_keys[k]*100+z << ", but is " << pull_vals[k*vpk+z]);
+          }
+          ++val_checks;
+        }
+      }
+
+      all_pulled_keys.insert(all_pulled_keys.end(), pull_keys.begin(), pull_keys.end());
+
+      keys_remaining -= num_keys;
     }
+
+    // check that keys are unique (for without-replacement sampling)
+    if (!Sampling<ValT, WorkerT, ServerT>::with_replacement_) {
+      ++unique_checks;
+      std::unordered_set<Key> pull_keys_set (all_pulled_keys.begin(), all_pulled_keys.end());
+      if (all_pulled_keys.size() != pull_keys_set.size()) {
+        ++unique_errors;
+        ALOG("ERROR in unique check in worker " << worker_id << ": Pulled keys are not unique: " << all_pulled_keys);
+      }
+    }
+
+    kv.advanceClock();
+  }
+
+  // val check output
+  ALOG("Sampling (" << variant.str() << "), worker " << worker_id << " val check " << (val_errors != 0 ? "FAILED" : "PASSED") << " (" << 100.0 * val_errors / (val_checks + 0.00001) << "% of " << val_checks << " wrong)");
+
+  // uniqueness check output
+  if (!Sampling<ValT, WorkerT, ServerT>::with_replacement_) {
+    ALOG("Sampling (" << variant.str() << "), worker " << worker_id << " unique check " << (unique_errors != 0 ? "FAILED" : "PASSED") << " (" << 100.0 * unique_errors / (unique_checks + 0.00001) << "% of " << unique_checks << " wrong)");
   }
 
   kv.Barrier();
@@ -83,14 +151,12 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
   if (worker_id == 0) { ADLOG("Sampling test took " << duration); }
 
   kv.Finalize();
-  Finalize(customer_id, barrier);
 }
 
 int process_program_options(const int argc, const char *const argv[]) {
   namespace po = boost::program_options;
   po::options_description desc("Allowed options");
   desc.add_options()
-    ("replicate", po::bool_switch(&replicate)->default_value(false), "replicate")
     ;
 
   // add system options
@@ -107,30 +173,17 @@ int main(int argc, char *argv[]) {
   int po_error = process_program_options(argc, argv);
   if(po_error) return 1;
 
-  std::vector<Key> hotspot_keys {};
-  if (replicate) {
-    for(Key k=0; k<num_keys; k+=5) {
-      hotspot_keys.push_back(k);
-    }
-    ALOG("Replication: on (" << hotspot_keys.size() << " of " << num_keys << " keys)");
-  } else {
-    ALOG("Replication: off");
-  }
-
-  Postoffice::Get()->enable_dynamic_allocation(num_keys, num_threads, false);
+  Setup(num_keys, num_threads);
 
   std::string role = std::string(getenv("DMLC_ROLE"));
 
   // co-locate server and worker threads into one process
   if (role.compare("scheduler") == 0) {
-    Start(0);
-    Finalize(0, true);
+    Scheduler();
   } else if (role.compare("server") == 0) { // worker+server
 
     // Start the server system
-    int server_customer_id = 0; // server gets customer_id=0, workers 1..n
-    Start(server_customer_id);
-    auto server = new ServerT(num_keys, vpk, &hotspot_keys);
+    auto server = new ServerT(vpk);
     RegisterExitCallback([server](){ delete server; });
 
     // make sure all servers are set up
@@ -140,6 +193,12 @@ int main(int argc, char *argv[]) {
     server->enable_sampling_support(&SampleKey);
     size_t rank = ps::MyRank();
     auto num_servers = ps::NumServers();
+
+    variant << Sampling<ValT, WorkerT, ServerT>::scheme << ", "
+            << (Sampling<ValT, WorkerT, ServerT>::with_replacement_ ? "with" : "without") << " replacement, "
+            << Sampling<ValT, WorkerT, ServerT>::reuse_factor_ << "x reuse, "
+            << Sampling<ValT, WorkerT, ServerT>::pool_size_ << "ps"
+      ;
 
     // set up sampling sequence
     auto num_total_samples = num_samples_per_worker * num_keys_per_sample * num_threads;
@@ -170,8 +229,11 @@ int main(int argc, char *argv[]) {
 
     // run worker(s)
     std::vector<std::thread> workers {};
-    for (size_t i=0; i!=num_threads; ++i)
-      workers.push_back(std::thread(RunWorker<ValT>, i+1, false, server));
+    for (size_t i=0; i!=num_threads; ++i) {
+      workers.push_back(std::thread(RunWorker<ValT>, i, false, server));
+      std::string name = std::to_string(ps::MyRank())+"-worker-"+std::to_string(ps::MyRank()*num_threads + i);
+      SET_THREAD_NAME((&workers[workers.size()-1]), name.c_str());
+    }
 
     // wait for the workers to finish
     for (size_t w=0; w!=workers.size(); ++w) {
@@ -179,53 +241,45 @@ int main(int argc, char *argv[]) {
     }
 
     // in local sampling, correct numbers are different
-    if (SamplingSupport<ValT, WorkerT>::sampling_strategy == SamplingSupportType::OnlyLocal) {
+    if (Sampling<ValT, WorkerT, ServerT>::scheme == SamplingScheme::Local) {
       std::fill(correct_sampling_frequency.begin(), correct_sampling_frequency.end(), 0);
       size_t num_samples_total = 0;
       size_t pos = 0;
       while (num_samples_total != num_samples_per_worker * num_threads * num_keys_per_sample) {
         auto k = sampling_sequence[pos++ % sampling_sequence.size()];
-        if (k % num_servers == rank || (replicate && std::find(hotspot_keys.begin(), hotspot_keys.end(), k) != hotspot_keys.end()) ) {
+        if (k % num_servers == rank) {
           correct_sampling_frequency[k] += 1;
           num_samples_total += 1;
         }
       }
     }
 
-    // check
-    size_t correct = 0;
-    size_t errors = 0;
-    for (size_t k=0; k!=num_keys; ++k) {
-      size_t sampled = 0;
-      for (size_t j=0; j!=num_threads; ++j) {
-        sampled += frequencies[j][k];
+    // check sampling frequency (not for without replacement sampling)
+    if (Sampling<ValT, WorkerT, ServerT>::with_replacement_) {
+      // check
+      size_t correct = 0;
+      size_t errors = 0;
+      for (size_t k=0; k!=num_keys; ++k) {
+        size_t sampled = 0;
+        for (size_t j=0; j!=num_threads; ++j) {
+          sampled += frequencies[j][k];
+        }
+        if (sampled != correct_sampling_frequency[k] * Sampling<ValT, WorkerT, ServerT>::reuse_factor_) {
+          ALOG("Rank " << rank  << ": key " << k << " was sampled " << sampled << " times, but should be " << correct_sampling_frequency[k]);
+          ++errors;
+        } else {
+          ++correct;
+        }
       }
-      if (sampled != correct_sampling_frequency[k] * SamplingSupport<ValT, WorkerT>::reuse_factor_) {
-        ALOG("Rank " << rank  << ": key " << k << " was sampled " << sampled << " times, but should be " << correct_sampling_frequency[k]);
-        ++errors;
-      } else {
-        ++correct;
-      }
-    }
 
-    // output
-    std::stringstream reptype;
-    if (replicate) {
-      reptype << "(with ";
-      reptype <<  ReplicaManager<ValT,HandleT>::get_rsm();
-      reptype << " replication)";
+      // output
+      ALOG("Sampling (" << variant.str() << "), rank " << rank << ": frequency check " << (errors != 0 ? "FAILED" : "PASSED") << " (" << 100.0 * errors / (correct + errors + 0.00001) << "% of " << errors+correct << " wrong)");
+    } else {
+      ALOG("Sampling (" << variant.str() << "), rank " << rank << ": frequency not checked because without replacement sampling was enabled");
     }
-    std::stringstream s;
-    s << SamplingSupport<ValT, WorkerT>::sampling_strategy
-      << (SamplingSupport<ValT, WorkerT>::postpone_nonlocal_ ? " postpone" : "") << ", "
-      << SamplingSupport<ValT, WorkerT>::reuse_factor_ << "x reuse, "
-      << SamplingSupport<ValT, WorkerT>::group_size_ << "gs"
-      ;
-    ALOG("Sampling (" << s.str() << ") " << reptype.str() << ", rank " << rank << ": " << (errors != 0 ? "FAILED" : "PASSED") << " (" << 100.0 * errors / (correct + errors) << "% of " << errors+correct << " wrong)");
 
     // stop the server
     server->shutdown();
-    Finalize(server_customer_id, true);
 
   } else {
     LL << "Process started with unknown role '" << role << "'.";

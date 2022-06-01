@@ -14,10 +14,7 @@
 #include <unordered_set>
 #include "ps/base.h"
 #include "ps/internal/message.h"
-#include "ps/internal/threadsafe_queue.h"
 namespace ps {
-class Resender;
-
 /**
  * \brief Van sends messages to remote nodes
  *
@@ -54,7 +51,7 @@ class Van {
      * \brief send a message, It is thread-safe
      * \return the number of bytes sent. -1 if failed
      */
-    int Send(const Message &msg, const int origin = NO_QUEUING);
+    int Send(const Message &msg);
 
     /**
      * \brief return my node
@@ -130,8 +127,6 @@ class Van {
 
     /** thread function for receiving */
     void Receiving();
-    /** thread function for sending */
-    void Sending();
 
     /** thread function for heartbeat */
     void Heartbeat();
@@ -151,16 +146,9 @@ class Van {
     int num_workers_ = 0;
     /** the thread for receiving messages */
     std::unique_ptr<std::thread> receiver_thread_;
-    /** the thread for sending ps-thread messages */
-    std::unique_ptr<std::thread> sender_thread_;
-    /** queue of messages to be sent out by the sender thread */
-    ThreadsafeQueue<Message> send_queue_;
     /** the thread for sending heartbeat */
     std::unique_ptr<std::thread> heartbeat_thread_;
     std::vector<int> barrier_count_;
-    /** msg resender */
-    Resender *resender_ = nullptr;
-    int drop_rate_ = 0;
     std::atomic<int> timestamp_{0};
     int init_stage = 0;
 

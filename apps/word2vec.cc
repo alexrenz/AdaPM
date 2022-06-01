@@ -55,13 +55,13 @@ long long train_words = 0, word_count_actual = 0, file_size = 0;
 ValT alpha, starting_alpha, sample;
 long long int embed_dim,data_words;
 
-bool shuffle_b;
+bool enforce_random_keys;
+bool enforce_full_replication;
 bool write_results;
 bool sync_push;
 bool clustered_input;
-bool localize_positives;
-int prep_context_ahead;
-bool downsample_replicated_negative_samples;
+bool signal_intent;
+size_t read_sentences_ahead;
 ValT *expTable;
 double neg_power;
 string init_model;
@@ -73,9 +73,6 @@ vector<ps::Key> forwards; // word -> key
 vector<long long> backwards; // key -> word
 
 // number of parameters to replicate
-size_t replicate_n;
-
-size_t peek_ahead_n;
 
 
 using namespace ps;
@@ -84,7 +81,7 @@ using namespace std;
 
 // get the key for the syn0 parameter of a word
 inline Key syn0KeyResolver(long long word) {
-  if (shuffle_b) {
+  if (enforce_random_keys) {
     return (forwards[word] * 2);
   } else {
     return (word * 2);
@@ -92,7 +89,7 @@ inline Key syn0KeyResolver(long long word) {
 }
 // get the key for the syn1 parameter of a word
 inline Key syn1KeyResolver(long long word) {
-  if (shuffle_b) {
+  if (enforce_random_keys) {
     return (forwards[word] * 2 + 1);
   } else {
     return (word * 2 + 1);
@@ -100,7 +97,7 @@ inline Key syn1KeyResolver(long long word) {
 }
 // get the word from a syn1 key
 inline long long syn1Reverse(Key key) {
-  if (shuffle_b) {
+  if (enforce_random_keys) {
     return backwards[(key - 1) / 2];
   } else {
     return (key - 1)/2;
@@ -120,32 +117,19 @@ Key num_keys = 0;
 
 
 // calculates weight for negative sampling distribution
-inline double unigram_pow(int a, unordered_set<Key>& replicated, int num_servers) {
-  double pw = pow(vocab[a].cn, neg_power);
-
-  // adjust weight of the negative samples that are replicated
-  // (because such negative samples will locally available 100% of the time)
-  if (downsample_replicated_negative_samples) {
-    if (replicated.find(syn1KeyResolver(a)) != replicated.end()) {
-      pw = pw / num_servers;
-    }
-  }
-  return pw;
+inline double unigram_pow(int a) {
+  return pow(vocab[a].cn, neg_power);
 }
 
 // construct a table of all negative samples for efficient sampling
-void InitUnigramTable(const vector<Key>& replicated_parameters) {
-  // replicated parameters as set
-  unordered_set<Key> replicated (replicated_parameters.begin(), replicated_parameters.end());
-  int num_servers = atoi(Environment::Get()->find("DMLC_NUM_SERVER"));
-
+void InitUnigramTable() {
   int a, i;
   double train_words_pow = 0;
   double d1;
   table = (int *) malloc(table_size * sizeof(int));
-  for (a = 0; a < vocab_size; a++) train_words_pow += unigram_pow(a, replicated, num_servers);
+  for (a = 0; a < vocab_size; a++) train_words_pow += unigram_pow(a);
   i = 0;
-  d1 = unigram_pow(i, replicated, num_servers) / train_words_pow;
+  d1 = unigram_pow(i) / train_words_pow;
   for (a = 0; a < table_size; a++) {
     table[a] = i;
     if (a / (double) table_size > d1) {
@@ -153,7 +137,7 @@ void InitUnigramTable(const vector<Key>& replicated_parameters) {
         ADLOG(setw(5) << setfill(' ') << i << " most frequent words have " << d1 << " sampling probability");
       }
       i++;
-      d1 += unigram_pow(i, replicated, num_servers) / train_words_pow;
+      d1 += unigram_pow(i) / train_words_pow;
     }
     if (i >= vocab_size) i = vocab_size - 1;
   }
@@ -391,10 +375,10 @@ void write_checkpoint(string output, WorkerT &kv, const bool write_syn1=false) {
     syn1_keys[a] = syn1KeyResolver(a);
   }
 
-  vector<ValT> syn0 (embed_dim * vocab_size);
-  vector<ValT> syn1 (embed_dim * vocab_size);
+  vector<ValT> syn0 (embed_dim * 2 * vocab_size);
+  vector<ValT> syn1 (embed_dim * 2 * vocab_size);
 
-  kv.WaitReplicaSync();
+  kv.WaitSync();
   kv.Wait(kv.Pull(syn0_keys, &syn0));
   if (write_syn1) kv.Wait(kv.Pull(syn1_keys, &syn1));
 
@@ -407,8 +391,8 @@ void write_checkpoint(string output, WorkerT &kv, const bool write_syn1=false) {
     fprintf(fo_syn0, "%lld %lld\n", vocab_size, embed_dim);
     for (long a = 0; a < vocab_size; a++) {
       fprintf(fo_syn0, "%s ", vocab[a].word);
-      fwrite(&syn0[a*embed_dim], sizeof(ValT), embed_dim, fo_syn0);
-      if (write_syn1) fwrite(&syn1[a*embed_dim], sizeof(ValT), embed_dim, fo_syn1);
+      fwrite(&syn0[a*embed_dim*2], sizeof(ValT), embed_dim, fo_syn0); // write without adagrad for now
+      if (write_syn1) fwrite(&syn1[a*embed_dim*2], sizeof(ValT), embed_dim, fo_syn1); // write without adagrad for now
       fprintf(fo_syn0, "\n");
     }
     fclose(fo_syn0);
@@ -422,13 +406,26 @@ void write_checkpoint(string output, WorkerT &kv, const bool write_syn1=false) {
     for (long a = 0; a < vocab_size; a++) {
       file << vocab[a].word;
       for (long b = 0; b < embed_dim; b++) {
-        file << syn0[a*embed_dim+b] << endl;
+        file << syn0[a*embed_dim*2+b] << endl;
       }
     }
     file.close();
   }
   sw.stop();
   ADLOG("Current embeddings have been written to '" << output << "' (" << sw << ")");
+}
+
+// update step using AdaGrad
+template <typename ValT>
+void adagrad_update(std::vector<ValT>& val, std::vector<ValT>& push, const ValT alpha) {
+
+  ValT* val_ag = val.data() + embed_dim;
+  ValT* push_ag = push.data() + embed_dim;
+
+  for (unsigned i = 0; i != embed_dim; ++i) {
+    push_ag[i] = push[i] * push[i];
+    push[i] = alpha * push[i] / sqrt(val_ag[i] + push_ag[i]);
+  }
 }
 
 unsigned long long negs_next_random;
@@ -496,8 +493,10 @@ private:
 
 //training/computation happens here, equivalent to the original training-thread.
 void training_thread(WorkerT &kv, int customer_id, int worker_id) {
-  long long a, b, d, word, last_word, sentence_length = 0, sentence_position = 0;
-  long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];
+  long long a, b, d, word, last_word, sentence_position = 0;
+  long long word_count = 0, last_word_count = 0, prep_word_count = 0;
+  std::vector<std::vector<long long>> sentences (read_sentences_ahead+1);
+  size_t cslot = 0;
   long long c, target, label, local_iter = num_iterations;
   PeekableRandom<unsigned long long> context_size_rand((long long) 7+worker_id*13); // rng for determining context size
   unsigned long long next_random_read = (long long) 11+worker_id*17; // rng for frequent word skips
@@ -505,14 +504,13 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
 
 
   ValT f, g;
-  ADLOG("[w" << worker_id << "] begins work" << endl);
+  ADLOG("[w" << worker_id << "] begins work");
 
   // allocate memory for local parameters
-  vector <ValT> syn0_vec     (embed_dim);
-  vector <ValT> syn1neg_vec  (embed_dim);
-  vector <ValT> neu1_vec     (embed_dim);
-  vector <ValT> neu1e_vec    (embed_dim);
-  vector <ValT> syn1neg_push (embed_dim);
+  vector <ValT> syn0        (embed_dim*2);
+  vector <ValT> syn1        (embed_dim*2);
+  vector <ValT> syn0_update (embed_dim*2);
+  vector <ValT> syn1_update (embed_dim*2);
   vector <Key>  syn0_key     (1);
   vector <Key>  syn1neg_key  (1);
 
@@ -525,7 +523,7 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
 
   //partitions file for threads
   if (clustered_input) {
-    fseek(fi, (file_size / (long long) num_threads) * (long long) (customer_id - 1), SEEK_SET);
+    fseek(fi, (file_size / (long long) num_threads) * (long long) (customer_id), SEEK_SET);
 
   } else {
     auto pos = (file_size / (long long) num_workers) * (long long) worker_id;
@@ -547,6 +545,9 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
   util:: Stopwatch sw_wait_syn0;
   util:: Stopwatch sw_wait_syn1_pos;
   util:: Stopwatch sw_find_neg;
+  long current_sentence = 0;
+  long future_sentence = 0;
+
   //train loop
   while (1) { //loop ends when thread has reached the end of its partition during its last iteration.
 
@@ -561,159 +562,123 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
       if (alpha < starting_alpha * 0.0001) alpha = starting_alpha * 0.0001;
     }
 
-    // read next sentence
-    if (sentence_length == 0) {
-      std::unordered_set<Key> to_localize {};
+    // read new sentence(s)
+    // we read a couple of sentences into the future so that we can signal intent
+    if (sentences[cslot].size() == 0) {
+      // we read `read_sentences_ahead` into the future
+      while (future_sentence <= current_sentence + static_cast<long>(read_sentences_ahead)) {
+        ++future_sentence;
+        size_t fslot = future_sentence % sentences.size();
+        std::unordered_set<Key> intent {};
+        size_t num_samples = 0;
 
-      while (1) {
+        // read one sentence, word by word
+        while (sentences[fslot].size() < MAX_SENTENCE_LENGTH) {
+          word = ReadWordIndex(fi, &eof);
+          if (eof) break; // end of file
+          if (word == -1) continue; // word not in vocab
+          prep_word_count++;
+          if (word == 0) break; // end of sentence
 
-        word = ReadWordIndex(fi, &eof);  // gets the position in the vocab; common words come first, uncommon words last
+          // skip frequent words from time to time
+          if (sample > 0) {
+            ValT ran = (sqrt(vocab[word].cn / (sample * train_words)) + 1) * (sample * train_words) / vocab[word].cn;
+            next_random_read= next_random_read * (unsigned long long) 25214903917 + 11;
+            if (ran < (next_random_read & 0xFFFF) / (ValT) 65536) continue;
+          }
 
-        if (eof) break;
-        if (word == -1) continue; // word not in vocab
-        word_count++;
-        if (word == 0) break;
-        // The subsampling randomly discards frequent words while keeping the ranking same
-        if (sample > 0) {
-          ValT ran = (sqrt(vocab[word].cn / (sample * train_words)) + 1) * (sample * train_words) / vocab[word].cn;
-          next_random_read= next_random_read * (unsigned long long) 25214903917 + 11;
-          if (ran < (next_random_read & 0xFFFF) / (ValT) 65536) continue;
+          // add word to the future sentence
+          sentences[fslot].push_back(word);
+
+          // intent: we will access syn0 and syn1 parameters of this word
+          if (signal_intent) {
+            intent.insert(syn0KeyResolver(word));
+            intent.insert(syn1KeyResolver(word));
+          }
+
+          // estimate the number of samples for this word's context (upper bound)
+          int b_future = context_size_rand.peek(future_context-num_context) % window; // window size for the future context
+          num_samples += (window-b_future) * 2 * negative;
+          ++future_context;
         }
 
-        // localize parameters for the first couple of words of the sentence
-        // (later words will be localized by the context prep)
-        if (sentence_length < prep_context_ahead+window) {
-          to_localize.insert(syn0KeyResolver(word));
-          if (sentence_length < prep_context_ahead) {
-            to_localize.insert(syn1KeyResolver(word));
+        // prepare a sample of adequate size and signal intent for this sentence
+        auto futureClock = kv.currentClock()+future_sentence-current_sentence;
+        sample_ids[future_sentence] = kv.PrepareSample(num_samples, futureClock);
+        if (signal_intent) {
+          kv.Intent(std::move(intent), futureClock);
+        }
+
+        // end of epoch: move read position back to the start position
+        if (eof || (prep_word_count > min(train_words,data_words) / num_workers)) {
+          prep_word_count = 0;
+          eof = 0;
+          if (clustered_input) {
+            fseek(fi, (file_size / (long long) num_threads) * (long long) (customer_id), SEEK_SET);
+          } else {
+            fseek(fi, (file_size / (long long) num_workers) * (long long) worker_id, SEEK_SET);
           }
         }
-
-        sen[sentence_length] = word;
-        sentence_length++;
-        if (sentence_length >= MAX_SENTENCE_LENGTH) break;
       }
+
+      // start a new sentence
+      ++current_sentence;
       sentence_position = 0;
+      cslot = current_sentence % sentences.size();
+      word_count += sentences[cslot].size() + 1;
+      kv.advanceClock();
 
-      // "peek ahead": localize a few words from the beginning of the next sentence
-      if (peek_ahead_n != 0 && localize_positives) {
-        auto read_pos = ftell(fi); // store current read position (so we can jump back below)
-        auto next_random_read_copy = next_random_read; // fork the generator state so we can look into the future
-        for (size_t i=0; i!=peek_ahead_n; ++i) {
-          long long next_word = ReadWordIndex(fi, &eof);
-          // skip conditions (copied from above to achieve identical behavior)
-          if (eof) break;
-          if (next_word == -1) { --i; continue; }; // word not in vocab
-          if (next_word == 0)  { break; }; // sentence end
-          if (sample > 0) { // discard frequent words from time to time
-            ValT ran = (sqrt(vocab[next_word].cn / (sample * train_words)) + 1) * (sample * train_words) / vocab[next_word].cn;
-            next_random_read_copy = next_random_read_copy * (unsigned long long) 25214903917 + 11;
-            if (ran < (next_random_read_copy & 0xFFFF) / (ValT) 65536) {
-              --i;
-              continue;
-            }
-          }
-          to_localize.insert(syn0KeyResolver(next_word));
-          to_localize.insert(syn1KeyResolver(next_word));
-        }
-        fseek(fi, read_pos, SEEK_SET); // reset read position
-      }
+      // end of an epoch
+      if (word_count > min(train_words,data_words) / num_workers) {
+        word_count_actual += word_count - last_word_count;
+        local_iter--;
+        auto fepoch = num_iterations - local_iter; //finished epochs
 
-      // localize the words that we just read
-      if (localize_positives) {
-        std::vector<Key> to_localize_vec(to_localize.begin(), to_localize.end());
-        kv.Localize(to_localize_vec);
-      }
-    }
-
-
-    //finish iteration/epoch when either eof is reached or the # word_count
-    if (eof || (word_count > min(train_words,data_words) / num_workers)) {
-      word_count_actual += word_count - last_word_count;
-      local_iter--;
-      auto fepoch = num_iterations - local_iter; //finished epochs
-
-      sw_epoch.stop();
-      ADLOG("Worker " << worker_id << " finished epoch " << fepoch << " (" << sw_epoch << ")." );
-      kv.Barrier();
-      sw_epoch_all.stop();
-      sw_train.stop();
-      if (worker_id == 0) {
-        ADLOG("All workers finished epoch " << fepoch << " (epoch: " << sw_epoch_all << ", total: " << sw_train << ")");
-      }
-
-      if (write_results) {
-        kv.WaitAll();
+        sw_epoch.stop();
+        ADLOG("Worker " << worker_id << " finished epoch " << fepoch << " (" << sw_epoch << "). [sentence " << current_sentence << "]" );
         kv.Barrier();
-        if (customer_id == 1 && ps::MyRank() == ps::NumServers()-1) {// last rank saves (usually this is the first node)
-          util::Stopwatch sw_write; sw_write.start();
-          ADLOG("Write epoch " << fepoch << " embeddings");
-          write_checkpoint(out_file + ".epoch." + to_string(fepoch), kv);
+        sw_epoch_all.stop();
+        sw_train.stop();
+        if (worker_id == 0) {
+          ADLOG("All workers finished epoch " << fepoch << " (epoch: " << sw_epoch_all << ", total: " << sw_train << ")");
         }
-      }
-      kv.Barrier();
 
-      if (local_iter == 0) {
-        ADLOG("[w" << worker_id << "] Wait syn0: " << sw_wait_syn0 << "  Wait syn1 positive: " << sw_wait_syn1_pos << "  Find negative: " << sw_find_neg);
-        break;
-      }
-
-      // maximum time
-      if (sw_train.elapsed_s() > max_runtime ||
-          sw_train.elapsed_s() + sw_epoch_all.elapsed_s() > max_runtime * 1.05) {
-        ADLOG("Worker " << worker_id << " stops after epoch " << fepoch << " because max. time is reached: " << sw_train.elapsed_s() << "s (+1 epoch) > " << max_runtime << "s (epoch: " << sw_epoch_all.elapsed_s() << "s)");
-        break;
-      }
-
-      sw_epoch.start();
-      sw_epoch_all.start();
-      sw_train.resume();
-      //variable reset for next epoch, worker starts at its determined starting-point again.
-      word_count = 0;
-      last_word_count = 0;
-      sentence_length = 0;
-      eof = 0;
-
-      if (clustered_input) {
-        fseek(fi, (file_size / (long long) num_threads) * (long long) (customer_id - 1), SEEK_SET);
-        continue;
-      } else {
-        fseek(fi, (file_size / (long long) num_workers) * (long long) worker_id, SEEK_SET); // SEEK_SET begins at file start; computes offset via middle value
-        continue;
-      }
-    }
-
-    word = sen[sentence_position]; //word is extracted here again
-    if (word == -1) continue;
-
-
-    std::fill(neu1_vec.begin(), neu1_vec.end(), 0);
-    std::fill(neu1e_vec.begin(), neu1e_vec.end(), 0);
-
-    // prepare a future context
-    while (future_context <= num_context + prep_context_ahead) {
-      // find out the window size for the future context
-      int b_future = context_size_rand.peek(future_context-num_context) % window;
-
-      // prep a negative sample of adequate size for this future context
-      sample_ids[future_context] = kv.PrepareSample((window-b_future) * 2 * negative);
-
-      // localize words for this future context
-      auto future_position = sentence_position + (future_context-num_context);
-      if (localize_positives && future_position < sentence_length) {
-        std::vector<Key> to_localize {};
-        to_localize.reserve((window-b_future) * 2 + 1);
-        to_localize.push_back(syn1KeyResolver(sen[future_position]));
-        for (a = b_future; a < window * 2 + 1 - b_future; a++) {
-          c = future_position - window + a;
-          if (a != window && c >= 0 && c < sentence_length) {
-            to_localize.push_back(syn0KeyResolver(sen[c]));
+        if (write_results) {
+          kv.WaitAll();
+          kv.WaitSync();
+          kv.Barrier();
+          if (customer_id == 0 && ps::MyRank() == ps::NumServers()-1) {// last rank saves (usually this is the first node)
+            util::Stopwatch sw_write; sw_write.start();
+            ADLOG("Write epoch " << fepoch << " embeddings");
+            write_checkpoint(out_file + ".epoch." + to_string(fepoch), kv);
           }
         }
-        kv.Localize(to_localize);
+        kv.Barrier();
+
+        if (local_iter == 0) {
+          ADLOG("[w" << worker_id << "] Wait syn0: " << sw_wait_syn0 << "  Wait syn1 positive: " << sw_wait_syn1_pos << "  Find negative: " << sw_find_neg);
+          break;
+        }
+
+        // maximum time
+        if (sw_train.elapsed_s() > max_runtime ||
+            sw_train.elapsed_s() + sw_epoch_all.elapsed_s() > max_runtime * 1.05) {
+          ADLOG("Worker " << worker_id << " stops after epoch " << fepoch << " because max. time is reached: " << sw_train.elapsed_s() << "s (+1 epoch) > " << max_runtime << "s (epoch: " << sw_epoch_all.elapsed_s() << "s)");
+          break;
+        }
+
+        // reset word counts for new epoch
+        word_count = 0;
+        last_word_count = 0;
+        sw_epoch.start();
+        sw_epoch_all.start();
+        sw_train.resume();
       }
-      ++future_context;
     }
+
+    if (sentences[cslot].size() == 0) continue; // skip empty sentences
+    word = sentences[cslot][sentence_position];
+    if (word == -1) continue;
 
     // determine window size for the current context
     b = context_size_rand.next() % window;
@@ -724,18 +689,16 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
         c = sentence_position - window + a;
 
         if (c < 0) continue;
-        if (c >= sentence_length) continue;
-        last_word = sen[c];
+        if (c >= static_cast<long long>(sentences[cslot].size())) continue;
+        last_word = sentences[cslot][c];
         if (last_word == -1) continue;
 
         syn0_key[0] = syn0KeyResolver(last_word);
         sw_wait_syn0.resume();
-        kv.Wait(kv.Pull(syn0_key, &syn0_vec));
+        kv.Wait(kv.Pull(syn0_key, &syn0));
         sw_wait_syn0.stop();
 
-
-        std::fill(neu1e_vec.begin(), neu1e_vec.end(), 0);
-
+        std::fill(syn0_update.begin(), syn0_update.end(), 0);
 
         //negative sampling
         for (d = 0; d < negative + 1; d++) {
@@ -746,15 +709,14 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
             syn1neg_key[0] = syn1KeyResolver(target); // precomputed in preload neg_samples
 
             sw_wait_syn1_pos.resume();
-            kv.Localize(syn1neg_key);
-            kv.Wait(kv.Pull(syn1neg_key, &syn1neg_vec));
+            kv.Wait(kv.Pull(syn1neg_key, &syn1));
             sw_wait_syn1_pos.stop();
           } else { // negative sample
             label = 0;
 
             // Retrieve a negative sample
             sw_find_neg.resume();
-            kv.Wait(kv.PullSample(sample_ids[num_context], syn1neg_key, syn1neg_vec));
+            kv.Wait(kv.PullSample(sample_ids[current_sentence], syn1neg_key, syn1));
             target = syn1Reverse(syn1neg_key[0]);
             sw_find_neg.stop();
 
@@ -765,45 +727,43 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
 
           // retrieve output layer of negative-sampled word
           f = 0;
-          for (c = 0; c < embed_dim; c++)f += syn0_vec[c] * syn1neg_vec[c];
+          for (c = 0; c < embed_dim; c++)f += syn0[c] * syn1[c];
 
-          if (f > MAX_EXP) g = (label - 1) * alpha;
-          else if (f < -MAX_EXP) g = (label - 0) * alpha;
-          else g = (label - expTable[(int) ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
+          if (f > MAX_EXP) g = (label - 1);
+          else if (f < -MAX_EXP) g = (label - 0);
+          else g = (label - expTable[(int) ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]);
 
+          for (c = 0; c < embed_dim; c++) syn0_update[c] += g * syn1[c];
+          for (c = 0; c < embed_dim; c++) syn1_update[c] = g * syn0[c];
 
-          for (c = 0; c < embed_dim; c++) neu1e_vec[c] += g * syn1neg_vec[c];
-
-          for (c = 0; c < embed_dim; c++) syn1neg_push[c] = g * syn0_vec[c];
+          adagrad_update(syn1, syn1_update, alpha);
 
           // publish/push updates;  hidden->output
           if (sync_push) {
-            kv.Wait(kv.Push(syn1neg_key, syn1neg_push));
+            kv.Wait(kv.Push(syn1neg_key, syn1_update));
           } else {
-            kv.Push(syn1neg_key, syn1neg_push);
+            kv.Push(syn1neg_key, syn1_update);
           }
-
-
         }
         // Learn weights input -> hidden
+        adagrad_update(syn0, syn0_update, alpha);
         if (sync_push) {
-          kv.Wait(kv.Push(syn0_key, neu1e_vec));
+          kv.Wait(kv.Push(syn0_key, syn0_update));
         } else {
-          kv.Push(syn0_key, neu1e_vec);
+          kv.Push(syn0_key, syn0_update);
         }
       }
     }
-    kv.FinishSample(sample_ids[num_context]);
-    sample_ids.erase(num_context);
     sentence_position++;
     num_context++;
 
-
-    if (sentence_position >= sentence_length) {
-      sentence_length = 0;
+    // end of sentence
+    if (sentence_position >= static_cast<long long>(sentences[cslot].size())) {
+      sentences[cslot].clear();
+      kv.FinishSample(sample_ids[current_sentence]);
+      sample_ids.erase(current_sentence);
       continue;
     }
-
   }
 
 
@@ -861,21 +821,31 @@ void initialize_model(WorkerT &kv) {
     ALOG("No parameter initialization");
   } else if (init_model.compare("random") == 0) { // init syn0 randomly, don't init syn1
     ALOG("Initialize model randomly (seed " << model_seed << ")");
-    vector <ValT> syn_vec(embed_dim * vocab_size);
-    vector <Key> syn_key(vocab_size);
+    vector <ValT> syn0(embed_dim * 2 * vocab_size);
+    vector <Key> syn0_key(vocab_size);
+    vector <ValT> syn1(embed_dim * 2 * vocab_size, 0); // we initialize only the AdaGrad values in syn1 (see below)
+    vector <Key> syn1_key(vocab_size);
     unsigned long long next_random = model_seed;
     for (int e = 0; e < vocab_size; ++e) {
-      syn_key[e] = syn0KeyResolver(e);
+      syn0_key[e] = syn0KeyResolver(e);
+      syn1_key[e] = syn1KeyResolver(e);
       for (int j = 0; j < embed_dim; ++j) {
         next_random = next_random * (unsigned long long) 25214903917 + 11; // taken from original w2v
-        syn_vec[e * embed_dim + j] =
+        syn0[e * embed_dim * 2 + j] =
           (((next_random & 0xFFFF) / (ValT) 65536) - 0.5) / embed_dim;
+
+        // adagrad init
+        syn0[e * embed_dim * 2 + embed_dim + j] = 1e-6;
+        syn1[e * embed_dim * 2 + embed_dim + j] = 1e-6;
       }
     }
-    kv.Wait(kv.Push(syn_key, syn_vec));
-    ALOG("Model init finished: " << syn_vec[0] << " " << syn_vec[1] << " " << syn_vec[2] << " .. ");
+    kv.Wait(kv.Push(syn0_key, syn0));
+    kv.Wait(kv.Push(syn1_key, syn1));
+    ALOG("Model init finished: " << syn0[0] << " " << syn0[1] << " " << syn0[2] << " .. ");
   } else { // load syn0 and syn1 from a checkpoint
     ALOG("Initialize model from checkpoint:" << init_model);
+    ALOG("Not implemented: initialize from checkpoint (does not support AdaGrad yet)");
+    abort();
     // create keys
     vector<Key> syn0_keys (vocab_size);
     vector<Key> syn1_keys (vocab_size);
@@ -928,7 +898,7 @@ void initialize_model(WorkerT &kv) {
     // push parameters into the server
     kv.Wait(kv.Push(syn0_keys, syn0), kv.Push(syn1_keys, syn1));
   }
-  kv.WaitReplicaSync();
+  kv.WaitSync();
 }
 
 // returns a vector of files inside given directory
@@ -1029,68 +999,34 @@ bool sortdesc(const pair<double, Key>& a, const pair<double, Key>& b) {
 }
 
 
-// determine which parameters to replicate.
-// we calculate the expected access frequency for each parameter
-// and then pick the N with the highest expectations for replication
-std::vector<Key> determine_hotspot_keys(size_t N_hotspots) {
-  std::vector<Key> to_replicate {};
-  if (N_hotspots == 0) return to_replicate;
-
-  if (static_cast<long>(N_hotspots) > vocab_size*2) N_hotspots = vocab_size*2; // cannot replicate more than all keys
-
-  to_replicate.reserve(N_hotspots);
-
-  // calculate the expected access frequency for each parameter
-  std::vector<std::pair<double,Key>> expected_frequency (num_keys);
-  // calculate total count and pow
-  double total_pow = 0;
-  long total_cn = 0;
-  for (long long a = 0; a != vocab_size; ++a) {
-    total_cn += vocab[a].cn;
-    total_pow += pow(vocab[a].cn, neg_power);
-  }
-  for (long long a=0; a != vocab_size; ++a) {
-    // for syn0, access frequency depends on data frequency of the corresponding word
-    expected_frequency[syn0KeyResolver(a)] = std::make_pair(1.0*vocab[a].cn/total_cn, syn0KeyResolver(a));
-    // for syn1, access frequency depends on (1) sampling distribution (majority of accesses) and
-    // (2) data frequency
-    expected_frequency[syn1KeyResolver(a)] =
-      std::make_pair(pow(vocab[a].cn, neg_power)/total_pow*negative+
-                     1.0*vocab[a].cn/total_cn, syn1KeyResolver(a));
-    // note: over all, parameters of layer syn1 are accessed much more frequently than parameters in syn0.
-    // this is reflected here
-  }
-
-  // replicate the `N_hotspot` parameters that we expect to be accessed most frequently
-  std::sort(expected_frequency.begin(), expected_frequency.end(), sortdesc);
-  for (size_t i=0; i != N_hotspots; ++i) {
-    // ADLOG("Replicate " << expected_frequency[i].second << ", expected accesses: " << expected_frequency[i].first);
-    to_replicate.push_back(expected_frequency[i].second);
-  }
-  assert(to_replicate.size() == N_hotspots);
-
-  return to_replicate;
-}
-
 void RunWorker(int customer_id, ServerT *server = nullptr) {
 
-  Start(customer_id);
   std::unordered_map <std::string, util::Stopwatch> sw{};
-  WorkerT kv(0, customer_id, *server);
+  WorkerT kv(customer_id, *server);
 
-  int worker_id = ps::MyRank() * num_threads + customer_id - 1; // a unique id for this worker thread
+  int worker_id = ps::MyRank() * num_threads + customer_id; // a unique id for this worker thread
 
   // initialize the model with random parameter values
   kv.BeginSetup();
-  if (customer_id == 1 && ps::MyRank() == ps::NumServers()-1) { // last rank initializes
+  if (customer_id == 0 && ps::MyRank() == ps::NumServers()-1) { // last rank initializes
     initialize_model(kv);
   }
   kv.EndSetup();
 
+  // replicate all keys on all nodes throughout training
+  // (sensible only in ablation experiments)
+  if (enforce_full_replication && customer_id == 0) {
+  	std::vector<Key> keys (num_keys);
+    std::iota(keys.begin(), keys.end(), 0);
+    kv.Intent(keys, 0, CLOCK_MAX);
+  }
+  kv.WaitSync();
+  kv.Barrier();
+  kv.WaitSync();
+
   training_thread(kv, customer_id, worker_id);
 
   kv.Finalize();
-  Finalize(customer_id, false);
 }
 
 //boost program options
@@ -1108,7 +1044,8 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("output_file,o", po::value<string>(&out_file)->default_value("vectors.bin"), "output file (to store word vectors)")
     ("vocab_save", po::value<string>(&vocab_save), "name of the resulting vocab-file")
     ("vocab_retrieve", po::value<string>(&vocab_retrieve), "name of the source vocab-file")
-    ("shuffle", po::value<bool>(&shuffle_b)->default_value(true), "boolean to scramble words on keys randomly")
+    ("enforce_random_keys", po::value<bool>(&enforce_random_keys)->default_value(false), "enforce that keys are assigned randomly")
+    ("enforce_full_replication", po::value<bool>(&enforce_full_replication)->default_value(false), "manually enforce full model replication")
     ("debug_mode,d", po::value<int>(&debug_mode)->default_value(2), "disables debug mode")
     ("window,w", po::value<int>(&window)->default_value(5), "adjusts sizing of word-window, default is 5")
     ("embed_dim,v", po::value<long long int>(&embed_dim)->default_value(200),
@@ -1119,17 +1056,14 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("clustered_input", po::value<bool>(&clustered_input)->default_value(false),
      "flag to utilize separate files for each server in a distributed setting")
     ("write_results", po::value<bool>(&write_results)->default_value(false), "write out results")
-    ("localize_pos", po::value<bool>(&localize_positives)->default_value(true), "localize contextual data beforehand (default: yes)")
-    ("sync_push", po::value<bool>(&sync_push)->default_value(true), "use synchronous pushes? (default: yes)")
+    ("sync_push", po::value<bool>(&sync_push)->default_value(false), "use synchronous pushes? (default: no)")
     ("data_words", po::value<long long int>(&data_words)->default_value(numeric_limits<long long int>::max()), "use synchronous pushes? (default: yes)")
     ("min_count", po::value<int>(&min_count)->default_value(5), "learn embeddings for all words with count larger than min_cout")
     ("neg_power", po::value<double>(&neg_power)->default_value(0.75), "power for negative sampling")
     ("starting_alpha", po::value<ValT>(&alpha)->default_value(0.025), "starting alpha (learning rate)")
     ("subsample", po::value<ValT>(&sample)->default_value(1e-4), "subsample frequent words")
-    ("replicate", po::value<size_t>(&replicate_n)->default_value(0), "number of parameters to replicate")
-    ("peek_ahead", po::value<size_t>(&peek_ahead_n)->default_value(0), "peek ahead into the next sentence and localize N words. 0 to disable")
-    ("prep_context_ahead", po::value<int>(&prep_context_ahead)->default_value(10), "How many contexts ahead of time to localize positives and prepare negatives")
-    ("downsample_replicated_negatives", po::value<bool>(&downsample_replicated_negative_samples)->default_value(false), "downsample replicated negative samples according to the number of servers")
+    ("read_sentences_ahead", po::value<size_t>(&read_sentences_ahead)->default_value(1000), "How far to read ahead? This is relevant for intent signaling. 0: do not read ahead, N>0: read N sentences ahead")
+    ("signal_intent", po::value<bool>(&signal_intent)->default_value(true), "whether to signal intent (default: yes)")
     ("binary", po::value<int>(&binary)->default_value(1), "output in binary human-readable format(default)")
     ("init_model", po::value<string>(&init_model)->default_value("random"), "how to init the parameters. options: 'none', 'random', '[PATH TO CHECKPOINT]'")
     ("model_seed", po::value<unsigned long long>(&model_seed)->default_value(134827), "seed for model generation")
@@ -1143,12 +1077,6 @@ int process_program_options(const int argc, const char *const argv[]) {
   po::store(po::parse_command_line(argc, argv, desc), vm);
   po::notify(vm);
 
-  // Warnings about nonsensical settings
-  if (replicate_n != 0 && SamplingSupport<ValT, WorkerT>::sampling_strategy == SamplingSupportType::OnlyLocal &&
-      !downsample_replicated_negative_samples) {
-    ALOG("[WARNING] You are combining the 'only local' sampling strategy with replication, but downsampling of replicated parameters is turned off. This might deteriorate the sampling distribution even further.");
-  }
-
   if (vm.count("help")) {
     cout << desc << "\n";
     return 1;
@@ -1161,38 +1089,31 @@ int main(int argc, char *argv[]) {
   int po_error = process_program_options(argc, argv);
   if (po_error) return 1;
 
-  Postoffice::Get()->enable_dynamic_allocation(num_keys, num_threads);
+  Setup(num_keys, num_threads);
   std::string role = std::string(getenv("DMLC_ROLE"));
 
-  std::cout << "Word2vec: Starting " << role << ": running " << num_iterations << " iterations on " << num_keys
-            << " keys in " << num_threads << " threads\n"
-            << "embed_dim " << embed_dim << ", sync_push: " << sync_push << ", min_count: " << min_count << ", neg_power " << neg_power << "\n"
-            << "file " << in_file << ", vocab: " << vocab_retrieve << ", data_words " << data_words << "\n"
-            << "window " << window << ", negative " << negative << "\n"
-            << "localize_pos " << localize_positives << ", " << "replicate_n " << replicate_n << "\n"
-            << ReplicaManager<ValT,HandleT>::PrintOptions() << "\n";
+  ALOG("Word2vec: Starting " << role << ": running " << num_iterations << " iterations on " << num_keys
+       << " keys in " << num_threads << " threads,\n"
+       << "embed_dim " << embed_dim << ", sync_push: " << sync_push << ", min_count: " << min_count << ", neg_power " << neg_power << ",\n"
+       << "file " << in_file << ", vocab: " << vocab_retrieve << ", data_words " << data_words << ",\n"
+       << "window " << window << ", negative " << negative << ","
+       << "read ahead " << read_sentences_ahead << ", signal_intent " << signal_intent << "\n"
+       << (SyncManager<ValT,HandleT>::PrintOptions()));
 
 
   if (role.compare("scheduler") == 0) {
-    Start(0);
-    Finalize(0, true);
+    Scheduler();
   } else if (role.compare("server") == 0) {
 
     // initialize data structures that are shared among threads
     init_shared_datastructures();
     starting_alpha = alpha;
 
-    // replication
-    vector<Key> hotspot_keys = determine_hotspot_keys(replicate_n);
-    // std::sort(hotspot_keys.begin(), hotspot_keys.end());
-
     // construct unigram table (for efficient negative sampling)
-    InitUnigramTable(hotspot_keys);
+    InitUnigramTable();
 
     // Start the server system
-    int server_customer_id = 0; // server gets customer_id=0, workers 1..n
-    Start(server_customer_id);
-    auto server = new ServerT(num_keys, embed_dim, &hotspot_keys);
+    auto server = new ServerT(embed_dim*2);
     RegisterExitCallback([server]() { delete server; });
     num_workers = ps::NumServers() * num_threads;
 
@@ -1212,7 +1133,7 @@ int main(int argc, char *argv[]) {
     // run worker(s)
     std::vector <std::thread> workers{};
     for (size_t i = 0; i != num_threads; ++i) {
-      workers.push_back(std::thread(RunWorker, i + 1, server));
+      workers.push_back(std::thread(RunWorker, i, server));
       std::string name = std::to_string(ps::MyRank())+"-worker-"+std::to_string(ps::MyRank()*num_threads + i);
       SET_THREAD_NAME((&workers[workers.size()-1]), name.c_str());
     }
@@ -1223,6 +1144,5 @@ int main(int argc, char *argv[]) {
 
     // stop the server
     server->shutdown();
-    Finalize(server_customer_id, true);
   }
 }
