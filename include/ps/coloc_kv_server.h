@@ -55,14 +55,14 @@ std::ostream& operator<<(std::ostream &o, const MgmtTechniques& t) {
   public:
 
     /**
-     * Construct a Lapse server with uniform value lengths
+     * Construct a server with uniform value lengths
      */
 
     explicit ColoKVServer(size_t uniform_len) :
       ColoKVServer(std::vector<size_t> {uniform_len}) {}
 
     /**
-     * \brief Construct a Lapse server
+     * \brief Construct a server
      */
     explicit ColoKVServer(std::vector<size_t> value_lengths) :
       postoffice_setup {Postoffice::Get()->ps_customer_id(0), Postoffice::Get()->num_channels()}, // first of all, set up node connections

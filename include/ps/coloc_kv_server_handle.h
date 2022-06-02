@@ -40,9 +40,9 @@
          local parameters.
 
    The desired backend data structure can be specified with the compilation flag PS_BACKEND in
-   the external variable LAPSE_EXTERNAL_LDFLAGS. E.g, the following compiles the knowledge graph
+   the external variable PS_LDFLAGS. E.g, the following compiles the knowledge graph
    embeddings app with an unordered map:
-   export LAPSE_EXTERNAL_LDFLAGS="-DPS_BACKEND=1"; make apps/knowledge_graph_embeddings
+   export PS_LDFLAGS="-DPS_BACKEND=1"; make apps/knowledge_graph_embeddings
 
 */
 

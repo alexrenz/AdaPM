@@ -66,7 +66,7 @@ inline ps::Key LogUniformSampling() {
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("setup", &setup, "set up lapse");
+  m.def("setup", &setup, "set up AdaPS");
   m.def("scheduler", &scheduler, "run scheduler");
 
   // Server
@@ -87,7 +87,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                        const ps::Key min, // incl.
                                        const ps::Key max // excl.
                                        ){
-      // This enables to use the NuPS sampling support from the PyTorch bindings.
+      // This enables to use the AdaPS sampling support from the PyTorch bindings.
       // Out of the box, only some pre-provided sampling distributions are supported:
       //  - uniform: uniform sampling from a continuous range [min, max)  (incl. min, excl. max)
       //  - log-uniform: log-uniform sampling from a continuous range [min, max)  (incl. min, excl. max)
@@ -135,11 +135,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Worker
 
   py::class_<WorkerT>(m, "Worker")
-    .def(py::init([](const int app_id, const int customer_id, ServerT& server) { // DEPRECATED
-      ALOG("[DEPRECATED] You are using the lapse.Worker(app_id, customer_id, server) constructor to set up a worker, which is deprecated. Please switch to lapse.Worker(customer_id, server). No app_id is needed.");
-      return new WorkerT(customer_id, server);
-    }))
-
     .def(py::init([](const int customer_id, ServerT& server) {
       return new WorkerT(customer_id, server);
     }))

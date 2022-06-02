@@ -78,6 +78,10 @@ the pre-C++ ABI dependencies to a separate path `deps_bindings` (using
 `DEPS_PATH=$(pwd)/deps_bindings`). If you compile the dependencies to another
 path than `deps_bindings` you have to modify [setup.py](setup.py).
 
+Make sure that you install PyTorch **before** you run the installation of AdaPS
+(below). Otherwise, the ABI read-out will not work (and instead just use the
+default ABI).
+
 ```bash
 make clean
 make ps KEY_TYPE=int64_t CXX11_ABI=$(python bindings/lookup_torch_abi.py) DEPS_PATH=$(pwd)/deps_bindings
@@ -91,7 +95,7 @@ If successful, you can now use AdaPS in Python
 ```python
 #!/usr/bin/python
 import torch
-import lapse
+import adaps
 ```
 
 ## Experimental status

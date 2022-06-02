@@ -15,7 +15,7 @@ jobs:
       uses: actions/cache@v2
       with:
         path: deps
-        key: ${{ runner.os }}-deps-latest-ubuntu
+        key: ${{ runner.os }}-deps-latest-ubuntu-v2
 
     - name: Compile
       run: make
@@ -27,4 +27,4 @@ jobs:
       run: tests/run_apps.sh
 
     - name: Compile with key tracing
-      run: rm -rf build && export LAPSE_EXTERNAL_LDFLAGS="-DPS_TRACE_KEYS=1" && make
+      run: rm -rf build && export PS_LDFLAGS="-DPS_TRACE_KEYS=1" && make
