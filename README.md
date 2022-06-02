@@ -11,12 +11,11 @@ signals which parameters it intends to access in the near future. Based on these
 signals, AdaPS decides automatically (i.e., without specific user input) and
 adaptively (i.e., depending on the current situation) what to do and when to do
 it. This makes AdaPS *efficient and easy to use*. We describe details in our
-[paper on AdaPS](https://github.com/alexrenz/AdaPS/blob/review/adaps-long.pdf).
+[paper on AdaPS (arXiv)](https://arxiv.org/abs/2206.00470).
 
 The `main` branch of this repository contains the latest version of AdaPS.
 Details on the experiments in the AdaPS paper
-([arXiv](https://github.com/alexrenz/AdaPS/blob/review/adaps-long.pdf)) can be
-found in
+([arXiv](https://arxiv.org/abs/2206.00470)) can be found in
 [docs/experiments.md](https://github.com/alexrenz/AdaPS/blob/review/docs/experiments.md).
 The source code used in the paper is in branch
 [`review`](https://github.com/alexrenz/AdaPS/tree/review/).
@@ -170,14 +169,15 @@ AdaPS starts one process per node. Within this process, worker threads access th
 The citation for AdaPS is as follows:
 
 ```bibtex
-
-@inproceedings{adaps,
+@misc{adaps,
   author = {Renz-Wieland, Alexander and Kieslinger, Andreas and Gericke, Robert and Gemulla, Rainer and Kaoudi, Zoi and Markl, Volker},
   title = {Good Intentions: Adaptive Parameter Servers via Intent Signaling},
+  publisher = {arXiv},
   year = {2022},
-  howpublished = "\url{https://github.com/alexrenz/AdaPS/blob/review/adaps-long.pdf}",
-  publisher = {TU Berlin},
+  doi = {10.48550/ARXIV.2206.00470},
+  url = {https://arxiv.org/abs/2206.00470},
 }
+
 ```
 
 
