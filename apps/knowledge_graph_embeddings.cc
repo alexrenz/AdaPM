@@ -1197,7 +1197,7 @@ int process_program_options(const int argc, const char *const argv[]) {
     ("async_push", po::value<bool>(&async_push)->default_value(true), "push synchronously (false) or asynchronously (true, default)")
     ("signal_initial_relations_intent", po::value<bool>(&signal_initial_relations_intent)->default_value(false), "whether to signal long-term intent for relations or not")
     ("read_partitioned_dataset", po::value<bool>(&read_partitioned_dataset)->default_value(false), "read partitioned dataset")
-    ("init_parameters", po::value<string>(&init_parameters)->default_value("normal{0,0.1}"), "initialize parameters, possible: 'none', 'uniform{a,b}', 'normal{mean,std}'")
+    ("init_parameters", po::value<string>(&init_parameters)->default_value("normal{0/0.1}"), "initialize parameters, possible: 'none', 'uniform{a/b}', 'normal{mean/std}'")
     ("enforce_random_keys", po::value<bool>(&enforce_random_keys)->default_value(false), "enforce that keys are assigned randomly")
     ("enforce_full_replication", po::value<bool>(&enforce_full_replication)->default_value(false), "manually enforce full model replication")
     ("eval_truncate_tr", po::value<size_t>(&eval_truncate_tr)->default_value(2048), "truncate training dataset in evaluation (0 for no truncation)")

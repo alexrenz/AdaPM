@@ -141,7 +141,7 @@ You find example applications in the [apps/](apps/) directory and launch command
 #### Knowledge Graph Embeddings
 ```
 make apps/knowledge_graph_embeddings
-python3 tracker/dmlc_local.py-s 2 build/apps/knowledge_graph_embeddings --dataset apps/data/kge/ --num_entities 280 --num_relations 112 --num_epochs 4 --embed_dim 100 --eval_freq 2
+python3 tracker/dmlc_local.py -s 2 build/apps/knowledge_graph_embeddings --dataset apps/data/kge/ --num_entities 280 --num_relations 112 --num_epochs 4 --embed_dim 100
 ```
 
 #### Word vectors
