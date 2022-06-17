@@ -7,9 +7,9 @@
 #include "ps/internal/utils.h"
 namespace ps {
 
-#ifdef KEY_TYPE
+#ifdef PS_KEY_TYPE
 /*! \brief Use the specified key type */
-using Key = KEY_TYPE;
+using Key = PS_KEY_TYPE;
 #else
 /*! \brief Default: use unsigned 64-bit int as the key type */
 using Key = uint64_t;

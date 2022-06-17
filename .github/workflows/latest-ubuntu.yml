@@ -10,15 +10,21 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: Install package dependencies
-      run: sudo apt-get update && sudo apt-get install -y build-essential git libboost-all-dev
+      run: sudo apt-get update && sudo apt-get install -y build-essential git libboost-all-dev cmake libzmq3-dev libprotobuf-dev protobuf-compiler libeigen3-dev
     - name: Cache dependencies
       uses: actions/cache@v2
       with:
         path: deps
         key: ${{ runner.os }}-deps-latest-ubuntu-v2
 
+    - name: Get libtorch
+      run: wget https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.11.0%2Bcpu.zip && mkdir -p deps && unzip -q -o libtorch-cxx11-abi-shared-with-deps-1.11.0+cpu.zip -d deps
+
+    - name: CMake config
+      run: cmake -S . -B build -D TORCH_PATH=$(pwd)/deps/libtorch/
+
     - name: Compile
-      run: make
+      run: cmake --build build --target all
 
     - name: Tests (quick)
       run: tests/run_tests.sh dont_compile
@@ -27,4 +33,4 @@ jobs:
       run: tests/run_apps.sh
 
     - name: Compile with key tracing
-      run: rm -rf build && export PS_LDFLAGS="-DPS_TRACE_KEYS=1" && make
+      run: cmake -S . -B build_with_tracing -D PS_TRACE_KEYS=1 && cmake --build build --target all

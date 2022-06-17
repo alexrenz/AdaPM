@@ -4,7 +4,7 @@ rm -rf logs
 mkdir logs
 
 if [ "$1" != "dont_compile" ]; then
-    make tests -j || echo "Test compilation FAILED" > logs/compliation.log
+    cmake --build build --target tests -j || echo "Test compilation FAILED" > logs/compliation.log
 fi
 
 workload="--quick"

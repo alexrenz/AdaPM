@@ -399,7 +399,7 @@ void write_checkpoint(string output, WorkerT &kv, const bool write_syn1=false) {
     if (write_syn1) fclose(fo_syn1);
 
   } else { // write a text file
-    ofstream file;
+    std::ofstream file;
     file.open(output.c_str());
 
     file << vocab_size << " " << embed_dim << endl;

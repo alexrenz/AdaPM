@@ -82,7 +82,7 @@ bool create_binary_from_mmc (std::string fname, std::string fname_binary) {
 
 
   // output file
-  ofstream out(fname_binary, ios::out | ios::binary);
+  std::ofstream out(fname_binary, ios::out | ios::binary);
   std::cout << "Read text file of " << size1 << " x " << size2 << " matrix with " << nnz << " nnz" << endl;
   // wf.write((char *) &size1, sizeof(Student));
   out.write(reinterpret_cast<const char *>(&size1), sizeof(size1));
