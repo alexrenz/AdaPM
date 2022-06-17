@@ -83,47 +83,50 @@ A simple example:
   kv.Wait(kv.PullSample(h, keys, vals)); // pull the 3 samples (keys.size() determines how many samples are pulled)
 ```
 
-### Build
+## Build
 
 AdaPS requires a C++11 compiler such as `g++ >= 4.8` and boost for some the application examples. On Ubuntu >= 13.10, you
 can install it by
 ```
-sudo apt-get update && sudo apt-get install -y build-essential git libboost-all-dev
+sudo apt-get update && sudo apt-get install -y cmake build-essential git wget libboost-all-dev libzmq3-dev libprotobuf-dev protobuf-compiler libeigen3-dev
 ```
 
-Then clone and build
+Then clone and build (without torch support)
 
 ```bash
 git clone https://github.com/alexrenz/AdaPS
-cd AdaPS && make
+cd AdaPS
+cmake -S . -B build    # (equivalent old style for CMake<3.14: mkdir build && cd build && cmake ..)
+cmake --build build --target all -j
 ```
 
-See [bindings/README.md](bindings/README.md) for how to build the bindings.
+See [bindings/README.md](bindings/README.md) for how to build the **bindings**.
 
-### Getting started
+### CMake options
 
-A very simple example can be found in [simple.cc](apps/simple.cc). To run it, compile it:
+- Set `PROTOBUF_PATH` to link a specific protobuf installation (rather than relying on the system's default paths). E.g., we use this to build ABI-compatible PyTorch bindings (see [bindings/README.md](bindings/README.md)).
+- Set `CMAKE_BUILD_TYPE=Debug` to build debug binaries.
+- (Advanced) Set `PS_KEY_TYPE` to the data type that the PS should use as keys (default: `uint64_t`)
+- (Advanced) Set `PS_LOCALITY_STATS` to collect detailed locality statistics during run time.
+- (Advanced) Set `PS_TRACE_KEYS=1` to compile with key tracing support. Then set `--sys.trace.keys` and `--sys.stats.out` when starting an application on a cluster.
 
-```bash
-make apps/simple
-```
+## Getting started
 
-and run
+A very simple example can be found in [simple.cc](apps/simple.cc). To run it with one node and default parameters:
 
 ```bash
 python tracker/dmlc_local.py -s 1 build/apps/simple
 ```
 
-to run with one node and default parameters or 
+Or to run with 3 nodes and some specific parameters:
 
 ```bash
 python tracker/dmlc_local.py -s 3 build/apps/simple -v 5 -i 10 -k 14 -t 4
 ```
-to run with 3 nodes and specific parameters. Run `build/apps/simple --help` to see available parameters.
+Run `build/apps/simple --help` to see available parameters.
 
 
-
-### Starting an application
+## Starting an application on a cluster
 
 There are multiple start scripts. We commonly use the following ones:
 - [tracker/dmlc_local.py](tracker/dmlc_local.py) to run on a local machine
@@ -132,31 +135,28 @@ To see more information, run `python tracker/dmlc_local.py --help`, for example.
 
 The `-s` flag specifies how many processes/nodes to use. For example, `-s 4` uses 4 nodes. In each process, AdaPS starts one server thread and multiple worker threads. 
 
-### Example Applications
+## Example Applications
 
 You find example applications in the [apps/](apps/) directory and launch commands to locally run toy examples below. The toy datasets are in [apps/data/](apps/data/). 
 
 
-#### Knowledge Graph Embeddings
+### Knowledge Graph Embeddings
 ```
-make apps/knowledge_graph_embeddings
-python3 tracker/dmlc_local.py -s 2 build/apps/knowledge_graph_embeddings --dataset apps/data/kge/ --num_entities 280 --num_relations 112 --num_epochs 4 --embed_dim 100
-```
-
-#### Word vectors
-```
-make apps/word2vec
-python3 tracker/dmlc_local.py -s 2 build/apps/word2vec --num_threads 2 --negative 2 --binary 1 --num_keys 4970 --embed_dim 10  --input_file apps/data/lm/small.txt --num_iterations 4 --window 2 --data_words 10000
+python tracker/dmlc_local.py -s 2 build/apps/knowledge_graph_embeddings --dataset apps/data/kge/ --num_entities 280 --num_relations 112 --num_epochs 4 --embed_dim 100 
 ```
 
-#### Matrix Factorization
-
+### Word vectors
 ```
-make apps/matrix_factorization
-python3 tracker/dmlc_local.py -s 2 build/apps/matrix_factorization --dataset apps/data/mf/ -r 4 --num_rows 6 --num_cols 4 --epochs 10 --signal_intent_cols 1
+python tracker/dmlc_local.py -s 2 build/apps/word2vec --num_threads 2 --negative 2 --binary 1 --num_keys 4970 --embed_dim 10  --input_file apps/data/lm/small.txt --num_iterations 4 --window 2 --data_words 10000
 ```
 
-### Architecture
+### Matrix Factorization
+
+```
+python tracker/dmlc_local.py -s 2  build/apps/matrix_factorization --dataset apps/data/mf/ -r 2 --num_rows 6 --num_cols 4 --epochs 10
+```
+
+## Architecture
 
 AdaPS starts one process per node. Within this process, worker threads access the parameter store directly. A parameter server thread handles requests by other nodes, and a synchronization manager thread triggers replica synchronization and intent communication.
 

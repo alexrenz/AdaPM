@@ -2,7 +2,7 @@
 
 We provide (so far experimental) bindings to PyTorch. The bindings are specified in [bindings.cc](bindings.cc), usage examples can be found in [example.py](example.py). 
 
-The bindings provide the three primitives of AdaPS: `pull`, `push`, and `intent`. They further provide a `set` variant of the `push` primitive that sets parameter to specific values (instead of adding to the values, as `push` does).
+We provide bindings for the main primitives of AdaPS: `pull`, `push`, `intent`, `advance_clock`, `prepare_sample`, and `pull_sample`. They further provide a `set` variant of the `push` primitive that sets parameter to specific values (instead of adding to the values, as `push` does).
 
 ### PyTorch tensors
 
@@ -11,16 +11,17 @@ keys = torch.LongTensor([1,2,3,4])
 values = torch.ones((len(keys)*10), dtype=torch.float32)
 
 # pull
-kv.push(keys, values)
+kv.pull(keys, values)
 
 # push
-kv.pull(keys, values)
+kv.push(keys, values)
 
 # set (variant of push)
 kv.set(keys, values)
 
 # signal intent and advance clock
 kv.intent(keys, 2, 3)
+
 kv.advance_clock()
 ```
 
@@ -32,21 +33,22 @@ keys = np.array([1,2,3,4])
 values = np.ones(len(keys)*10, dtype=np.float32)
 
 # pull
-kv.push(keys, values)
+kv.pull(keys, values)
 
 # push
-kv.pull(keys, values)
+kv.push(keys, values)
 
 # set (variant of push)
 kv.set(keys, values)
 
 # signal intent and advance clock
 kv.intent(keys, 2, 3)
+
 kv.advance_clock()
 ```
 
 ### Synchronous and asynchronous operations
-By default, all operations run synchronously. To run asynchronously, pass `async=True` to any operation:
+By default, operations run synchronously. To run asynchronously, pass `async=True` to the operation:
 ```python
 kv.pull(keys, values, True)
 kv.push(keys, values, True)
@@ -61,42 +63,69 @@ timestamp = kv.pull(keys, values, True)
 
 kv.wait(timestamp) # wait for pull to finish
 ```
-All operations (`pull`, `push`, `set`, and `intent`) return a timestamp that can be used this way.
+Parameter access operations (`pull`, `push`, `set`, and `pull_sample`) return a timestamp that can be used this way.
 
 
 ## Installation
 
+To compile working bindings, it is important that AdaPS is built with a key
+data type that matches PyTorch and NumPy default integer data types (`int64`)
+and that AdaPS is built with the the same C++ ABI as the installed PyTorch. If
+you installed PyTorch in a normal way (e.g., pip or conda), it is likely that
+this PyTorch installation uses the old pre-C++11 ABI (apparently, this is done
+to ensure compatibility to old Python versions). If you are on a recent OS, this
+will be incompatible with system-provided Protocol Buffers. Thus, you will
+probably have to install Protocol Buffers manually. To check the ABI of your
+installed PyTorch, run `python bindings/lookup_torch_abi.py` (`0` means
+pre-C++11 ABI, `1` means C++ ABI). If that script returns `0` and you are on a
+recent OS with C++ ABI (e.g., compare `echo '#include <string>' | g++ -x c++ -E
+-dM - | fgrep _GLIBCXX_USE_CXX11_ABI`), you have to install Protocol Buffers
+manually. (Sorry :/)
 
-Compile AdaPS with `int64` keys (to match PyTorch and NumPy default integer data
-types) and with the appropriate ABI version, then use [setup.py](setup.py) to
-compile the bindings (see below). Pip PyTorch installations often use the old
-(pre C++11) ABI. The script [lookup_torch_abi.py](lookup_torch_abi.py) reads out
-the ABI version of the installed PyTorch. You can also specify the ABI version
-manually. To avoid ABI version conflicts with system provided libraries (e.g.,
-boost) for the apps in [apps/](apps/) (which use system-provided boost), compile
-the pre-C++ ABI dependencies to a separate path `deps_bindings` (using
-`DEPS_PATH=$(pwd)/deps_bindings`). If you compile the dependencies to another
-path than `deps_bindings` you have to modify [setup.py](setup.py).
 
-Make sure that you install PyTorch **before** you run the installation of AdaPS
-(below). Otherwise, the ABI read-out will not work (and instead just use the
-default ABI).
+To manually install protocol buffers with the pre-c++11 ABI, use:
 
 ```bash
-make clean
-make ps KEY_TYPE=int64_t CXX11_ABI=$(python bindings/lookup_torch_abi.py) DEPS_PATH=$(pwd)/deps_bindings
+# (in the root folder of this repository)
+wget https://github.com/protocolbuffers/protobuf/releases/download/v3.6.1/protobuf-cpp-3.6.1.tar.gz
+tar zxf protobuf-cpp-3.6.1.tar.gz
+cd protobuf-3.6.1
+mkdir release && cd release
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$(pwd)/../../deps/ -D CMAKE_CXX_FLAGS="-fPIC -D_GLIBCXX_USE_CXX11_ABI=0" -D protobuf_BUILD_TESTS=OFF ../cmake/
+make -j  # this can take a while
+make install
+```
+
+Then to compile AdaPS with the matching key type and the ABI of the installed PyTorch:
+```bash
+# (in the root folder of this repository)
+cmake -S . -B build_bindings -D PS_KEY_TYPE=int64_t -DPROTOBUF_PATH=$(pwd)/deps/lib/cmake/protobuf/ -D CMAKE_CXX_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=$(python bindings/lookup_torch_abi.py)"
+cmake --build build_bindings --target adaps
+```
+
+> **Note**
+> Make sure that PyTorch is installed before you build AdaPS. Otherwise, the ABI read-out (`$(python bindings/lookup_torch_abi.py)` above) will fail. Also make sure that you run the read-out with the python that you are using (i.e., potentially `python3` or `python3.9` rather than `python`).
+
+And finally, to compile the bindings:
+```bash
 cd bindings
 python setup.py install --user
 ```
 
+> **Note**
+> If you built AdaPS to another path than `build_bindings/` or you installed Protocol Buffers to a folder other than `deps/`, you need to pass these paths to `setup.py` explicitly via environment variables `BUILD_PATH` and `DEPS_PATH` (using absolute paths). E.g.: `BUILD_PATH=[ABSOLUTE_PATH_TO_BUILD] DEPS_PATH=[ABSOLUTE_PATH_TO_PROTOBUF_INSTALL] python setup.py install --user`
 
-If successful, you can now use AdaPS in Python
+If successful, you can now use AdaPS from Python
 
 ```python
 #!/usr/bin/python
 import torch
 import adaps
 ```
+
+You should also be able to run `python bindings/example.py` without error messages.
+
+
 
 ## Experimental status
 

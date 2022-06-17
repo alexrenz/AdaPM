@@ -39,10 +39,9 @@
          In this case, consistency is guaranteed because only the server thread accesses
          local parameters.
 
-   The desired backend data structure can be specified with the compilation flag PS_BACKEND in
-   the external variable PS_LDFLAGS. E.g, the following compiles the knowledge graph
-   embeddings app with an unordered map:
-   export PS_LDFLAGS="-DPS_BACKEND=1"; make apps/knowledge_graph_embeddings
+   The desired backend data structure can be specified with the compilation flag
+   PS_BACKEND in cmake. E.g, to compile with the unordered map as backend data
+   structure, run cmake as follows: `cmake -S . -B build -DPS_BACKEND=1`
 
 */
 
@@ -963,7 +962,7 @@ inline bool attemptLocalPull(const Key key, Val* val, const bool stats=true) {
     // write out locality stats
 #if PS_LOCALITY_STATS
     std::string outfile (Postoffice::Get()->get_stats_output_folder() + "/locality_stats.rank." + std::to_string(my_rank) + ".tsv");
-    std::ofstream statsfile (outfile, ofstream::trunc);
+    std::ofstream statsfile (outfile, std::ofstream::trunc);
     long total_accesses = 0, total_accesses_local = 0;
     statsfile << "Param\tAccesses\tLocal\n";
     for (uint i=0; i!=num_accesses.size(); ++i) {

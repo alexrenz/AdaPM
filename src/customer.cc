@@ -66,7 +66,6 @@ void Customer::Receiving() {
   // stats
   long long q_size = 0;
   long long iterations = 0;
-  auto r = Postoffice::Get()->my_rank();
 
   // receive loop
   while (true) {
@@ -76,7 +75,7 @@ void Customer::Receiving() {
     if (!recv.meta.control.empty() &&
         recv.meta.control.cmd == Control::TERMINATE) {
       if (Postoffice::Get()->is_ps(customer_id_)) {
-        ADLOG("Mean length of recv queue in ps-" << r << "-" << Postoffice::Get()->fchannel(customer_id_, true) << ": " << std::setprecision(5) << 1.0*q_size/iterations);
+        ADLOG("Mean length of recv queue in ps-" << Postoffice::Get()->my_rank() << "-" << Postoffice::Get()->fchannel(customer_id_, true) << ": " << std::setprecision(5) << 1.0*q_size/iterations);
       }
       break;
     }

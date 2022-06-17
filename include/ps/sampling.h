@@ -129,7 +129,7 @@ namespace ps {
 #if PS_LOCALITY_STATS
       // write number of non-deterministic accesses to file
       std::string outfile ("stats/locality_stats.sampling.rank." + std::to_string(myRank) + ".tsv");
-      ofstream statsfile (outfile, ofstream::trunc);
+      std::ofstream statsfile (outfile, std::ofstream::trunc);
       long total_accesses = 0;
       statsfile << "Param\tAccesses\n";
       for (uint i=0; i!=num_accesses.size(); ++i) {
