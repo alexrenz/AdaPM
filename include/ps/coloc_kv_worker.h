@@ -539,7 +539,7 @@ namespace ps {
         std::this_thread::sleep_for(std::chrono::microseconds(100));
       }
 
-      ADLOG("r" << Postoffice::Get()->my_rank() << "-w" << workerId() << ": Waited for syncs " << str(wait_syncs));
+      ALOG("r" << Postoffice::Get()->my_rank() << "-w" << workerId() << ": Waited for syncs " << str(wait_syncs));
     }
 
     /**

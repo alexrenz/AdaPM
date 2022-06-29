@@ -166,8 +166,8 @@ public:
     p_num_channels_(std::log2(Postoffice::Get()->num_channels())) {
 
     long store_max = Postoffice::Get()->num_keys();
-    ADLOG("Creating handle for " << store_max << " keys with " <<
-          (value_lengths.size() == 1 ? "uniform" : "non-uniform") << " lengths ");
+    ALOG("Creating handle for " << store_max << " keys with " <<
+         (value_lengths.size() == 1 ? "uniform" : "non-uniform") << " lengths ");
 
 #if PS_BACKEND == PS_BACKEND_STD_UNORDERED_LOCKS
     ALOG("Handle data structure: std::unordered_map with " << mu_.size() << " locks");
@@ -204,7 +204,7 @@ public:
 
     // capture detailed locality statistics
 #if PS_LOCALITY_STATS
-    ADLOG("Capture locality statistics for " << store_max << " keys");
+    ALOG("Capture locality statistics for " << store_max << " keys");
     num_accesses.resize(store_max, 0);
     num_accesses_local.resize(store_max, 0);
 #endif
@@ -971,7 +971,7 @@ inline bool attemptLocalPull(const Key key, Val* val, const bool stats=true) {
       total_accesses_local += num_accesses_local[i];
     }
     statsfile.close();
-    ADLOG("Wrote locality stats for rank " << my_rank << " to " << outfile << ". Total: " << total_accesses << " accesses, " << total_accesses_local << " local." );
+    ALOG("Wrote locality stats for rank " << my_rank << " to " << outfile << ". Total: " << total_accesses << " accesses, " << total_accesses_local << " local." );
 #endif
 
     // write out key traces

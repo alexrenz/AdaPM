@@ -101,7 +101,7 @@ namespace ps {
       sample_key_(sample_key), id_counters(Postoffice::Get()->num_worker_threads(), 1),
       server_(server) {
 #if PS_LOCALITY_STATS
-      ADLOG("Capture number of non-deterministic accesses per key");
+      ALOG("Capture number of non-deterministic accesses per key");
       myRank = Postoffice::Get()->my_rank();
       num_accesses.resize(Postoffice::Get()->num_keys(), 0);
 #endif
@@ -137,7 +137,7 @@ namespace ps {
         total_accesses += num_accesses[i];
       }
       statsfile.close();
-      ADLOG("Wrote non-deterministic access stats for rank " << myRank << " to " << outfile << ". Total: " << total_accesses << " accesses");
+      ALOG("Wrote non-deterministic access stats for rank " << myRank << " to " << outfile << ". Total: " << total_accesses << " accesses");
 #endif
     }
 

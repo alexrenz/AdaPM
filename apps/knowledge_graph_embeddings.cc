@@ -227,7 +227,7 @@ void pull_full_model(std::vector<ValT>& E, std::vector<ValT>& R, WorkerT& kv) {
   kv.Wait(kv.Pull(E_keys, &E), kv.Pull(R_keys, &R));
 
   sw_pull.stop();
-  ADLOG("Model pulled (" << sw_pull << ")");
+  ALOG("Model pulled (" << sw_pull << ")");
 }
 
 
@@ -290,7 +290,7 @@ public:
             __or2s[__or].push_back(s);
         }
 
-        ADLOG("SROBucket: skipped " << duplicates << " duplicate data points");
+        ALOG("SROBucket: skipped " << duplicates << " duplicate data points");
     }
 
     bool contains(int a, int b, int c) const {
@@ -326,7 +326,7 @@ public:
 
   // saves a given model to disk
   void save(const uint epoch, const string& fname, WorkerT& kv, const bool export_for_eval=true, const bool write_checkpoint=false) {
-    ADLOG("Save model (" << (export_for_eval ? "eval export" : "") << (write_checkpoint ? ", checkpoint" : "") <<
+    ALOG("Save model (" << (export_for_eval ? "eval export" : "") << (write_checkpoint ? ", checkpoint" : "") <<
           ") for epoch " << epoch << " to " << fname << "*.epoch." << std::to_string(epoch) << ".*.bin");
     // pull the model
     std::vector<ValT> E {};
@@ -524,7 +524,6 @@ public:
 
       adagrad_update(E_s, R_r, E_o, d_s, d_r, d_o);
 
-      // ADLOG("Push. Key: " << key_r << "\nValues: " << update_r);
       if (async_push) {
         kv.Push(key_s, update_s); kv.Push(key_r, update_r); kv.Push(key_o, update_o);
       } else {
@@ -934,11 +933,11 @@ void run_eval(const uint epoch, double& best_mrr, const int worker_id, WorkerT& 
   // evaluate
   util::Stopwatch sw_eval;
   sw_eval.start();
-  ADLOG("Evaluation (TR truncate " << eval_truncate_tr << ", VA truncate " << eval_truncate_va << ")");
+  ALOG("Evaluation (TR truncate " << eval_truncate_tr << ", VA truncate " << eval_truncate_va << ")");
   auto info_tr = evaluator_tr->evaluate(model, eval_truncate_tr, E, R, worker_id, kv);
   auto info_va = evaluator_va->evaluate(model, eval_truncate_va, E, R, worker_id, kv);
   sw_eval.stop();
-  ADLOG("Worker " << worker_id << ": eval finished (" << sw_eval << ")");
+  ALOG("Worker " << worker_id << ": eval finished (" << sw_eval << ")");
 
   // save the best model to disk
   if (worker_id == 0) {
@@ -971,7 +970,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
   int N_per_thread = ceil(1.0 * N / num_workers);
   vector<int> pi = range(N_per_thread, N_per_thread*worker_id);
 
-  ADLOG("Worker " << worker_id << " reads data points " << pi[0] << ".." << pi[pi.size()-1]);
+  ALOG("Worker " << worker_id << " reads data points " << pi[0] << ".." << pi[pi.size()-1]);
   std::mt19937 gen_shuffle (model_seed^worker_id);
 
   // replicate all keys on all nodes throughout training
@@ -999,14 +998,14 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     if (std::regex_match(init_parameters, matches, uniform_regex)) { // uniform distribution
       auto low = std::stod(matches[1].str());
       auto high = std::stod(matches[2].str());
-      ADLOG("Init model (uniform{" << low << "/" << high <<"}, seed " << model_seed << ") ... ");
+      ALOG("Init model (uniform{" << low << "/" << high <<"}, seed " << model_seed << ") ... ");
       std::uniform_real_distribution<double> dist (low, high);
       init_vals = model->init_ps([&dist, &gen_initial](){return dist(gen_initial);});
 
     } else if (std::regex_match(init_parameters, matches, normal_regex)) { // normal distribution
       auto mean = std::stod(matches[1].str());
       auto std = std::stod(matches[2].str());
-      ADLOG("Init model (normal{" << mean << "/" << std <<"}, seed " << model_seed << ") ... ");
+      ALOG("Init model (normal{" << mean << "/" << std <<"}, seed " << model_seed << ") ... ");
       std::normal_distribution<double> dist (mean, std);
       init_vals = model->init_ps([&dist, &gen_initial](){return dist(gen_initial);});
 
@@ -1016,7 +1015,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     }
 
     kv.Wait(kv.Push(keys, init_vals));
-    ADLOG("Init model done: " << init_vals[0] << " " << init_vals[1] << " " << init_vals[2] << " ... ");
+    ALOG("Init model done: " << init_vals[0] << " " << init_vals[1] << " " << init_vals[2] << " ... ");
   }
   kv.EndSetup();
 
@@ -1029,7 +1028,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
       int r = get<1>(sro);
       local_relations.insert(relation_key(r));
     }
-    ADLOG("Worker " << worker_id << " has long-term intent for relations " << local_relations);
+    ALOG("Worker " << worker_id << " has long-term intent for relations " << local_relations);
     kv.Intent(std::move(local_relations), 0, CLOCK_MAX);
   }
   kv.Barrier();
@@ -1048,7 +1047,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
   kv.Barrier(); // make sure all workers start the epoch at the same time
   for (uint epoch = 1; epoch <= num_epochs; epoch++) {
-    ADLOG("Worker " << worker_id << " starts epoch " << epoch);
+    ALOG("Worker " << worker_id << " starts epoch " << epoch);
     sw["epoch"].start(); sw["epoch_worker"].start(); sw["runtime"].resume();
 
     // iterate over data points
@@ -1095,7 +1094,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
       // run only first N data points per thread (for fast testing)
       if (max_N_per_thread != -1 && i >= max_N_per_thread) {
-        ADLOG("Worker " << worker_id << ": SHORT epoch. Ended after " << max_N_per_thread << " data points");
+        ALOG("Worker " << worker_id << ": SHORT epoch. Ended after " << max_N_per_thread << " data points");
         break;
       }
 
@@ -1126,7 +1125,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
     // make sure all workers finished
     sw["epoch_worker"].stop();
-    ADLOG("Worker " << worker_id << " finished epoch " << epoch << " (" << sw["epoch_worker"] << ")");
+    ALOG("Worker " << worker_id << " finished epoch " << epoch << " (" << sw["epoch_worker"] << ")");
     kv.Barrier();
     sw["epoch"].stop();
     sw["runtime"].stop();
@@ -1138,7 +1137,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     auto global_loss = global_bce_loss + global_reg_loss;
 
     if (worker_id == 0) {
-      ADLOG("All workers finished epoch " << epoch << " (epoch: " << sw["epoch"] << ", total: " << sw["runtime"] << "). Training loss: " << global_loss << " (" << global_bce_loss << " + " << global_reg_loss << ").");
+      ALOG("All workers finished epoch " << epoch << " (epoch: " << sw["epoch"] << ", total: " << sw["runtime"] << "). Training loss: " << global_loss << " (" << global_bce_loss << " + " << global_reg_loss << ").");
     }
 
     // save checkpoint
@@ -1160,7 +1159,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     // maximum time
     if (sw["runtime"].elapsed_s() > max_runtime ||
         sw["runtime"].elapsed_s() + sw["epoch"].elapsed_s() > max_runtime * 1.05) {
-      ADLOG("Worker " << worker_id << " stops after epoch " << epoch << " because max. time is reached: " << sw["runtime"].elapsed_s() << "s (+1 epoch) > " << max_runtime << "s (epoch: " << sw["epoch"].elapsed_s() << "s)");
+      ALOG("Worker " << worker_id << " stops after epoch " << epoch << " because max. time is reached: " << sw["runtime"].elapsed_s() << "s (+1 epoch) > " << max_runtime << "s (epoch: " << sw["epoch"].elapsed_s() << "s)");
       break;
     }
 
@@ -1255,7 +1254,7 @@ int main(int argc, char *argv[]) {
     model = new Complex (ne, nr, embed_dim, eta);
     algorithm = Alg::ComplEx;
   } else {
-    ADLOG("Unkown KGE model '" << alg << "'! Supported: RESCAL and ComplEx");
+    ALOG("Unkown KGE model '" << alg << "'! Supported: RESCAL and ComplEx");
     return 0;
   }
 

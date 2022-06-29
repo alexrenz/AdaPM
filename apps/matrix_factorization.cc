@@ -129,7 +129,7 @@ double calculate_loss(const int epoch, std::vector<Key>& local_w_keys,
   double local_test_loss = 0;
   double local_train_reg = 0;
   if (!prevent_full_model_pull) {
-    if (worker_id == 0) ADLOG("Pull model for loss calc");
+    if (worker_id == 0) ALOG("Pull model for loss calc");
 
     // pull local part of W
     std::vector<ValT> local_w_worker {};
@@ -162,12 +162,10 @@ double calculate_loss(const int epoch, std::vector<Key>& local_w_keys,
     std::tie(local_test_loss, std::ignore)      = loss_Nzsl_L2(test_data,  *local_w, full_h, 0.0,    worker_id, add_w_l2);
   } else {
     // calculate loss (pulling necessary factors on demand)
-    if (worker_id == 0) ADLOG("No full model pull for eval. Pull factors on demand.");
+    if (worker_id == 0) ALOG("No full model pull for eval. Pull factors on demand.");
     std::tie(local_train_loss, local_train_reg) = loss_Nzsl_L2_pull(train_data, kv, local_w_keys, lambda, worker_id, add_w_l2);
     std::tie(local_test_loss, std::ignore)      = loss_Nzsl_L2_pull(test_data,  kv, local_w_keys, 0.0,    worker_id, add_w_l2);
   }
-  // ADLOG("Local training loss (worker " << worker_id << "): " << local_train_loss);
-  // ADLOG("Local test loss (worker " << worker_id << "): " << local_test_loss);
 
   // aggregate local losses to global loss (using the PS)
   agg_vec[0] = local_train_loss;
@@ -181,8 +179,8 @@ double calculate_loss(const int epoch, std::vector<Key>& local_w_keys,
   auto test_loss = (agg_vec[2]) / test_data.total_nnz();
 
   if (worker_id == 0) {
-    ADLOG("(Ep." << epoch << ") Train loss: " << train_loss << " (" << agg_vec[0] / train_data.total_nnz() << " + " << agg_vec[1] / train_data.total_nnz() << ")");
-    ADLOG("(Ep." << epoch << ") Test loss:  " << test_loss);
+    ALOG("(Ep." << epoch << ") Train loss: " << train_loss << " (" << agg_vec[0] / train_data.total_nnz() << " + " << agg_vec[1] / train_data.total_nnz() << ")");
+    ALOG("(Ep." << epoch << ") Test loss:  " << test_loss);
   }
 
   return train_loss;
@@ -398,7 +396,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
   /* Training loop */
   for(int epoch = 1; epoch != epochs+1; ++epoch) {
-    if (worker_id == 0) ADLOG("(Ep." << epoch << ") Starting epoch " << epoch);
+    if (worker_id == 0) ALOG("(Ep." << epoch << ") Starting epoch " << epoch);
     sw["epoch.worker"].start();
     sw["epoch"].start();
     sw["runtime"].resume();
@@ -410,7 +408,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
     if (algorithm == Alg::dsgd) { // use DSGD to create locality in parameter accesses
       for(uint subepoch = 0; subepoch != num_workers; ++subepoch) {
-        if (worker_id == 0) ADLOG("Subepoch " << epoch << "." << subepoch);
+        if (worker_id == 0) ALOG("Subepoch " << epoch << "." << subepoch);
 
         // get the block this workers works on in this epoch
         sw["comm"].resume();
@@ -457,13 +455,10 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
         sw["barrier"].resume();
         kv.Barrier();
         sw["barrier"].stop();
-
-        // ADLOG("Subepoch " << epoch << "." << subepoch << " took " << sw["subepoch"]);
       }
     } else if (algorithm == Alg::columnwise) { // columnwise
       // permute columns
       sw["perm"].resume();
-      ADLOG("Permute columns");
       if(use_wor_block_schedule) std::random_shuffle(my_columns.begin(), my_columns.end());
       sw["perm"].stop();
 
@@ -529,13 +524,13 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
 
       // permute training data points (WOR training schedule)
       sw["perm"].resume();
-      if (worker_id == 0) ADLOG("Permute ...");
+      if (worker_id == 0) ALOG("Permute ...");
       if (use_wor_point_schedule) data.permuteData();
       sw["perm"].stop();
 
       // iterate over the nonzeros that are partitioned to this worker
       sw["comp"].resume();
-      if (worker_id == 0) ADLOG("Compute ...");
+      if (worker_id == 0) ALOG("Compute ...");
       unsigned long z_future=0;
       for (unsigned long z=0; z!=data.num_nnz(); ++z) {
         const mf::DataPoint& dp = data.data()[data.permutation()[z]];
@@ -584,7 +579,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     }
     sw["epoch"].stop();
     sw["runtime"].stop();
-    ADLOG("(Ep." << epoch << ") Worker " << worker_id << " finished epoch " << epoch <<" (" << sw["epoch"] << ": " << sw["comm"] << " comm, "  << sw["comp"] << " comp, " << sw["barrier"] << " barrier, updates: " << updates <<")");
+    ALOG("(Ep." << epoch << ") Worker " << worker_id << " finished epoch " << epoch <<" (" << sw["epoch"] << ": " << sw["comm"] << " comm, "  << sw["comp"] << " comp, " << sw["barrier"] << " barrier, updates: " << updates <<")");
     if (worker_id == 0) {
       ALOG("All workers finished epoch " << epoch << " (epoch: " << sw["epoch"] << ", total: " << sw["runtime"] << ").");
     }
@@ -599,12 +594,12 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
         if (train_loss < previous_train_loss) {
           update_fun.update_step_size(increase_step_factor); // good epoch. increase step size slightly
           if (worker_id == 0) {
-            ADLOG("Bold driver: Increase step size to " << update_fun.current_step_size() << " (Train loss: " << previous_train_loss << " -> " << train_loss << ")");
+            ALOG("Bold driver: Increase step size to " << update_fun.current_step_size() << " (Train loss: " << previous_train_loss << " -> " << train_loss << ")");
           }
         } else {
           update_fun.update_step_size(decrease_step_factor); // bad epoch. reduce step size
           if (worker_id == 0) {
-            ADLOG("Bold driver: Decrease step size to " << update_fun.current_step_size() << " (Train loss: " << previous_train_loss << " -> " << train_loss << ")");
+            ALOG("Bold driver: Decrease step size to " << update_fun.current_step_size() << " (Train loss: " << previous_train_loss << " -> " << train_loss << ")");
           }
         }
       }
@@ -615,7 +610,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     // maximum time
     if (sw["runtime"].elapsed_s() > max_runtime ||
         sw["runtime"].elapsed_s() + sw["epoch"].elapsed_s() > max_runtime * 1.05) {
-      ADLOG("Worker " << worker_id << " stops after epoch " << epoch << " because max. time is reached: " << sw["runtime"].elapsed_s() << "s (+1 epoch) > " << max_runtime << "s (epoch: " << sw["epoch"].elapsed_s() << "s)");
+      ALOG("Worker " << worker_id << " stops after epoch " << epoch << " because max. time is reached: " << sw["runtime"].elapsed_s() << "s (+1 epoch) > " << max_runtime << "s (epoch: " << sw["epoch"].elapsed_s() << "s)");
       break;
     }
   }

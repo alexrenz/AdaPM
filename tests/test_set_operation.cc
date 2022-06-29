@@ -64,7 +64,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
     if (worker_id == 0) {
       kv.Wait(kv.Pull(keys1, &testvals));
       if(correctvals != testvals) {
-        ADLOG("Run " << checkrun << ", initial check failed: actual " << testvals << ", correct " << correctvals);
+        ALOG("Run " << checkrun << ", initial check failed: actual " << testvals << ", correct " << correctvals);
         error = true;
       }
       kv.advanceClock();
@@ -112,7 +112,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
         correctvals[1] += w*2 * pullpush_runs;
       }
       if(correctvals != testvals) {
-        ADLOG("Run " << checkrun << ", end check failed: actual " << testvals << ", correct " << correctvals);
+        ALOG("Run " << checkrun << ", end check failed: actual " << testvals << ", correct " << correctvals);
         error = true;
       }
     }

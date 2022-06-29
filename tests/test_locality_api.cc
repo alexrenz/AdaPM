@@ -164,7 +164,6 @@ int main(int argc, char *argv[]) {
     // wait for the workers to finish
     for (size_t w=0; w!=workers.size(); ++w) {
       workers[w].join();
-      ADLOG("Customer r" << Postoffice::Get()->my_rank() << ":c" << w+1 << " joined");
     }
 
     // stop the server
