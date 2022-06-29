@@ -137,16 +137,6 @@ inline void InitLogging(const char* argv0) {
   std::stringstream ___s; ___s << ___time.str() << x << "\n"; std::cout << ___s.str() << std::flush; \
 } // atomic log [sysChange]
 
-// LOG FOR PARAMETER TRANSFERS
-#define TRANSFER_LOG false
-#if TRANSFER_LOG
-#define TLOG(key, requester, msg) \
-  ADLOG("Localize(" << key << ")->" << requester << " @ " << Postoffice::Get()->my_rank() << ": " << msg);
-#else
-#define TLOG(key, requester, msg) \
- while (false) CHECK(true);
-#endif // TRANSFER_LOG
-
 #define LOG_INFO dmlc::LogMessage(__FILE__, __LINE__)
 #define LOG_ERROR LOG_INFO
 #define LOG_WARNING LOG_INFO

@@ -51,7 +51,6 @@ int Customer::NumResponse(int timestamp) {
 
 int Customer::HasAllResponses(int timestamp) {
   std::lock_guard<std::mutex> lk(tracker_mu_);
-  // ADLOG("r" << Postoffice::Get()->my_rank() << ":c" << customer_id_ << ":t" << timestamp <<" has " << tracker_[timestamp].second << "/" << tracker_[timestamp].first << " responses");
   return tracker_[timestamp].first == tracker_[timestamp].second;
 }
 
@@ -75,7 +74,7 @@ void Customer::Receiving() {
     if (!recv.meta.control.empty() &&
         recv.meta.control.cmd == Control::TERMINATE) {
       if (Postoffice::Get()->is_ps(customer_id_)) {
-        ADLOG("Mean length of recv queue in ps-" << Postoffice::Get()->my_rank() << "-" << Postoffice::Get()->fchannel(customer_id_, true) << ": " << std::setprecision(5) << 1.0*q_size/iterations);
+        ALOG("Mean length of recv queue in ps-" << Postoffice::Get()->my_rank() << "-" << Postoffice::Get()->fchannel(customer_id_, true) << ": " << std::setprecision(5) << 1.0*q_size/iterations);
       }
       break;
     }

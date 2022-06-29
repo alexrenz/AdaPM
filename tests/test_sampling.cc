@@ -148,7 +148,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
 
   kv.Barrier();
   duration.stop();
-  if (worker_id == 0) { ADLOG("Sampling test took " << duration); }
+  if (worker_id == 0) { ALOG("Sampling test took " << duration); }
 
   kv.Finalize();
 }

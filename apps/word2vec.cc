@@ -134,7 +134,7 @@ void InitUnigramTable() {
     table[a] = i;
     if (a / (double) table_size > d1) {
       if (i == 1 || i == 10 || i == 100 || i == 1000 || i == 10000) {
-        ADLOG(setw(5) << setfill(' ') << i << " most frequent words have " << d1 << " sampling probability");
+        ALOG(setw(5) << setfill(' ') << i << " most frequent words have " << d1 << " sampling probability");
       }
       i++;
       d1 += unigram_pow(i) / train_words_pow;
@@ -412,7 +412,7 @@ void write_checkpoint(string output, WorkerT &kv, const bool write_syn1=false) {
     file.close();
   }
   sw.stop();
-  ADLOG("Current embeddings have been written to '" << output << "' (" << sw << ")");
+  ALOG("Current embeddings have been written to '" << output << "' (" << sw << ")");
 }
 
 // update step using AdaGrad
@@ -504,7 +504,6 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
 
 
   ValT f, g;
-  ADLOG("[w" << worker_id << "] begins work");
 
   // allocate memory for local parameters
   vector <ValT> syn0        (embed_dim*2);
@@ -527,7 +526,7 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
 
   } else {
     auto pos = (file_size / (long long) num_workers) * (long long) worker_id;
-    ADLOG("Worker " << worker_id << ": Start at position " << pos << " of " << file_size);
+    ALOG("Worker " << worker_id << ": Start at position " << pos << " of " << file_size);
     fseek(fi, pos, SEEK_SET);
   }
 
@@ -542,9 +541,6 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
   sw_worker.start();
   sw_epoch.start();
   sw_epoch_all.start();
-  util:: Stopwatch sw_wait_syn0;
-  util:: Stopwatch sw_wait_syn1_pos;
-  util:: Stopwatch sw_find_neg;
   long current_sentence = 0;
   long future_sentence = 0;
 
@@ -635,12 +631,12 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
         auto fepoch = num_iterations - local_iter; //finished epochs
 
         sw_epoch.stop();
-        ADLOG("Worker " << worker_id << " finished epoch " << fepoch << " (" << sw_epoch << "). [sentence " << current_sentence << "]" );
+        ALOG("Worker " << worker_id << " finished epoch " << fepoch << " (" << sw_epoch << "). [sentence " << current_sentence << "]" );
         kv.Barrier();
         sw_epoch_all.stop();
         sw_train.stop();
         if (worker_id == 0) {
-          ADLOG("All workers finished epoch " << fepoch << " (epoch: " << sw_epoch_all << ", total: " << sw_train << ")");
+          ALOG("All workers finished epoch " << fepoch << " (epoch: " << sw_epoch_all << ", total: " << sw_train << ")");
         }
 
         if (write_results) {
@@ -649,21 +645,20 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
           kv.Barrier();
           if (customer_id == 0 && ps::MyRank() == ps::NumServers()-1) {// last rank saves (usually this is the first node)
             util::Stopwatch sw_write; sw_write.start();
-            ADLOG("Write epoch " << fepoch << " embeddings");
+            ALOG("Write epoch " << fepoch << " embeddings");
             write_checkpoint(out_file + ".epoch." + to_string(fepoch), kv);
           }
         }
         kv.Barrier();
 
         if (local_iter == 0) {
-          ADLOG("[w" << worker_id << "] Wait syn0: " << sw_wait_syn0 << "  Wait syn1 positive: " << sw_wait_syn1_pos << "  Find negative: " << sw_find_neg);
           break;
         }
 
         // maximum time
         if (sw_train.elapsed_s() > max_runtime ||
             sw_train.elapsed_s() + sw_epoch_all.elapsed_s() > max_runtime * 1.05) {
-          ADLOG("Worker " << worker_id << " stops after epoch " << fepoch << " because max. time is reached: " << sw_train.elapsed_s() << "s (+1 epoch) > " << max_runtime << "s (epoch: " << sw_epoch_all.elapsed_s() << "s)");
+          ALOG("Worker " << worker_id << " stops after epoch " << fepoch << " because max. time is reached: " << sw_train.elapsed_s() << "s (+1 epoch) > " << max_runtime << "s (epoch: " << sw_epoch_all.elapsed_s() << "s)");
           break;
         }
 
@@ -694,9 +689,7 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
         if (last_word == -1) continue;
 
         syn0_key[0] = syn0KeyResolver(last_word);
-        sw_wait_syn0.resume();
         kv.Wait(kv.Pull(syn0_key, &syn0));
-        sw_wait_syn0.stop();
 
         std::fill(syn0_update.begin(), syn0_update.end(), 0);
 
@@ -708,17 +701,13 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
             target = word;
             syn1neg_key[0] = syn1KeyResolver(target); // precomputed in preload neg_samples
 
-            sw_wait_syn1_pos.resume();
             kv.Wait(kv.Pull(syn1neg_key, &syn1));
-            sw_wait_syn1_pos.stop();
           } else { // negative sample
             label = 0;
 
             // Retrieve a negative sample
-            sw_find_neg.resume();
             kv.Wait(kv.PullSample(sample_ids[current_sentence], syn1neg_key, syn1));
             target = syn1Reverse(syn1neg_key[0]);
-            sw_find_neg.stop();
 
             if (target == word)
               continue;
@@ -768,12 +757,12 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
 
 
   sw_worker.stop();
-  ADLOG("[w" << worker_id << "] finished training (" << sw_worker << "). Processed " << word_count << " words.");
+  ALOG("[w" << worker_id << "] finished training (" << sw_worker << "). Processed " << word_count << " words.");
 
   kv.Barrier();
   sw_train.stop();
   if (worker_id == 0) {
-    ADLOG("All workers finished training (" << sw_train << ")");
+    ALOG("All workers finished training (" << sw_train << ")");
   }
 
 
@@ -781,7 +770,6 @@ void training_thread(WorkerT &kv, int customer_id, int worker_id) {
   kv.Barrier(); // make sure all requests in the system have been answered
 
   fclose(fi);
-  ADLOG("[w" << worker_id << "] has passed the training barrier ");
 }
 
 // handles loading vocab into memory, found in the original TrainModel()
@@ -792,13 +780,11 @@ void load_vocab(int worker_id) {
   } else {
     LearnVocabFromTrainFile();
 
-    ADLOG("[w" << worker_id << "] ______ done loading vocab from'" << in_file << "' into memory" << endl);
-
   }
 
   if (vocab_save.size() != 0) {
     SaveVocab();
-    ADLOG("______Vocab was written to::'" << vocab_save << "'");
+    ALOG("Vocab was written to '" << vocab_save << "'");
   }
 }
 
@@ -957,7 +943,7 @@ void init_shared_datastructures () {
     std::size_t found = in_file.find(slash);
     CHECK(found != std::string::npos) << " full path needed for clustered input" << endl;
     in_file = clustered_ingest(in_file);
-    ADLOG("Clustered Input:: Inputfile will be loaded as:: '" << in_file << "' " << endl);
+    ALOG("Clustered Input: Inputfile will be loaded as:: '" << in_file << "' " << endl);
   }
 
   // load vocabulary and initialize exponent table
@@ -990,7 +976,6 @@ void init_shared_datastructures () {
   CHECK(num_keys >= min_key && num_keys <= max_key) << "number of keys should be set between " << min_key << " and "
                                                     << max_key << " (vocab size " << vocab_size << ")";
 
-  ADLOG("______Global datastructures have been set up.______" << endl);
 }
 
 // sort a collection of pairs by the first element, in descending order

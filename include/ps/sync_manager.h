@@ -468,7 +468,7 @@ namespace ps {
       if (!std::isinf(sync_threshold)) { // threshold=inf disables sync entirely
         while (true) {
           if (terminate) {
-            ADLOG("Terminate signal at SM" << my_rank << Postoffice::Get()->fchannel(my_channel) << ". Shut down.");
+            ALOG("Terminate signal at SM" << my_rank << Postoffice::Get()->fchannel(my_channel) << ". Shut down.");
             break;
           }
 
