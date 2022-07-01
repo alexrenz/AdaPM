@@ -8,11 +8,11 @@
 #include <iterator>
 #include <vector>
 #include <thread>
+#include <random>
 #include <boost/random/uniform_int.hpp>
 #include <boost/random/uniform_real.hpp>
 #include <boost/random/normal_distribution.hpp>
 #include <boost/random/variate_generator.hpp>
-#include <boost/random/mersenne_twister.hpp>
 #include <boost/timer/timer.hpp>
 #include <boost/generator_iterator.hpp>
 #include <boost/program_options.hpp>
@@ -189,7 +189,7 @@ double calculate_loss(const int epoch, std::vector<Key>& local_w_keys,
 void RunWorker(int customer_id, ServerT* server=nullptr) {
   WorkerT kv(customer_id, *server);
 
-  boost::random::mt19937 rng(static_cast<unsigned int>(std::time(0)));
+  std::mt19937 rng(static_cast<unsigned int>(std::time(0)));
   std::unordered_map<std::string, util::Stopwatch> sw {};
   util::Trace trace {"./measurements/mf/mf_trace.csv"};
 
@@ -242,7 +242,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
       // init model randomly
       ALOG("Init H randomly (seed " << model_seed << ")");
       init_h.resize(num_cols * param_len);
-      boost::random::mt19937 rng_H (model_seed+133273);
+      std::mt19937 rng_H (model_seed+133273);
       for (long col=0; col!=num_cols ; ++col) {
           for (long r=0; r!=mf_rank; ++r) {
             init_h[col*param_len+r] = factor_generator(rng_H);
@@ -290,7 +290,7 @@ void RunWorker(int customer_id, ServerT* server=nullptr) {
     } else if (init_parameters == 2) {
       // init model randomly
       ALOG("Init W randomly (seed " << model_seed << ")");
-      boost::random::mt19937 rng_W (model_seed);
+      std::mt19937 rng_W (model_seed);
 
       // optional: write out initial random factors
       std::ofstream out {};
