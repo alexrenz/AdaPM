@@ -1,0 +1,34 @@
+name: Run on Ubuntu 20.04
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Install package dependencies
+      run: sudo apt-get update && sudo apt-get install -y build-essential git libboost-all-dev cmake libzmq3-dev libprotobuf-dev protobuf-compiler libeigen3-dev
+    - name: Cache dependencies
+      uses: actions/cache@v2
+      with:
+        path: deps
+        key: ${{ runner.os }}-deps-2004
+
+    - name: CMake config
+      run: cmake -S . -B build
+
+    - name: Compile
+      run: cmake --build build --target all
+
+    - name: Tests (quick)
+      run: tests/run_tests.sh dont_compile
+
+    - name: Apps
+      run: tests/run_apps.sh
+
+    - name: Compile with key tracing
+      run: cmake -S . -B build_with_tracing -D PS_TRACE_KEYS=1 && cmake --build build --target all

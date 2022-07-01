@@ -1,27 +1,25 @@
-name: Run on latest Ubuntu
+name: Run on Ubuntu 22.04
 
 on: [push]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v2
+
     - name: Install package dependencies
       run: sudo apt-get update && sudo apt-get install -y build-essential git libboost-all-dev cmake libzmq3-dev libprotobuf-dev protobuf-compiler libeigen3-dev
     - name: Cache dependencies
       uses: actions/cache@v2
       with:
         path: deps
-        key: ${{ runner.os }}-deps-latest-ubuntu-v2
-
-    - name: Get libtorch
-      run: wget https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.11.0%2Bcpu.zip && mkdir -p deps && unzip -q -o libtorch-cxx11-abi-shared-with-deps-1.11.0+cpu.zip -d deps
+        key: ${{ runner.os }}-deps-2204
 
     - name: CMake config
-      run: cmake -S . -B build -D TORCH_PATH=$(pwd)/deps/libtorch/
+      run: cmake -S . -B build
 
     - name: Compile
       run: cmake --build build --target all
