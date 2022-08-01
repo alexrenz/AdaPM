@@ -35,7 +35,7 @@ target_link_libraries(adaps PUBLIC pthread)
 # Protobuf
 if(DEFINED PROTOBUF_PATH) # use a custom Protobuf
   set(protobuf_MODULE_COMPATIBLE ON CACHE BOOL "")
-  find_package(Protobuf 3.0.0 REQUIRED PATHS ${PROTOBUF_PATH})
+  find_package(Protobuf 3.0.0 REQUIRED NO_DEFAULT_PATH PATHS ${PROTOBUF_PATH})
 else() # use any (likely system-provided) Protobuf
   find_package(Protobuf 3.0.0 REQUIRED)
 endif()
