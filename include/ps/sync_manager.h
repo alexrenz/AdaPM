@@ -294,6 +294,9 @@ namespace ps {
 
       // wait for last sync round to finish
       while (num_refreshes_answered < num_refreshes_requested) {
+        if (terminate) { // stop waiting if we want to terminate
+          return 0;
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(100));
       }
       sw_finishing.stop();
