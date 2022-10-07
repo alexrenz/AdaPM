@@ -75,7 +75,7 @@ class SSHLauncher(object):
                 if self.args.interface != "":
                     pass_envs['DMLC_INTERFACE'] = self.args.interface
                 node = self.hosts[i % len(self.hosts)]
-                prog = self.get_env(pass_envs) + ' cd ' + working_dir + '; ' + self.cmd
+                prog = self.get_env(pass_envs) + ' cd ' + working_dir + '; ' + self.args.activation + self.cmd
                 prog = 'ssh -o StrictHostKeyChecking=no ' + node + ' \'' + prog + '\''
 
                 thread = Thread(target = run, args=(prog,))
@@ -99,6 +99,8 @@ def main():
                         help = 'number of server nodes to be launched')
     parser.add_argument('-i', '--interface', default = "", type=str,
                         help = 'the desired network interface')
+    parser.add_argument('-a', '--activation', default = "", type=str,
+                        help = 'custom activation for local environments (e.g., to set specific conda environment)')
     parser.add_argument('-H', '--hostfile', type=str,
                         help = 'the hostfile of all slave nodes')
     parser.add_argument('command', nargs='+',
