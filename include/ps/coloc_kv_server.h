@@ -25,12 +25,21 @@
 namespace ps {
 
 // read management technique from stream
+MgmtTechniques tokenToMgmtTechniques (const std::string& token) {
+  if (token == "all") {
+    return MgmtTechniques::ALL;
+  } else if (token == "replication_only") {
+    return MgmtTechniques::REPLICATION_ONLY;
+  } else if (token == "relocation_only") {
+    return MgmtTechniques::RELOCATION_ONLY;
+  } else {
+  CHECK(false) << "Fatal! Unknown management technique selection " << token;
+  }
+  return MgmtTechniques::ALL;
+}
 std::istream& operator>>(std::istream& in, MgmtTechniques& t) {
   std::string token; in >> token;
-  if (token == "all") t = MgmtTechniques::ALL;
-  else if (token == "replication_only") t = MgmtTechniques::REPLICATION_ONLY;
-  else if (token == "relocation_only") t = MgmtTechniques::RELOCATION_ONLY;
-  else { CHECK(false) << "Fatal! Unknown management technique selection " << token; }
+  t = tokenToMgmtTechniques(token);
   return in;
 }
 // write management technique to stream
