@@ -15,7 +15,18 @@ using namespace std;
 namespace py = pybind11;
 
 
-void setup(int num_keys, int num_threads) {
+void setup(int num_keys, int num_threads, const std::string& use_techniques="", const int num_channels = -1) {
+  // set specifically which techniques AdaPS should use to manage parameters
+  if (use_techniques != "") {
+    ps::Postoffice::Get()->set_management_techniques(
+                           ps::tokenToMgmtTechniques(use_techniques));
+  }
+
+  // set specifically how many communication channels AdaPS should use
+  if (num_channels != -1) {
+    ps::Postoffice::Get()->set_num_channels(num_channels);
+  }
+
   ps::Postoffice::Get()->setup(num_keys, num_threads);
 }
 
@@ -66,7 +77,10 @@ inline ps::Key LogUniformSampling() {
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("setup", &setup, "set up AdaPS");
+  m.def("setup", &setup, "set up AdaPS",
+        py::arg("num_keys"), py::arg("num_threads"),
+        py::arg("use_techniques") = "", py::arg("num_channels") = -1);
+
   m.def("scheduler", &scheduler, "run scheduler");
 
   // Server

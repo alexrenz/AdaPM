@@ -146,14 +146,18 @@ class Postoffice {
     num_worker_threads_ = num_threads;
     customers_.resize(num_threads + num_channels_ + 1); // +1 for sampling customer
   }
-  /** \brief Return whether to relocate parameters (otherwise, the system will always replicate on intent) */
+  /** \brief Return which techniques the system is allowed to use for managing parameters */
   inline MgmtTechniques management_techniques() const { return management_techniques_; }
+  /** \brief Set which management techniques the system should use to manage parameters */
+  void set_management_techniques (const MgmtTechniques techs) { management_techniques_ = techs; }
   /** \brief Whether and with which target probability to time intent actions */
   inline double time_intent_actions() const { return time_intent_actions_; }
   /** \brief Returns whether location caches are used */
   inline bool use_location_caches() const { return location_caches_; }
   /** \brief Returns the number of communication channels */
   inline unsigned int num_channels() const { return num_channels_; }
+  /** \brief Set the number of communication channels */
+  void set_num_channels(const int nc) { num_channels_ = nc; }
   /** \brief Get the configured number of keys */
   inline Key num_keys() const { return num_keys_; }
   /** \brief Get the number of worker threads per server process */
