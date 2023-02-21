@@ -42,7 +42,7 @@ jobs:
     - name: Compile Bindings
       run: cd bindings && python setup.py install --user
 
-    - name: Test torch and lapse import
+    - name: Test torch and AdaPS import
       run: python3 bindings/test_import.py
 
     - name: Run example
