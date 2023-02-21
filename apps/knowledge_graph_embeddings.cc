@@ -259,11 +259,10 @@ class SROBucket {
 
 public:
     SROBucket(const vector<triplet>& sros) {
-      // make sure hash(int,int,int) does not overflow despite int64
       ne_bits = ceil(log2(ne*2));
       nr_bits = ceil(log2(nr*2));
-      auto hash_needs = 2*ne_bits + nr_bits;
-      assert(hash_needs < sizeof(int64_t)*8);
+      assert(2*ne_bits + nr_bits < sizeof(int64_t)*8); // make sure hash(int,int,int) does not overflow despite int64
+
 
         for (auto sro : sros) {
             int s = get<0>(sro);
