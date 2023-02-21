@@ -31,8 +31,7 @@ The source code used in this paper is in branch
 [`vldb20`](https://github.com/alexrenz/AdaPS/tree/vldb20/). NuPS is a novel
 multi-technique PS that combines relocation and replication management
 techniques, and supports sampling directly in the PS. Our paper on NuPS provides
-more detail ([arXiv](https://arxiv.org/abs/2104.00501), to appear in SIGMOD
-'22). Details on the experiments of this paper can be found in
+more detail ([SIGMOD 22](https://dl.acm.org/doi/10.1145/3514221.3517860)). Details on the experiments of this paper can be found in
 [docs/experiments-sigmod22.md](https://github.com/alexrenz/AdaPS/blob/sigmod22/docs/experiments-sigmod22.md).
 The source code used in this paper is in branch
 [`sigmod22`](https://github.com/alexrenz/AdaPS/tree/sigmod22/).
