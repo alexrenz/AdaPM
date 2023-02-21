@@ -85,7 +85,7 @@ A simple example:
 
 ## Build
 
-AdaPS requires a C++11 compiler such as `g++ >= 4.8` and boost for some the application examples. On Ubuntu >= 13.10, you
+AdaPS requires a C++14 compiler such as `g++ >= 4.9` and boost for some the application examples. On Ubuntu >= 13.10, you
 can install it by
 ```
 sudo apt-get update && sudo apt-get install -y cmake build-essential git wget libboost-all-dev libzmq3-dev libprotobuf-dev protobuf-compiler libeigen3-dev
