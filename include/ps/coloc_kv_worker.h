@@ -13,6 +13,7 @@
 #include "utils.h"
 #include <boost/math/special_functions/factorials.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
+#include <boost/dynamic_bitset.hpp>
 
 #include <iostream>
 #include <iomanip>
@@ -279,10 +280,16 @@ namespace ps {
 
       // Step 2: slow general case
 
+      // remember which key positions were processed locally already
+      auto processed = std::make_unique<boost::dynamic_bitset<>>(num_keys);
+      for (size_t i=0; i!=num_keys; ++i) {
+        (*processed)[i] = (destinations[i] == LOCAL);
+      }
+
       // create request
       int ts = obj_->NewRequest(kServerGroup, num_keys);
       orig_kv_mu_.lock();
-      request_original_kvs_[ts] = std::make_tuple(keys, num_keys, vals);
+      request_original_kvs_[ts] = std::make_tuple(keys, num_keys, vals, std::move(processed));
       orig_kv_mu_.unlock();
 
       this->AddCallback(ts, [this, ts, keys, vals, cb]() mutable {
@@ -804,7 +811,7 @@ namespace ps {
     ColoKVServer<Val, Handle>& server;
 
     // pointers to original keys and values (we use this for pushs: when a message arrives, we put the arriving values directly into the original array)
-    std::unordered_map<int, std::tuple<const Key*, size_t, Val*>> request_original_kvs_;
+    std::unordered_map<int, std::tuple<const Key*, size_t, Val*, std::unique_ptr<boost::dynamic_bitset<>>>> request_original_kvs_;
     std::mutex orig_kv_mu_;
 
     // The customer id of the thread that owns this KVWorker instance (used for barrier)
@@ -846,26 +853,30 @@ namespace ps {
 
         // get reference to original keys + val arrays of this timestamp
         orig_kv_mu_.lock();
-        auto orig = request_original_kvs_[ts];
+        auto& orig = request_original_kvs_[ts];
         orig_kv_mu_.unlock();
 
-        CHECK(std::get<0>(orig)) << "FATAL: have no place to put reply to a pull requests at worker " << Postoffice::Get()->my_rank() << "::" << obj_->customer_id() << " for ts " << ts <<". Pointer is " << std::get<0>(orig);
+        auto requested_keys = std::get<0>(orig);
+        auto num_requested_keys = std::get<1>(orig);
+        auto requested_vals = std::get<2>(orig);
+        auto processed = *(std::get<3>(orig));
+
+        CHECK(requested_keys) << "FATAL: have no place to put reply to a pull requests at worker " << Postoffice::Get()->my_rank() << "::" << obj_->customer_id() << " for ts " << ts <<". Pointer is " << requested_keys;
 
         // go trough requested keys and match with the keys of this message,
         // place received vals at the correct positions of the array
         // note: we can do this without lock because (a) there is only one receive thread
         //    (b) if there were multiple, there is separated write areas in the val array
         size_t len = 0, orig_pos = 0, recv_pos = 0, key_pos = 0;
-        const Key* requested_keys = std::get<0>(orig);
-        auto num_requested_keys = std::get<1>(orig);
         auto senderRank = Postoffice::Get()->IDtoRank(msg.meta.sender);
 
         for (size_t i = 0; i != num_requested_keys; ++i) {
           Key key = kvs.keys[key_pos];
           len = server.request_handle_.get_len(requested_keys[i]);
-          if (requested_keys[i] == key) {
+          if (requested_keys[i] == key && !processed[i]) {
             // write vals to correct position
-            std::copy_n(kvs.vals.begin()+recv_pos, len, std::get<2>(orig)+orig_pos);
+            std::copy_n(kvs.vals.begin()+recv_pos, len, requested_vals+orig_pos);
+            processed[i] = 1; // mark as processed
 
             // update location caches
             if (Postoffice::Get()->use_location_caches()) {
@@ -885,6 +896,8 @@ namespace ps {
           orig_pos += len;
         }
 
+        // did we run through all keys?
+        assert(key_pos == kvs.keys.size());
 
         // increase receive count
         obj_->AddResponse(ts, kvs.keys.size());
