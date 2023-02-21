@@ -167,8 +167,6 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
     push_keys[i] = random_keys(num_keys, max_keys_at_a_time);
   }
 
-  bool init = false;
-
   // run workload (pushs, pulls, localizes)
   for(size_t i=0, i_future=0; i!=runs; ++i) {
 
@@ -182,10 +180,7 @@ void RunWorker(int customer_id, bool barrier, ServerT* server=nullptr) {
     }
 
     // make sure intent is processed
-    if(!init) {
-      kv.WaitSync();
-      init = true;
-    }
+    kv.WaitSync();
 
     // pull a random list of keys
     pull_vals[i].resize(pull_keys[i].size() * vpk, 12);
