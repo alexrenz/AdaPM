@@ -16,13 +16,13 @@ namespace py = pybind11;
 
 
 void setup(int num_keys, int num_threads, const std::string& use_techniques="", const int num_channels = -1) {
-  // set specifically which techniques AdaPS should use to manage parameters
+  // set specifically which techniques AdaPM should use to manage parameters
   if (use_techniques != "") {
     ps::Postoffice::Get()->set_management_techniques(
                            ps::tokenToMgmtTechniques(use_techniques));
   }
 
-  // set specifically how many communication channels AdaPS should use
+  // set specifically how many communication channels AdaPM should use
   if (num_channels != -1) {
     ps::Postoffice::Get()->set_num_channels(num_channels);
   }
@@ -77,7 +77,7 @@ inline ps::Key LogUniformSampling() {
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("setup", &setup, "set up AdaPS",
+  m.def("setup", &setup, "set up AdaPM",
         py::arg("num_keys"), py::arg("num_threads"),
         py::arg("use_techniques") = "", py::arg("num_channels") = -1);
 
@@ -101,7 +101,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                        const ps::Key min, // incl.
                                        const ps::Key max // excl.
                                        ){
-      // This enables to use the AdaPS sampling support from the PyTorch bindings.
+      // This enables to use the AdaPM sampling support from the PyTorch bindings.
       // Out of the box, only some pre-provided sampling distributions are supported:
       //  - uniform: uniform sampling from a continuous range [min, max)  (incl. min, excl. max)
       //  - log-uniform: log-uniform sampling from a continuous range [min, max)  (incl. min, excl. max)

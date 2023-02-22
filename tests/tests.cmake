@@ -5,7 +5,7 @@ foreach( test ${TESTS} )
   target_include_directories(${test} PUBLIC ${INCS})
   target_link_libraries(${test}
     PUBLIC pthread
-    PUBLIC adaps
+    PUBLIC adapm
     PUBLIC Boost::system
     PUBLIC Boost::program_options
   )

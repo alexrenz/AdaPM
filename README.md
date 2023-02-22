@@ -1,57 +1,57 @@
-![logo](docs/adaps.svg?raw=true) 
+![logo](docs/adapm.svg?raw=true)
 
-![Build on Latest Ubuntu](https://github.com/alexrenz/AdaPS/actions/workflows/latest-ubuntu.yml/badge.svg)
-![Test bindings](https://github.com/alexrenz/AdaPS/actions/workflows/bindings.yml/badge.svg)
+![Build on Latest Ubuntu](https://github.com/alexrenz/AdaPM/actions/workflows/latest-ubuntu.yml/badge.svg)
+![Test bindings](https://github.com/alexrenz/AdaPM/actions/workflows/bindings.yml/badge.svg)
 [![License](docs/apache2.svg?raw=true)](./LICENSE)
 
-**AdaPS** is a fully adaptive parameter server (PS). AdaPS is efficient for many
+**AdaPM** (formerly AdaPS) is a fully adaptive parameter manager. AdaPM is efficient for many
 machine learning tasks out of the box because it automatically adapts to the
 underlying task. It adapts based on **intent signals**. I.e., the application
 signals which parameters it intends to access in the near future. Based on these
-signals, AdaPS decides automatically (i.e., without specific user input) and
+signals, AdaPM decides automatically (i.e., without specific user input) and
 adaptively (i.e., depending on the current situation) what to do and when to do
-it. This makes AdaPS *efficient and easy to use*. We describe details in our
-[paper on AdaPS (arXiv)](https://arxiv.org/abs/2206.00470).
+it. This makes AdaPM *efficient and easy to use*. We describe details in our
+[paper on AdaPM (arXiv)](https://arxiv.org/abs/2206.00470).
 
-The `main` branch of this repository contains the latest version of AdaPS.
-Details on the experiments in the AdaPS paper
+The `main` branch of this repository contains the latest version of AdaPM.
+Details on the experiments in the AdaPM paper
 ([arXiv](https://arxiv.org/abs/2206.00470)) can be found in
-[docs/experiments.md](https://github.com/alexrenz/AdaPS/blob/review/docs/experiments.md).
+[docs/experiments.md](https://github.com/alexrenz/AdaPM/blob/review/docs/experiments.md).
 The source code used in the paper is in branch
-[`review`](https://github.com/alexrenz/AdaPS/tree/review/).
+[`review`](https://github.com/alexrenz/AdaPM/tree/review/).
 
-AdaPS is the successor of **Lapse** and **NuPS**. Lapse is the first PS
+AdaPM is the successor of **Lapse** and **NuPS**. Lapse is the first parameter manager
 that supports dynamic parameter allocation, i.e., the ability to relocate
 parameters among nodes during run time. Our paper on Lapse provides more
 information ([PVLDB 13(12),
 2020](https://www.vldb.org/pvldb/vol13/p1877-renz-wieland.pdf)). Details on the
 experiments for this paper can be found in
-[docs/experiments-vldb20.md](https://github.com/alexrenz/AdaPS/blob/vldb20/docs/experiments-vldb20.md).
+[docs/experiments-vldb20.md](https://github.com/alexrenz/AdaPM/blob/vldb20/docs/experiments-vldb20.md).
 The source code used in this paper is in branch
-[`vldb20`](https://github.com/alexrenz/AdaPS/tree/vldb20/). NuPS is a novel
-multi-technique PS that combines relocation and replication management
-techniques, and supports sampling directly in the PS. Our paper on NuPS provides
+[`vldb20`](https://github.com/alexrenz/AdaPM/tree/vldb20/). NuPS is a novel
+multi-technique parameter manager that combines relocation and replication management
+techniques, and supports sampling directly in the parameter manager. Our paper on NuPS provides
 more detail ([SIGMOD 22](https://dl.acm.org/doi/10.1145/3514221.3517860)). Details on the experiments of this paper can be found in
-[docs/experiments-sigmod22.md](https://github.com/alexrenz/AdaPS/blob/sigmod22/docs/experiments-sigmod22.md).
+[docs/experiments-sigmod22.md](https://github.com/alexrenz/AdaPM/blob/sigmod22/docs/experiments-sigmod22.md).
 The source code used in this paper is in branch
-[`sigmod22`](https://github.com/alexrenz/AdaPS/tree/sigmod22/).
+[`sigmod22`](https://github.com/alexrenz/AdaPM/tree/sigmod22/).
 
 
-AdaPS provides bindings to PyTorch, see [bindings/](bindings/). 
+AdaPM provides bindings to PyTorch, see [bindings/](bindings/). 
 
-The implementation of AdaPS is based on NuPS, Lapse, and [PS-Lite](https://github.com/dmlc/ps-lite). 
+The implementation of AdaPM is based on NuPS, Lapse, and [PS-Lite](https://github.com/dmlc/ps-lite). 
 
 ### Usage
 
-AdaPS provides the following primitives to access parameters: 
+AdaPM provides the following primitives to access parameters: 
 - `Pull(keys)`: retrieve the values of a set of parameters (identified by keys)
 - `Push(keys, updates)`: send (additive) updates for parameters
 
-AdaPS provides the following primitives to signal intent:
+AdaPM provides the following primitives to signal intent:
 - `Intent(keys, start, end)`: signal that the issuing worker intends to access `keys` between clock `start` (incl.) and `end` (excl.)
 - `advanceClock()`: raise the clock of the issuing worker by 1
 
-Additionally, AdaPS supports sampling access (as NuPS does) via the following primitives:
+Additionally, AdaPM supports sampling access (as NuPS does) via the following primitives:
 - `handle = PrepareSample(N)`: prepare a group of `N` samples
 - `PullSample(handle)`: retrieve `N` samples from a prepared group
 
@@ -85,7 +85,7 @@ A simple example:
 
 ## Build
 
-AdaPS requires a C++14 compiler such as `g++ >= 4.9` and boost for some the application examples. On Ubuntu >= 13.10, you
+AdaPM requires a C++14 compiler such as `g++ >= 4.9` and boost for some the application examples. On Ubuntu >= 13.10, you
 can install it by
 ```
 sudo apt-get update && sudo apt-get install -y cmake build-essential git wget libboost-all-dev libzmq3-dev libprotobuf-dev protobuf-compiler libeigen3-dev
@@ -94,8 +94,8 @@ sudo apt-get update && sudo apt-get install -y cmake build-essential git wget li
 Then clone and build (without torch support)
 
 ```bash
-git clone https://github.com/alexrenz/AdaPS
-cd AdaPS
+git clone https://github.com/alexrenz/AdaPM
+cd AdaPM
 cmake -S . -B build    # (equivalent old style for CMake<3.14: mkdir build && cd build && cmake ..)
 cmake --build build --target all -j
 ```
@@ -106,7 +106,7 @@ See [bindings/README.md](bindings/README.md) for how to build the **bindings**.
 
 - Set `PROTOBUF_PATH` to link a specific protobuf installation (rather than relying on the system's default paths). E.g., we use this to build ABI-compatible PyTorch bindings (see [bindings/README.md](bindings/README.md)).
 - Set `CMAKE_BUILD_TYPE=Debug` to build debug binaries.
-- (Advanced) Set `PS_KEY_TYPE` to the data type that the PS should use as keys (default: `uint64_t`)
+- (Advanced) Set `PS_KEY_TYPE` to the data type that the parameter manager should use as keys (default: `uint64_t`)
 - (Advanced) Set `PS_LOCALITY_STATS` to collect detailed locality statistics during run time.
 - (Advanced) Set `PS_TRACE_KEYS=1` to compile with key tracing support. Then set `--sys.trace.keys` and `--sys.stats.out` when starting an application on a cluster.
 
@@ -133,7 +133,7 @@ There are multiple start scripts. We commonly use the following ones:
 - [tracker/dmlc_ssh.py](tracker/dmlc_ssh.py) to run on a cluster
 To see more information, run `python tracker/dmlc_local.py --help`, for example.
 
-The `-s` flag specifies how many processes/nodes to use. For example, `-s 4` uses 4 nodes. In each process, AdaPS starts one server thread and multiple worker threads. 
+The `-s` flag specifies how many processes/nodes to use. For example, `-s 4` uses 4 nodes. In each process, AdaPM starts one server thread and multiple worker threads. 
 
 ## Example Applications
 
@@ -158,17 +158,17 @@ python tracker/dmlc_local.py -s 2  build/apps/matrix_factorization --dataset app
 
 ## Architecture
 
-AdaPS starts one process per node. Within this process, worker threads access the parameter store directly. A parameter server thread handles requests by other nodes, and a synchronization manager thread triggers replica synchronization and intent communication.
+AdaPM starts one process per node. Within this process, worker threads access the parameter store directly. A server thread handles requests by other nodes, and a synchronization manager thread triggers replica synchronization and intent communication.
 
 ![architecture](docs/architecture.png?raw=true)
 
 
 ### How to cite
 
-The citation for AdaPS is as follows:
+The citation for AdaPM is as follows:
 
 ```bibtex
-@misc{adaps,
+@misc{adapm,
   author = {Renz-Wieland, Alexander and Kieslinger, Andreas and Gericke, Robert and Gemulla, Rainer and Kaoudi, Zoi and Markl, Volker},
   title = {Good Intentions: Adaptive Parameter Servers via Intent Signaling},
   publisher = {arXiv},
