@@ -37,12 +37,12 @@ jobs:
         key: ${{ runner.os }}-deps-ubuntu-bindings
 
     - name: Compile PS
-      run: cmake -S . -B build_bindings -D PS_KEY_TYPE=int64_t -DPROTOBUF_PATH=$(pwd)/deps/lib/cmake/protobuf/ -D CMAKE_CXX_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=0" && cmake --build build_bindings --target adaps
+      run: cmake -S . -B build_bindings -D PS_KEY_TYPE=int64_t -DPROTOBUF_PATH=$(pwd)/deps/lib/cmake/protobuf/ -D CMAKE_CXX_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=0" && cmake --build build_bindings --target adapm
 
     - name: Compile Bindings
       run: cd bindings && python setup.py install --user
 
-    - name: Test torch and AdaPS import
+    - name: Test torch and AdaPM import
       run: python3 bindings/test_import.py
 
     - name: Run example
