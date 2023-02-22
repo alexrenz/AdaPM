@@ -4,7 +4,7 @@ import os
 
 ##############################################
 #
-#   PyTorch bindings to AdaPS
+#   PyTorch bindings to AdaPM
 #
 ##############################################
 
@@ -30,14 +30,14 @@ ps_include_dirs = [ps_dir,
                    ps_dir + 'include',
                    deps_dir + 'include']
 
-setup(name='adaps',
+setup(name='adapm',
       version='0.1',
-      description='PyTorch bindings to the AdaPS parameter server',
+      description='PyTorch bindings to the AdaPM parameter manager',
       ext_modules=[cpp_extension.CppExtension(
-          name='adaps',
+          name='adapm',
           include_dirs = ps_include_dirs,
-          extra_objects = [build_dir + 'libadaps.a'],
-          depends       = [build_dir + 'libadaps.a',
+          extra_objects = [build_dir + 'libadapm.a'],
+          depends       = [build_dir + 'libadapm.a',
                            ps_dir + 'include/ps/addressbook.h',
                            ps_dir + 'include/ps/base.h',
                            ps_dir + 'include/ps/coloc_kv_server.h',

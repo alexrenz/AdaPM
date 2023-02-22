@@ -2,7 +2,7 @@
 
 We provide (so far experimental) bindings to PyTorch. The bindings are specified in [bindings.cc](bindings.cc), usage examples can be found in [example.py](example.py). 
 
-We provide bindings for the main primitives of AdaPS: `pull`, `push`, `intent`, `advance_clock`, `prepare_sample`, and `pull_sample`. They further provide a `set` variant of the `push` primitive that sets parameter to specific values (instead of adding to the values, as `push` does).
+We provide bindings for the main primitives of AdaPM: `pull`, `push`, `intent`, `advance_clock`, `prepare_sample`, and `pull_sample`. They further provide a `set` variant of the `push` primitive that sets parameter to specific values (instead of adding to the values, as `push` does).
 
 ### PyTorch tensors
 
@@ -68,9 +68,9 @@ Parameter access operations (`pull`, `push`, `set`, and `pull_sample`) return a 
 
 ## Installation
 
-To compile working bindings, it is important that AdaPS is built with a key
+To compile working bindings, it is important that AdaPM is built with a key
 data type that matches PyTorch and NumPy default integer data types (`int64`)
-and that AdaPS is built with the the same C++ ABI as the installed PyTorch. If
+and that AdaPM is built with the the same C++ ABI as the installed PyTorch. If
 you installed PyTorch in a normal way (e.g., pip or conda), it is likely that
 this PyTorch installation uses the old pre-C++11 ABI (apparently, this is done
 to ensure compatibility to old Python versions). If you are on a recent OS, this
@@ -96,15 +96,15 @@ make -j  # this can take a while
 make install
 ```
 
-Then to compile AdaPS with the matching key type and the ABI of the installed PyTorch:
+Then to compile AdaPM with the matching key type and the ABI of the installed PyTorch:
 ```bash
 # (in the root folder of this repository)
 cmake -S . -B build_bindings -D PS_KEY_TYPE=int64_t -DPROTOBUF_PATH=$(pwd)/deps/lib/cmake/protobuf/ -D CMAKE_CXX_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=$(python bindings/lookup_torch_abi.py)"
-cmake --build build_bindings --target adaps
+cmake --build build_bindings --target adapm
 ```
 
 > **Note**
-> Make sure that PyTorch is installed before you build AdaPS. Otherwise, the ABI read-out (`$(python bindings/lookup_torch_abi.py)` above) will fail. Also make sure that you run the read-out with the python that you are using (i.e., potentially `python3` or `python3.9` rather than `python`).
+> Make sure that PyTorch is installed before you build AdaPM. Otherwise, the ABI read-out (`$(python bindings/lookup_torch_abi.py)` above) will fail. Also make sure that you run the read-out with the python that you are using (i.e., potentially `python3` or `python3.9` rather than `python`).
 
 And finally, to compile the bindings:
 ```bash
@@ -113,14 +113,14 @@ python setup.py install --user
 ```
 
 > **Note**
-> If you built AdaPS to another path than `build_bindings/` or you installed Protocol Buffers to a folder other than `deps/`, you need to pass these paths to `setup.py` explicitly via environment variables `BUILD_PATH` and `DEPS_PATH` (using absolute paths). E.g.: `BUILD_PATH=[ABSOLUTE_PATH_TO_BUILD] DEPS_PATH=[ABSOLUTE_PATH_TO_PROTOBUF_INSTALL] python setup.py install --user`
+> If you built AdaPM to another path than `build_bindings/` or you installed Protocol Buffers to a folder other than `deps/`, you need to pass these paths to `setup.py` explicitly via environment variables `BUILD_PATH` and `DEPS_PATH` (using absolute paths). E.g.: `BUILD_PATH=[ABSOLUTE_PATH_TO_BUILD] DEPS_PATH=[ABSOLUTE_PATH_TO_PROTOBUF_INSTALL] python setup.py install --user`
 
-If successful, you can now use AdaPS from Python
+If successful, you can now use AdaPM from Python
 
 ```python
 #!/usr/bin/python
 import torch
-import adaps
+import adapm
 ```
 
 You should also be able to run `python bindings/example.py` without error messages.

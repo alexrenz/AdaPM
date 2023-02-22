@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 
-project(adaps VERSION 0.1 LANGUAGES CXX)
+project(adapm VERSION 0.1 LANGUAGES CXX)
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 set(CMAKE_CXX_STANDARD 14)
@@ -22,15 +22,15 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
-# libadaps
+# libadapm
 set(SOURCES src/customer.cc src/postoffice.cc src/van.cc)
-add_library(adaps ${SOURCES})
-target_include_directories(adaps
+add_library(adapm ${SOURCES})
+target_include_directories(adapm
   PUBLIC "${PROJECT_BINARY_DIR}"
   PUBLIC "${PROJECT_SOURCE_DIR}/include/"
 )
 add_library(Threads::Threads INTERFACE IMPORTED)
-target_link_libraries(adaps PUBLIC pthread)
+target_link_libraries(adapm PUBLIC pthread)
 
 # Protobuf
 if(DEFINED PROTOBUF_PATH) # use a custom Protobuf
@@ -41,14 +41,14 @@ else() # use any (likely system-provided) Protobuf
 endif()
 set(PROTO_FILES src/meta.proto)
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILES})
-set_property(TARGET adaps PROPERTY SOURCES ${SOURCES} ${PROTO_SRCS} ${PROTO_HDRS})
-target_include_directories(adaps PUBLIC ${PROTOBUF_INCLUDE_DIRS})
-target_link_libraries(adaps PUBLIC ${PROTOBUF_LIBRARY})
+set_property(TARGET adapm PROPERTY SOURCES ${SOURCES} ${PROTO_SRCS} ${PROTO_HDRS})
+target_include_directories(adapm PUBLIC ${PROTOBUF_INCLUDE_DIRS})
+target_link_libraries(adapm PUBLIC ${PROTOBUF_LIBRARY})
 
 # ZMQ
 find_package (ZMQ REQUIRED)
-target_include_directories(adaps PUBLIC ${ZMQ_INCLUDE_DIRS})
-target_link_libraries(adaps PUBLIC ${ZMQ_LIBRARIES})
+target_include_directories(adapm PUBLIC ${ZMQ_INCLUDE_DIRS})
+target_link_libraries(adapm PUBLIC ${ZMQ_LIBRARIES})
 
 # Boost
 find_package(Boost 1.63.0 COMPONENTS system program_options iostreams filesystem REQUIRED)

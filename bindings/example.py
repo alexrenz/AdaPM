@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 import numpy as np
 from torch.multiprocessing import Process
-import adaps
+import adapm
 from signal import signal, SIGINT
 from sys import exit
 import threading
@@ -168,45 +168,45 @@ def init_scheduler(dummy, num_nodes):
     os.environ['DMLC_PS_ROOT_URI'] = localip
     os.environ['DMLC_PS_ROOT_PORT'] = port
 
-    adaps.scheduler(num_keys, num_workers_per_node)
+    adapm.scheduler(num_keys, num_workers_per_node)
 
 
 def init_node(rank, num_nodes):
-    """Start up an AdaPS node (server + multiple worker threads)"""
+    """Start up an AdaPM node (server + multiple worker threads)"""
     os.environ['DMLC_NUM_SERVER'] = str(num_nodes)
     os.environ['DMLC_ROLE'] = 'server'
     os.environ['DMLC_PS_ROOT_URI'] = localip
     os.environ['DMLC_PS_ROOT_PORT'] = port
 
-    adaps.setup(num_keys, num_workers_per_node)
+    adapm.setup(num_keys, num_workers_per_node)
 
     # in this example, there are `num_keys` keys and all keys except one
-    #   hold a vector of length `vpk`. To indicate this to AdaPS, we pass
+    #   hold a vector of length `vpk`. To indicate this to AdaPM, we pass
     #   an array of length `num_keys`, in which each key holds the length
     #   of the parameter vector
     value_lengths = torch.ones(num_keys)*vpk
     value_lengths[400] = 10 ## one key holds a vector of other length
 
-    s = adaps.Server(value_lengths)
+    s = adapm.Server(value_lengths)
     s.enable_sampling_support(scheme="local", with_replacement=True,
                               distribution="uniform", min=0, max=int(num_keys/2))
 
     threads = []
     for w in range(num_workers_per_node):
         worker_id = rank * num_workers_per_node + w
-        t = threading.Thread(target=run_worker, args=(worker_id, rank, adaps.Worker(w, s)))
+        t = threading.Thread(target=run_worker, args=(worker_id, rank, adapm.Worker(w, s)))
         t.start()
         threads.append(t)
 
     for t in threads:
         t.join()
 
-    # shutdown AdaPS node
+    # shutdown AdaPM node
     s.shutdown()
 
 
 def kill_processes(signal_received, frame):
-    """Kills all started AdaPS processes"""
+    """Kills all started AdaPM processes"""
     print('\nSIGINT or CTRL-C detected. Shutting down all processes and exiting..')
     for p in processes:
         p.kill()
@@ -214,15 +214,15 @@ def kill_processes(signal_received, frame):
 
 processes = []
 if __name__ == "__main__":
-    # catch interrupt (to shut down AdaPS processes)
+    # catch interrupt (to shut down AdaPM processes)
     signal(SIGINT, kill_processes)
 
-    # launch AdaPS scheduler
+    # launch AdaPM scheduler
     p = Process(target=init_scheduler, args=(0, num_nodes))
     p.start()
     processes.append(p)
 
-    # launch AdaPS processes
+    # launch AdaPM processes
     for rank in range(num_nodes):
         p = Process(target=init_node, args=(rank, num_nodes))
         p.start()
