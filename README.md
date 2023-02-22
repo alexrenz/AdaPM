@@ -1,6 +1,7 @@
 ![logo](docs/adapm.svg?raw=true)
 
-![Build on Latest Ubuntu](https://github.com/alexrenz/AdaPM/actions/workflows/latest-ubuntu.yml/badge.svg)
+![Run on Ubuntu 20.04](https://github.com/alexrenz/AdaPM/actions/workflows/ubuntu-20.04.yml/badge.svg)
+![Run on Ubuntu 22.04](https://github.com/alexrenz/AdaPM/actions/workflows/ubuntu-22.04.yml/badge.svg)
 ![Test bindings](https://github.com/alexrenz/AdaPM/actions/workflows/bindings.yml/badge.svg)
 [![License](docs/apache2.svg?raw=true)](./LICENSE)
 
