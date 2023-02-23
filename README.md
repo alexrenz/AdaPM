@@ -17,9 +17,10 @@ it. This makes AdaPM *efficient and easy to use*. We describe details in our
 The `main` branch of this repository contains the latest version of AdaPM.
 Details on the experiments in the AdaPM paper
 ([arXiv](https://arxiv.org/abs/2206.00470)) can be found in
-[docs/experiments.md](https://github.com/alexrenz/AdaPM/blob/review/docs/experiments.md).
+[docs/experiments.md](https://github.com/alexrenz/AdaPM/blob/exp22/docs/experiments.md).
 The source code used in the paper is in branch
-[`review`](https://github.com/alexrenz/AdaPM/tree/review/).
+[`exp22`](https://github.com/alexrenz/AdaPM/tree/exp22/). The implementations for
+the GCN and CTR applications can be found in a [separate repository](https://github.com/alexrenz/adapm-pytorch-apps).
 
 AdaPM is the successor of **Lapse** and **NuPS**. Lapse is the first parameter manager
 that supports dynamic parameter allocation, i.e., the ability to relocate
